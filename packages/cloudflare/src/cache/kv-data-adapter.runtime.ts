@@ -29,6 +29,7 @@ import type {
   CachedImageValue,
   IncrementalCacheValue,
 } from "vinext/shims/cache";
+import { getCacheTimestamp } from "vinext/shims/cache";
 import {
   getRequestExecutionContext,
   type ExecutionContextLike,
@@ -470,7 +471,7 @@ export class KVCacheHandler implements CacheHandler {
     }
     if (effectiveRevalidate === 0) return Promise.resolve();
 
-    const now = Date.now();
+    const now = getCacheTimestamp();
     const revalidateAt =
       typeof effectiveRevalidate === "number" && effectiveRevalidate > 0
         ? now + effectiveRevalidate * 1000
@@ -533,7 +534,7 @@ export class KVCacheHandler implements CacheHandler {
 
   async revalidateTag(tags: string | string[], _durations?: { expire?: number }): Promise<void> {
     const tagList = Array.isArray(tags) ? tags : [tags];
-    const now = Date.now();
+    const now = getCacheTimestamp();
     const validTags = tagList.filter((t) => validateTag(t) !== null);
     // Store invalidation timestamp for each tag
     // Use a long TTL (30 days) so recent invalidations are always found

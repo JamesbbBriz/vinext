@@ -25,6 +25,8 @@ import {
 import {
   NEXT_ROUTER_PREFETCH_HEADER,
   NEXT_ROUTER_SEGMENT_PREFETCH_HEADER,
+  NEXT_CACHE_REVALIDATED_TAGS_HEADER,
+  NEXT_CACHE_REVALIDATE_TAG_TOKEN_HEADER,
   RSC_HEADER,
   VINEXT_CLIENT_REUSE_MANIFEST_HEADER,
   VINEXT_INTERCEPTION_ID_HEADER,
@@ -61,6 +63,7 @@ import {
   CACHEABILITY_REQUEST_STATE,
   type RouteCacheabilityState,
 } from "../packages/vinext/src/shims/cacheability-classification.js";
+import { _wasTagRevalidatedAfter } from "../packages/vinext/src/shims/cache-request-state.js";
 import {
   DefaultCdnCacheAdapter,
   setCdnCacheAdapter,
@@ -230,6 +233,38 @@ function useSplitPolicyAdapter(): void {
 afterEach(() => setCdnCacheAdapter(new DefaultCdnCacheAdapter()));
 
 describe("createAppRscHandler", () => {
+  it("restores authenticated forwarded invalidations without exposing protocol headers", async () => {
+    const observed: Record<string, boolean | string | null> = {};
+    const handler = createHandler({
+      async dispatchMatchedPage() {
+        observed.oldEntry = _wasTagRevalidatedAfter(["posts"], 0);
+        observed.newEntry = _wasTagRevalidatedAfter(["posts"], Date.now() + 10_000);
+        const headers = await requestHeaders();
+        observed.tagsHeader = headers.get(NEXT_CACHE_REVALIDATED_TAGS_HEADER);
+        observed.tokenHeader = headers.get(NEXT_CACHE_REVALIDATE_TAG_TOKEN_HEADER);
+        return new Response("page");
+      },
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/about", {
+        headers: {
+          [NEXT_CACHE_REVALIDATED_TAGS_HEADER]: "posts",
+          [NEXT_CACHE_REVALIDATE_TAG_TOKEN_HEADER]: "test-draft-secret",
+        },
+      }),
+      null,
+    );
+
+    expect(response.status).toBe(200);
+    expect(observed).toEqual({
+      oldEntry: true,
+      newEntry: false,
+      tagsHeader: null,
+      tokenHeader: null,
+    });
+  });
+
   it("dispatches a matched GET through the App response stage and composes request-stage headers", async () => {
     const dispatchResponseStage = vi.fn<DispatchAppWorkerResponseStage>(async (_request, props) => {
       expect(props).toMatchObject({

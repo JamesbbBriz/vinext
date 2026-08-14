@@ -30,14 +30,14 @@ import { workUnitAsyncStorage } from "./internal/work-unit-async-storage.js";
 import { makeHangingPromise } from "./internal/make-hanging-promise.js";
 import { encodeCacheTag, encodeCacheTags } from "../utils/encode-cache-tag.js";
 import { getCdnCacheAdapter } from "./cdn-cache.js";
-import { getDataCacheHandler, type CachedFetchValue } from "./cache-handler.js";
+import { getCacheTimestamp, getDataCacheHandler, type CachedFetchValue } from "./cache-handler.js";
 import { getRequestExecutionContext } from "./request-context.js";
 import { isStagedCacheabilityProbeActive } from "./cacheability-classification.js";
 import { addCollectedRequestTags, getCurrentFetchSoftTags } from "./fetch-cache.js";
 import {
   ACTION_DID_REVALIDATE_DYNAMIC_ONLY,
   ACTION_DID_REVALIDATE_STATIC_AND_DYNAMIC,
-  _wasPendingTagRevalidatedAfter,
+  _wasTagRevalidatedAfter,
   _markPendingRevalidatedTag,
   _queuePendingRevalidation,
   _setRequestScopedCacheLife,
@@ -574,6 +574,9 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
   tags: string[],
   revalidateSeconds: number | false | undefined,
 ): Promise<Result> {
+  // Cache handlers timestamp at set() completion. Keep the earlier boundary
+  // so a fill that overlaps tag invalidation is not persisted as fresh.
+  const fillStartedAt = getCacheTimestamp();
   const result = await _unstableCacheAls.run(true, () => fn(...args));
 
   const cacheValue: CachedFetchValue = {
@@ -590,6 +593,10 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
     // Next.js behavior for unstable_cache without explicit revalidate.
     revalidate: typeof revalidateSeconds === "number" ? revalidateSeconds : false,
   };
+
+  if (_wasTagRevalidatedAfter([...tags, ...getCurrentFetchSoftTags()], fillStartedAt)) {
+    return result;
+  }
 
   await getDataCacheHandler().set(cacheKey, cacheValue, {
     fetchCache: true,
@@ -649,10 +656,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
         tags,
         softTags,
       });
-      if (
-        existing &&
-        _wasPendingTagRevalidatedAfter([...tags, ...softTags], existing.lastModified)
-      ) {
+      if (existing && _wasTagRevalidatedAfter([...tags, ...softTags], existing.lastModified)) {
         existing = null;
       }
       if (existing?.value && existing.value.kind === "FETCH") {

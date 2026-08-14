@@ -669,8 +669,8 @@ describe("KVCacheHandler", () => {
     it("revalidateTag persists slash-based path invalidation markers", async () => {
       await handler.revalidateTag(["/revalidate-tag-test", "_N_T_/revalidate-tag-test"]);
 
-      expect(store.get("__tag:/revalidate-tag-test")).toMatch(/^\d+$/);
-      expect(store.get("__tag:_N_T_/revalidate-tag-test")).toMatch(/^\d+$/);
+      expect(Number(store.get("__tag:/revalidate-tag-test"))).toBeGreaterThan(0);
+      expect(Number(store.get("__tag:_N_T_/revalidate-tag-test"))).toBeGreaterThan(0);
     });
 
     it("slash-based path tags invalidate persisted APP_PAGE entries", async () => {
@@ -699,6 +699,26 @@ describe("KVCacheHandler", () => {
 
       expect(result).toBeNull();
       expect(kv.delete).toHaveBeenCalledWith("cache:app-page");
+    });
+
+    it("keeps an entry created at the same timestamp as tag invalidation", async () => {
+      store.set(
+        "cache:same-timestamp",
+        JSON.stringify({
+          value: {
+            kind: "FETCH",
+            data: { headers: {}, body: "fresh", url: "https://example.test/data" },
+            revalidate: 3600,
+          },
+          tags: ["posts"],
+          lastModified: 2_000,
+          revalidateAt: null,
+        }),
+      );
+      store.set("__tag:posts", "2000");
+
+      expect(await handler.get("same-timestamp")).not.toBeNull();
+      expect(kv.delete).not.toHaveBeenCalledWith("cache:same-timestamp");
     });
 
     it("softTags invalidate FETCH reads without deleting the shared entry", async () => {
@@ -1781,6 +1801,7 @@ describe("KVCacheHandler", () => {
         },
         { revalidate: 60, tags },
       );
+      vi.advanceTimersByTime(1);
     }
 
     it("invalidates entries whose paths match the prefix (segment-aware)", async () => {
@@ -1893,6 +1914,7 @@ describe("KVCacheHandler", () => {
       expect(await handler.get("/big-tags")).not.toBeNull();
 
       // Exact-path invalidation via revalidateTag still works
+      vi.advanceTimersByTime(1);
       await handler.revalidateTag(allTags.slice(0, 2));
       handler.resetRequestCache();
       expect(await handler.get("/big-tags")).toBeNull();
@@ -1928,6 +1950,7 @@ describe("KVCacheHandler", () => {
         },
         { revalidate: 60, tags },
       );
+      vi.advanceTimersByTime(1);
     }
 
     it("invalidates the cached page after revalidatePath('/foo')", async () => {
@@ -2025,6 +2048,7 @@ describe("KVCacheHandler", () => {
       const beforeHit = await handler.get("/seeded");
       expect(beforeHit).not.toBeNull();
 
+      vi.advanceTimersByTime(1);
       await Promise.resolve(revalidatePath("/seeded"));
 
       handler.resetRequestCache();
