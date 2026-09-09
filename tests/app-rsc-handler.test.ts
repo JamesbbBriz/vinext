@@ -2305,6 +2305,29 @@ describe("createAppRscHandler", () => {
     );
   });
 
+  it("ignores client-supplied interception context on HTML response-stage dispatch", async () => {
+    const dispatchResponseStage = vi.fn<DispatchAppWorkerResponseStage>(
+      async () => new Response("page"),
+    );
+    const handler = createHandler({ configHeaders: [] });
+
+    const response = await handler(
+      new Request("https://example.test/docs/about", {
+        headers: { "X-Vinext-Interception-Context": "/feed" },
+      }),
+      null,
+      false,
+      dispatchResponseStage,
+    );
+
+    expect(response.status).toBe(200);
+    expect(dispatchResponseStage.mock.calls[0]?.[1]).toMatchObject({
+      interceptionContext: null,
+      isRscRequest: false,
+      kind: "app-page",
+    });
+  });
+
   // Interception renders the source route's tree, so that route must clear the
   // same middleware boundary a direct request to it would. Next.js never renders
   // the source for this request (its rewrite targets the intercepting route and
