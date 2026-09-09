@@ -300,6 +300,49 @@ describe("createAppRscHandler", () => {
     expect(await response.text()).toBe("response-stage");
   });
 
+  it("restores authenticated forwarded invalidations across the App response stage", async () => {
+    const observed: Record<string, boolean | string | null> = {};
+    const responseHandler = createHandler({
+      async dispatchMatchedPage() {
+        observed.oldEntry = _wasTagRevalidatedAfter(["posts,tenant"], 0);
+        observed.newEntry = _wasTagRevalidatedAfter(["posts,tenant"], Date.now() + 10_000);
+        const headers = await requestHeaders();
+        observed.tagsHeader = headers.get(NEXT_CACHE_REVALIDATED_TAGS_HEADER);
+        observed.tokenHeader = headers.get(NEXT_CACHE_REVALIDATE_TAG_TOKEN_HEADER);
+        observed.vinextTagsHeader = headers.get(VINEXT_CACHE_REVALIDATED_TAGS_HEADER);
+        return new Response("page");
+      },
+    });
+    const requestHandler = createHandler();
+    const dispatchResponseStage = vi.fn<DispatchAppWorkerResponseStage>(
+      (request, props, stageOptions) =>
+        responseHandler.handleResponseStage(request, null, props, stageOptions),
+    );
+
+    const response = await requestHandler(
+      new Request("https://example.test/docs/about", {
+        headers: {
+          [NEXT_CACHE_REVALIDATED_TAGS_HEADER]: "posts,tenant",
+          [NEXT_CACHE_REVALIDATE_TAG_TOKEN_HEADER]: "test-draft-secret",
+          [VINEXT_CACHE_REVALIDATED_TAGS_HEADER]: '["posts,tenant"]',
+        },
+      }),
+      null,
+      false,
+      dispatchResponseStage,
+    );
+
+    expect(response.status).toBe(200);
+    expect(dispatchResponseStage.mock.calls[0]?.[2]).toEqual({ cache: "bypass" });
+    expect(observed).toEqual({
+      oldEntry: true,
+      newEntry: false,
+      tagsHeader: null,
+      tokenHeader: null,
+      vinextTagsHeader: null,
+    });
+  });
+
   it.each(["no-cache", "no-store", "max-age=0, no-cache"])(
     "keeps production App responses shareable with request Cache-Control %s",
     async (cacheControl) => {

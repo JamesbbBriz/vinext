@@ -243,7 +243,7 @@ export class KVCacheHandler implements CacheHandler {
     return this.keySpace.tagKey(tag);
   }
 
-  async get(key: string, _ctx?: Record<string, unknown>): Promise<CacheHandlerValue | null> {
+  async get(key: string, _ctx?: CacheHandlerContext): Promise<CacheHandlerValue | null> {
     const kvKey = this._entryKey(key);
     const softTags = validUniqueTags(readStringArrayField(_ctx, "softTags"));
     // Soft tags are known before the entry arrives, so their markers ride the
@@ -296,6 +296,17 @@ export class KVCacheHandler implements CacheHandler {
     }
 
     const entryTags = validUniqueTags(entry.tags);
+    const requestStartTime = _ctx?.requestStartTime;
+    const forwardedTags = new Set(_ctx?.revalidatedTags ?? []);
+    if (
+      typeof requestStartTime === "number" &&
+      Number.isFinite(requestStartTime) &&
+      entry.lastModified <= requestStartTime &&
+      entryTags.some((tag) => forwardedTags.has(tag))
+    ) {
+      this._deleteInBackground(kvKey);
+      return null;
+    }
 
     // A marker an earlier read already cached settles the entry on its own, so
     // check before awaiting reads whose failure would otherwise mask it.

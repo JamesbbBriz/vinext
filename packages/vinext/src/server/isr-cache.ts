@@ -24,6 +24,7 @@ import {
 import { getCdnCacheAdapter } from "vinext/shims/cdn-cache";
 import { fnv1a64 } from "../utils/hash.js";
 import { getRequestExecutionContext } from "vinext/shims/request-context";
+import { getRequestContext, isInsideUnifiedScope } from "vinext/shims/unified-request-context";
 import { reportRequestError, type OnRequestErrorContext } from "./instrumentation.js";
 import { normalizeMountedSlotsHeader } from "./app-mounted-slots-header.js";
 import {
@@ -89,7 +90,16 @@ export type ISRCacheEntry = {
 export async function isrGet(key: string): Promise<ISRCacheEntry | null> {
   // Page-level reads go through the CDN cache adapter. The default adapter
   // reads the data cache; an edge adapter may return null so the CDN serves.
-  const result = await getCdnCacheAdapter().get(key);
+  const requestContext = isInsideUnifiedScope() ? getRequestContext() : null;
+  const result = await getCdnCacheAdapter().get(
+    key,
+    requestContext && requestContext.previouslyRevalidatedTags.size > 0
+      ? {
+          requestStartTime: requestContext.requestStartTime,
+          revalidatedTags: [...requestContext.previouslyRevalidatedTags],
+        }
+      : undefined,
+  );
   if (!result) return null;
   const isExpired = result.cacheState === "expired";
 

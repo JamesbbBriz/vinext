@@ -776,6 +776,30 @@ describe("KVCacheHandler", () => {
       expect(kv.delete).not.toHaveBeenCalledWith("cache:same-timestamp");
     });
 
+    it("rejects an older entry invalidated by a forwarded request", async () => {
+      store.set(
+        "cache:forwarded-invalidation",
+        JSON.stringify({
+          value: {
+            kind: "FETCH",
+            data: { headers: {}, body: "stale", url: "https://example.test/data" },
+            revalidate: 3600,
+          },
+          tags: ["posts"],
+          lastModified: 1_000,
+          revalidateAt: null,
+        }),
+      );
+
+      expect(
+        await handler.get("forwarded-invalidation", {
+          requestStartTime: 2_000,
+          revalidatedTags: ["posts"],
+        }),
+      ).toBeNull();
+      expect(kv.delete).toHaveBeenCalledWith("cache:forwarded-invalidation");
+    });
+
     it("softTags invalidate FETCH reads without deleting the shared entry", async () => {
       store.set(
         "cache:fetch-entry",

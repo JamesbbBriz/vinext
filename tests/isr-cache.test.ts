@@ -493,6 +493,25 @@ describe("ISR expire ceiling", () => {
     });
   });
 
+  it("rejects an older ISR entry invalidated by a forwarded request", async () => {
+    setCacheHandler(new MemoryCacheHandler());
+    await isrSet("forwarded-invalidation", buildPagesCacheValue("<html>stale</html>", {}), {
+      cacheControl: { revalidate: 60 },
+      tags: ["posts"],
+      timestamp: 1_000,
+    });
+
+    await runWithRequestContext(
+      createRequestContext({
+        previouslyRevalidatedTags: new Set(["posts"]),
+        requestStartTime: 2_000,
+      }),
+      async () => {
+        await expect(isrGet("forwarded-invalidation")).resolves.toBeNull();
+      },
+    );
+  });
+
   it("stores revalidate false without creating a revalidation deadline", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(1_000);

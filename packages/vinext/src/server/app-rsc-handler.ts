@@ -51,6 +51,7 @@ import {
   closeAfterResponse,
   closeAfterResponseWithBody,
   createRequestContext,
+  getRequestContext,
   preserveFullyBufferedBodyMetadata,
   runWithRequestContext,
 } from "vinext/shims/unified-request-context";
@@ -1056,6 +1057,14 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     : null;
   const draftModeCookie =
     dispatchResponseStage || options.renderResponseStageLocally ? getDraftModeCookieHeader() : null;
+  const cacheRequestContext = getRequestContext();
+  const forwardedRevalidation =
+    cacheRequestContext.previouslyRevalidatedTags.size > 0
+      ? {
+          requestStartTime: cacheRequestContext.requestStartTime,
+          tags: [...cacheRequestContext.previouslyRevalidatedTags],
+        }
+      : undefined;
   const responseStageCacheability = (resolvedRouteUrl: string) => ({
     policyHeaders: null,
     probeMode: responseStageProbeMode,
@@ -1076,6 +1085,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
         )
       : Promise.resolve(null));
   let canUseSharedWorkerResponseStage =
+    forwardedRevalidation === undefined &&
     draftModeCookie === null &&
     !hasMiddlewareCookieOverlay &&
     !hasMiddlewareRequestHeaderOverrides(
@@ -1108,6 +1118,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
               : stageRequest,
             {
               ...props,
+              ...(forwardedRevalidation ? { forwardedRevalidation } : {}),
               cacheability: {
                 ...props.cacheability,
                 policyHeaders: await loadResponseStagePolicy(),
@@ -1808,6 +1819,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
               canonicalPathname,
               cleanPathname,
               draftModeCookie,
+              ...(forwardedRevalidation ? { forwardedRevalidation } : {}),
               isDataRequest,
               isRscRequest,
               matchKind,

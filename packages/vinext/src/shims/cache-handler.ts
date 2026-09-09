@@ -116,7 +116,10 @@ export type CachedImageValue = {
 export type CacheHandlerContext = {
   dev?: boolean;
   maxMemoryCacheSize?: number;
+  /** Authenticated invalidations forwarded from an earlier request. */
   revalidatedTags?: string[];
+  /** Start of the current request, used to order forwarded invalidations. */
+  requestStartTime?: number;
   /**
    * Causal timestamp captured by the producer before cache filling starts.
    * Handlers must persist it as `lastModified` and return it unchanged.
@@ -270,6 +273,18 @@ export class MemoryCacheHandler implements CacheHandler {
   async get(key: string, ctx?: CacheHandlerContext): Promise<CacheHandlerValue | null> {
     const entry = this.store.get(key);
     if (!entry) return null;
+
+    const requestStartTime = ctx?.requestStartTime;
+    const revalidatedTags = new Set(ctx?.revalidatedTags ?? []);
+    if (
+      typeof requestStartTime === "number" &&
+      Number.isFinite(requestStartTime) &&
+      entry.lastModified <= requestStartTime &&
+      entry.tags.some((tag) => revalidatedTags.has(tag))
+    ) {
+      this.deleteEntry(key);
+      return null;
+    }
 
     for (const tag of entry.tags) {
       const revalidatedAt = this.tagRevalidatedAt.get(tag);
