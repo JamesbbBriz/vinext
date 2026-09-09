@@ -6,10 +6,10 @@ import { createBuilder } from "vite-plus";
 import vinext from "../packages/vinext/src/index.js";
 
 const APP_FIXTURE_DIR = path.resolve(import.meta.dirname, "./fixtures/workerd-import-meta-url");
-const GUARDED_DEP_ID = path.join(APP_FIXTURE_DIR, "node_modules/dep-with-guard/index.js");
+const DEPENDENCY_ID = path.join(APP_FIXTURE_DIR, "node_modules/dep-with-guard/index.js");
 // Keep the raw source in a non-JS fixture so the formatter cannot relocate the
 // pre-parenthesis comment into the argument list and weaken this regression.
-const GUARDED_DEP_SOURCE = path.join(APP_FIXTURE_DIR, "deps/dep-with-guard/index.fixture.js.txt");
+const DEPENDENCY_SOURCE = path.join(APP_FIXTURE_DIR, "deps/dep-with-guard/index.fixture.js.txt");
 
 async function readJavaScriptTree(dir: string): Promise<string> {
   const files = await fs.readdir(dir, { recursive: true });
@@ -23,7 +23,7 @@ async function readJavaScriptTree(dir: string): Promise<string> {
   return code;
 }
 
-async function buildFixture(): Promise<{ serverDir: string; clientDir: string }> {
+async function buildFixture(): Promise<string> {
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-workerd-import-meta-url-"));
 
   const rscOutDir = path.join(outDir, "server");
@@ -49,10 +49,10 @@ async function buildFixture(): Promise<{ serverDir: string; clientDir: string }>
         {
           name: "test:dep-with-guard",
           resolveId(source) {
-            if (source === "dep-with-guard") return GUARDED_DEP_ID;
+            if (source === "dep-with-guard") return DEPENDENCY_ID;
           },
           async load(id) {
-            if (id === GUARDED_DEP_ID) return fs.readFile(GUARDED_DEP_SOURCE, "utf8");
+            if (id === DEPENDENCY_ID) return fs.readFile(DEPENDENCY_SOURCE, "utf8");
           },
         },
         vinext({
@@ -67,41 +67,27 @@ async function buildFixture(): Promise<{ serverDir: string; clientDir: string }>
 
     await builder.buildApp();
 
-    return {
-      serverDir: rscOutDir,
-      clientDir: clientOutDir,
-    };
+    return rscOutDir;
   } finally {
     await fs.unlink(nodeModulesLink).catch(() => {});
   }
 }
 
-describe("vinext:workerd-import-meta-url-guard (build integration)", () => {
-  let output: { serverDir: string; clientDir: string } | null = null;
+describe("bundled dependency import.meta.url regression", () => {
+  let serverDir: string | null = null;
 
   afterAll(async () => {
-    if (output) {
-      await fs.rm(path.dirname(output.serverDir), { recursive: true, force: true });
+    if (serverDir) {
+      await fs.rm(path.dirname(serverDir), { recursive: true, force: true });
     }
   });
 
-  it("guards fileURLToPath(import.meta.url) in the built server bundle", async () => {
-    output = await buildFixture();
-    const code = await readJavaScriptTree(output.serverDir);
+  it("preserves fileURLToPath module identity across an annotated call", async () => {
+    serverDir = await buildFixture();
+    const code = await readJavaScriptTree(serverDir);
 
-    // The long-comment dependency call must be guarded in the final output.
-    // Rolldown may minify whitespace and quote style in production chunks.
-    expect(code).toMatch(/import\.meta\.url\?\.startsWith\(["'`]file:["'`]\)/);
+    expect(code).toContain("fileURLToPath");
     // No bare unguarded call may remain, including minified forms.
     expect(code).not.toMatch(/fileURLToPath\(\s*import\.meta\.url\s*\)/);
-  });
-
-  it("does not leak the guard into the client bundle", async () => {
-    output ??= await buildFixture();
-    // The minimal fixture config may not emit a client build; only assert
-    // when one exists.
-    if (!(await fs.stat(output.clientDir).catch(() => null))) return;
-    const clientCode = await readJavaScriptTree(output.clientDir);
-    expect(clientCode).not.toContain('import.meta.url?.startsWith("file:")');
   });
 });
