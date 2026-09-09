@@ -298,13 +298,28 @@ export class KVCacheHandler implements CacheHandler {
     const entryTags = validUniqueTags(entry.tags);
     const requestStartTime = _ctx?.requestStartTime;
     const forwardedTags = new Set(_ctx?.revalidatedTags ?? []);
+    const matchedForwardedTags = entryTags.filter((tag) => forwardedTags.has(tag));
     if (
       typeof requestStartTime === "number" &&
       Number.isFinite(requestStartTime) &&
       entry.lastModified <= requestStartTime &&
-      entryTags.some((tag) => forwardedTags.has(tag))
+      matchedForwardedTags.length > 0
     ) {
-      this._deleteInBackground(kvKey);
+      // Keep the authenticated invalidation visible after this redirected
+      // request. Otherwise a cached null/older marker from #3187's shared
+      // tag cache could admit the same stale KV value on the next request.
+      // Do not delete the entry: this read may itself be a stale colo-cached
+      // value, and an unconditional delete could remove a newer central write.
+      const order = ++this._tagCacheOrder;
+      const fetchedAt = Date.now();
+      for (const tag of matchedForwardedTags) {
+        const current = this._tagCache.get(tag);
+        const timestamp =
+          current && (Number.isNaN(current.timestamp) || current.timestamp > requestStartTime)
+            ? current.timestamp
+            : requestStartTime;
+        this._tagCache.set(tag, { timestamp, fetchedAt, order });
+      }
       return null;
     }
 

@@ -778,6 +778,21 @@ describe("KVCacheHandler", () => {
 
     it("rejects an older entry invalidated by a forwarded request", async () => {
       store.set(
+        "cache:forwarded-primer",
+        JSON.stringify({
+          value: {
+            kind: "FETCH",
+            data: { headers: {}, body: "newer", url: "https://example.test/data" },
+            revalidate: 3600,
+          },
+          tags: ["posts"],
+          lastModified: 3_000,
+          revalidateAt: null,
+        }),
+      );
+      expect(await handler.get("forwarded-primer")).not.toBeNull();
+
+      store.set(
         "cache:forwarded-invalidation",
         JSON.stringify({
           value: {
@@ -797,7 +812,39 @@ describe("KVCacheHandler", () => {
           revalidatedTags: ["posts"],
         }),
       ).toBeNull();
-      expect(kv.delete).toHaveBeenCalledWith("cache:forwarded-invalidation");
+      expect(kv.delete).not.toHaveBeenCalled();
+
+      kv.get.mockClear();
+      expect(await handler.get("forwarded-invalidation")).toBeNull();
+      expect(kv.get).toHaveBeenCalledTimes(1);
+      expect(kv.get).toHaveBeenCalledWith("cache:forwarded-invalidation");
+    });
+
+    it("does not delete a newer central entry after a forwarded stale read", async () => {
+      const value = {
+        kind: "FETCH",
+        data: { headers: {}, body: "value", url: "https://example.test/data" },
+        revalidate: 3600,
+      };
+      const stale = validEntry(value, { tags: ["posts"], lastModified: 1_000 });
+      const replacement = validEntry(value, { tags: ["posts"], lastModified: 3_000 });
+      store.set("cache:forwarded-stale-read", replacement);
+      kv.get.mockImplementation(async (key: string | string[]) => {
+        if (key === "cache:forwarded-stale-read") return stale;
+        if (Array.isArray(key)) {
+          return new Map(key.map((item) => [item, store.get(item) ?? null]));
+        }
+        return store.get(key) ?? null;
+      });
+
+      expect(
+        await handler.get("forwarded-stale-read", {
+          requestStartTime: 2_000,
+          revalidatedTags: ["posts"],
+        }),
+      ).toBeNull();
+      expect(kv.delete).not.toHaveBeenCalled();
+      expect(store.get("cache:forwarded-stale-read")).toBe(replacement);
     });
 
     it("softTags invalidate FETCH reads without deleting the shared entry", async () => {

@@ -23,7 +23,9 @@ export function getCacheTimestamp(): number {
   if (
     typeof performance !== "undefined" &&
     Number.isFinite(performance.timeOrigin) &&
-    performance.timeOrigin > 0
+    // Cloudflare Workers intentionally expose zero while performance.now()
+    // remains an epoch timestamp, so zero is a valid origin here.
+    performance.timeOrigin >= 0
   ) {
     const highResolutionTime = performance.timeOrigin + performance.now();
     // Fake timers and wall-clock corrections can move Date.now() onto a

@@ -5861,6 +5861,20 @@ describe("next/config shim", () => {
 });
 
 describe("next/cache shim", () => {
+  it("uses the high-resolution Workers clock when timeOrigin is zero", async () => {
+    const { getCacheTimestamp } = await import("../packages/vinext/src/shims/cache-handler.js");
+    const originalPerformance = globalThis.performance;
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    vi.stubGlobal("performance", { now: () => 1_000.25, timeOrigin: 0 });
+
+    try {
+      expect(getCacheTimestamp()).toBe(1_000.25);
+    } finally {
+      vi.stubGlobal("performance", originalPerformance);
+      dateNow.mockRestore();
+    }
+  });
+
   it("exports revalidateTag, revalidatePath, unstable_cache", async () => {
     const mod = await import("../packages/vinext/src/shims/cache.js");
     expect(typeof mod.revalidateTag).toBe("function");
