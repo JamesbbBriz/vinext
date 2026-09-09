@@ -174,6 +174,20 @@ function isPathChildOf(path: string, prefix: string): boolean {
   return path.startsWith(prefix + "/");
 }
 
+type TagCacheEntry = {
+  timestamp: number;
+  fetchedAt: number;
+  /** Monotonic order of local cache updates. */
+  order: number;
+  /** Forwarded markers use an inclusive boundary and must not delete KV entries. */
+  forwarded: boolean;
+};
+
+type TagInvalidation = {
+  invalidated: boolean;
+  destructive: boolean;
+};
+
 /**
  * Cloudflare KV data cache handler.
  *
@@ -202,7 +216,7 @@ export class KVCacheHandler implements CacheHandler {
   private ttlSeconds: number;
 
   /** Local in-memory cache for tag invalidation timestamps. Avoids redundant KV reads. */
-  private _tagCache = new Map<string, { timestamp: number; fetchedAt: number; order: number }>();
+  private _tagCache = new Map<string, TagCacheEntry>();
   /** Monotonic ordering for concurrent tag-cache fills and local invalidations. */
   private _tagCacheOrder = 0;
   /** TTL (ms) for local tag cache entries. After this, re-fetch from KV. */
@@ -314,19 +328,23 @@ export class KVCacheHandler implements CacheHandler {
       const fetchedAt = Date.now();
       for (const tag of matchedForwardedTags) {
         const current = this._tagCache.get(tag);
-        const timestamp =
-          current && (Number.isNaN(current.timestamp) || current.timestamp > requestStartTime)
-            ? current.timestamp
-            : requestStartTime;
-        this._tagCache.set(tag, { timestamp, fetchedAt, order });
+        const preserveCurrent =
+          current && (Number.isNaN(current.timestamp) || current.timestamp > requestStartTime);
+        this._tagCache.set(tag, {
+          timestamp: preserveCurrent ? current.timestamp : requestStartTime,
+          fetchedAt,
+          order,
+          forwarded: preserveCurrent ? current.forwarded : true,
+        });
       }
       return null;
     }
 
     // A marker an earlier read already cached settles the entry on its own, so
     // check before awaiting reads whose failure would otherwise mask it.
-    if (this._hasRevalidatedTag(entryTags, entry.lastModified, true)) {
-      this._deleteEntryReadInBackground(kvKey);
+    const cachedInvalidation = this._getTagInvalidation(entryTags, entry.lastModified, true);
+    if (cachedInvalidation.invalidated) {
+      if (cachedInvalidation.destructive) this._deleteEntryReadInBackground(kvKey);
       return null;
     }
 
@@ -340,8 +358,8 @@ export class KVCacheHandler implements CacheHandler {
 
     // The soft-tag batch may have covered an entry tag too, which spares the
     // second hop. Only the post-prime check trusts an entry past its TTL.
-    let invalidated = this._hasRevalidatedTag(entryTags, entry.lastModified, true);
-    if (!invalidated) {
+    let invalidation = this._getTagInvalidation(entryTags, entry.lastModified, true);
+    if (!invalidation.invalidated) {
       await this._primeTagCache(entryTags);
       // The entry-tag hop can race a reset too. Re-prime the complete
       // validation set until one cache generation survives the whole read.
@@ -349,14 +367,14 @@ export class KVCacheHandler implements CacheHandler {
         softTagCache = this._tagCache;
         await this._primeTagCache([...new Set([...softTags, ...entryTags])]);
       }
-      invalidated = this._hasRevalidatedTag(entryTags, entry.lastModified);
+      invalidation = this._getTagInvalidation(entryTags, entry.lastModified);
     }
-    if (invalidated) {
-      this._deleteEntryReadInBackground(kvKey);
+    if (invalidation.invalidated) {
+      if (invalidation.destructive) this._deleteEntryReadInBackground(kvKey);
       return null;
     }
 
-    if (this._hasRevalidatedTag(softTags, entry.lastModified)) {
+    if (this._getTagInvalidation(softTags, entry.lastModified).invalidated) {
       return null;
     }
 
@@ -423,7 +441,12 @@ export class KVCacheHandler implements CacheHandler {
       const current = tagCache.get(tag);
       if (current && current.order >= order) continue;
       const marker = markers.get(this._tagKey(tag));
-      tagCache.set(tag, { timestamp: marker ? Number(marker) : 0, fetchedAt: now, order });
+      tagCache.set(tag, {
+        timestamp: marker ? Number(marker) : 0,
+        fetchedAt: now,
+        order,
+        forwarded: false,
+      });
     }
   }
 
@@ -460,17 +483,27 @@ export class KVCacheHandler implements CacheHandler {
    * counts as never invalidated. Pass `requireFresh` to call it before a prime,
    * so an entry past `tagCacheTtlMs` does not answer for a tag it never re-read.
    */
-  private _hasRevalidatedTag(tags: string[], lastModified: number, requireFresh = false): boolean {
+  private _getTagInvalidation(
+    tags: string[],
+    lastModified: number,
+    requireFresh = false,
+  ): TagInvalidation {
     const now = requireFresh ? Date.now() : 0;
+    let invalidated = false;
+    let destructive = false;
     for (const tag of tags) {
       const cached = this._tagCache.get(tag);
-      if (!cached || cached.timestamp === 0) continue;
+      if (!cached || (cached.timestamp === 0 && !cached.forwarded)) continue;
       if (requireFresh && now - cached.fetchedAt >= this._tagCacheTtl) continue;
-      if (Number.isNaN(cached.timestamp) || cached.timestamp >= lastModified) {
-        return true;
+      if (
+        Number.isNaN(cached.timestamp) ||
+        (cached.forwarded ? cached.timestamp >= lastModified : cached.timestamp > lastModified)
+      ) {
+        invalidated = true;
+        destructive ||= !cached.forwarded;
       }
     }
-    return false;
+    return { invalidated, destructive };
   }
 
   set(key: string, data: IncrementalCacheValue | null, ctx?: CacheHandlerContext): Promise<void> {
@@ -584,7 +617,7 @@ export class KVCacheHandler implements CacheHandler {
     // Update local tag cache immediately so invalidations are reflected
     // without waiting for the TTL to expire
     for (const tag of validTags) {
-      this._tagCache.set(tag, { timestamp: now, fetchedAt: now, order });
+      this._tagCache.set(tag, { timestamp: now, fetchedAt: now, order, forwarded: false });
     }
   }
 

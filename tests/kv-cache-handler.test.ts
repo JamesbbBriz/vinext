@@ -801,7 +801,7 @@ describe("KVCacheHandler", () => {
             revalidate: 3600,
           },
           tags: ["posts"],
-          lastModified: 1_000,
+          lastModified: 2_000,
           revalidateAt: null,
         }),
       );
@@ -818,6 +818,7 @@ describe("KVCacheHandler", () => {
       expect(await handler.get("forwarded-invalidation")).toBeNull();
       expect(kv.get).toHaveBeenCalledTimes(1);
       expect(kv.get).toHaveBeenCalledWith("cache:forwarded-invalidation");
+      expect(kv.delete).not.toHaveBeenCalled();
     });
 
     it("does not delete a newer central entry after a forwarded stale read", async () => {
@@ -843,6 +844,13 @@ describe("KVCacheHandler", () => {
           revalidatedTags: ["posts"],
         }),
       ).toBeNull();
+      expect(kv.delete).not.toHaveBeenCalled();
+      expect(store.get("cache:forwarded-stale-read")).toBe(replacement);
+
+      kv.get.mockClear();
+      expect(await handler.get("forwarded-stale-read")).toBeNull();
+      expect(kv.get).toHaveBeenCalledTimes(1);
+      expect(kv.get).toHaveBeenCalledWith("cache:forwarded-stale-read");
       expect(kv.delete).not.toHaveBeenCalled();
       expect(store.get("cache:forwarded-stale-read")).toBe(replacement);
     });
