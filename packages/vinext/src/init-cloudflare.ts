@@ -57,9 +57,7 @@ export function validateCloudflarePlatformSetup(
     .find((candidate) => fs.existsSync(candidate));
   const wranglerCode = wranglerPath ? fs.readFileSync(wranglerPath, "utf-8") : undefined;
   const updatedWranglerCode = wranglerCode
-    ? updateWranglerConfigForCloudflare(wranglerCode, cloudflare, {
-        root: context.root,
-      })
+    ? updateWranglerConfigForCloudflare(wranglerCode, cloudflare, { root: context.root })
     : undefined;
   const imagesBinding = updatedWranglerCode
     ? getWranglerImagesBinding(updatedWranglerCode)
@@ -94,9 +92,7 @@ export function setupCloudflarePlatform(
     .find((candidate) => fs.existsSync(candidate));
   const wranglerCode = wranglerPath ? fs.readFileSync(wranglerPath, "utf-8") : undefined;
   const updatedWranglerCode = wranglerCode
-    ? updateWranglerConfigForCloudflare(wranglerCode, cloudflare, {
-        root: context.root,
-      })
+    ? updateWranglerConfigForCloudflare(wranglerCode, cloudflare, { root: context.root })
     : undefined;
   const imagesBinding = updatedWranglerCode
     ? getWranglerImagesBinding(updatedWranglerCode)
@@ -489,9 +485,7 @@ export function updateWranglerConfigForCloudflare(
       );
     } else {
       const rawValue = output.slice(kvProperty.valueStart, kvProperty.valueEnd);
-      const namespaces = JSON.parse(stripJsonComments(rawValue)) as Array<{
-        binding?: string;
-      }>;
+      const namespaces = JSON.parse(stripJsonComments(rawValue)) as Array<{ binding?: string }>;
       if (!namespaces.some((namespace) => namespace.binding === "VINEXT_KV_CACHE")) {
         const closing = kvProperty.valueEnd - 1;
         const content = output.slice(kvProperty.valueStart + 1, closing);

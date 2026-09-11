@@ -2116,10 +2116,7 @@ async function probeWebpackConfig(
   }
 
   try {
-    const clientProbe = await runWebpackConfigProbe(config, root, {
-      dev,
-      isServer: false,
-    });
+    const clientProbe = await runWebpackConfigProbe(config, root, { dev, isServer: false });
     const serverProbe = await runWebpackConfigProbe(config, root, {
       dev,
       isServer: true,

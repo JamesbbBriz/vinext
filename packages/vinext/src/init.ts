@@ -179,10 +179,7 @@ export function addScripts(
   root: string,
   port: number | false,
   platform: InitPlatform = "node",
-  options: {
-    warmCdnCache?: boolean;
-    scriptNames?: "namespaced" | "standard";
-  } = {},
+  options: { warmCdnCache?: boolean; scriptNames?: "namespaced" | "standard" } = {},
 ): string[] {
   const pkgPath = path.join(root, "package.json");
   if (!fs.existsSync(pkgPath)) return [];
@@ -654,14 +651,10 @@ export async function init(options: InitOptions): Promise<InitResult> {
       );
       try {
         if (shouldInstall) {
-          const installOutput = await installDeps(root, reactUpgrade, exec, {
-            dev: false,
-          });
+          const installOutput = await installDeps(root, reactUpgrade, exec, { dev: false });
           if (isApproveBuildsError(installOutput)) dependencyInstallNeedsApproval = true;
         } else {
-          const added = addDependencyEntries(root, reactUpgrade, {
-            dev: false,
-          });
+          const added = addDependencyEntries(root, reactUpgrade, { dev: false });
           dependencyEntriesAdded.push(...added);
         }
       } catch (error) {
@@ -680,9 +673,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
         dependencyEntriesAdded.push(...missingDependencies);
         if (isApproveBuildsError(installOutput)) dependencyInstallNeedsApproval = true;
       } else {
-        const added = addDependencyEntries(root, missingDependencies, {
-          dev: false,
-        });
+        const added = addDependencyEntries(root, missingDependencies, { dev: false });
         dependencyEntriesAdded.push(...added);
       }
     } catch (error) {
@@ -701,9 +692,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
         devDependencyEntriesAdded.push(...missingDevDependencies);
         if (isApproveBuildsError(installOutput)) dependencyInstallNeedsApproval = true;
       } else {
-        const added = addDependencyEntries(root, missingDevDependencies, {
-          dev: true,
-        });
+        const added = addDependencyEntries(root, missingDevDependencies, { dev: true });
         devDependencyEntriesAdded.push(...added);
       }
     } catch (error) {
