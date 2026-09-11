@@ -25,7 +25,12 @@
  * pre-split implementation.
  */
 
-import type { CacheHandlerValue, IncrementalCacheValue } from "./cache-handler.js";
+import {
+  getDataCacheHandler,
+  type CacheHandlerContext,
+  type CacheHandlerValue,
+  type IncrementalCacheValue,
+} from "./cache-handler.js";
 import { getExplicitCdnCacheAdapter } from "./cdn-cache-state.js";
 export { setCdnCacheAdapter } from "./cdn-cache-state.js";
 
@@ -145,7 +150,7 @@ export type CdnCacheAdapter = {
    * Default: reads the data cache. Edge adapters typically return `null` so the
    * edge owns serving.
    */
-  get(key: string, ctx?: Record<string, unknown>): Promise<CacheHandlerValue | null>;
+  get(key: string, ctx?: CacheHandlerContext): Promise<CacheHandlerValue | null>;
 
   /**
    * Persist a freshly-rendered page-level artifact.
@@ -153,11 +158,7 @@ export type CdnCacheAdapter = {
    * Default: writes to the data cache. Edge adapters that rely entirely on the
    * CDN may make this a no-op.
    */
-  set(
-    key: string,
-    data: IncrementalCacheValue | null,
-    ctx?: Record<string, unknown>,
-  ): Promise<void>;
+  set(key: string, data: IncrementalCacheValue | null, ctx?: CacheHandlerContext): Promise<void>;
 
   /**
    * Build the response cache headers for a given policy. Returns a map so an
@@ -207,15 +208,14 @@ const PENDING_DYNAMIC_CACHE_CONTROL = "no-store, must-revalidate";
 export class DefaultCdnCacheAdapter implements CdnCacheAdapter {
   readonly ownsBackgroundRevalidation = true;
 
-  async get(key: string, ctx?: Record<string, unknown>): Promise<CacheHandlerValue | null> {
-    const { getDataCacheHandler } = await import("./cache-handler.js");
+  async get(key: string, ctx?: CacheHandlerContext): Promise<CacheHandlerValue | null> {
     return getDataCacheHandler().get(key, ctx);
   }
 
   async set(
     key: string,
     data: IncrementalCacheValue | null,
-    ctx?: Record<string, unknown>,
+    ctx?: CacheHandlerContext,
   ): Promise<void> {
     const { getDataCacheHandler } = await import("./cache-handler.js");
     await getDataCacheHandler().set(key, data, ctx);
