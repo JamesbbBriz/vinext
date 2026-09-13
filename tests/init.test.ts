@@ -941,6 +941,19 @@ describe("init — generated project snapshots", () => {
     expect(snapshotProject(tmpDir)).toMatchSnapshot();
   });
 
+  it.each([
+    ["node", "^3.4.0"],
+    ["node", "^4.2.0"],
+    ["cloudflare", "^3.4.0"],
+    ["cloudflare", "^4.2.0"],
+  ] as const)("wires Tailwind %s %s without upgrading v3", async (platform, version) => {
+    setupProject(tmpDir, { extraPkg: { devDependencies: { tailwindcss: version } } });
+    await runInit(tmpDir, { platform, install: false });
+    const enabled = version.startsWith("^4");
+    expect(readFile(tmpDir, "vite.config.ts").includes("@tailwindcss/vite")).toBe(enabled);
+    expect("@tailwindcss/vite" in (readPkg(tmpDir).devDependencies as object)).toBe(enabled);
+  });
+
   it("adds MDX and Tailwind devDependencies for detected frameworks", () => {
     const groups = getInitDependencyGroups(true, "node", {
       hasMDX: true,
