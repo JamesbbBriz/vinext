@@ -232,10 +232,11 @@ describe("scanImports", () => {
   });
 
   it("honors scoped gitignore rules and negations without a Git repository", () => {
-    writeFile(".gitignore", "generated/\n*.generated.ts\n/root-only.ts\n*.ignored.ts\n");
+    writeFile(".gitignore", "generated/\n*.GENERATED.ts\n/root-only.ts\n*.ignored.ts\n");
     writeFile("generated/bundle.ts", 'import { useAmp } from "next/amp";');
     writeFile("root-only.ts", 'import { useAmp } from "next/amp";');
     writeFile("src/a.generated.ts", 'import { useAmp } from "next/amp";');
+    writeFile("src/b.GENERATED.ts", 'import { useAmp } from "next/amp";');
     writeFile("src/.gitignore", "!keep.ignored.ts\nlocal.ts\n");
     writeFile("src/local.ts", 'import { useAmp } from "next/amp";');
     writeFile("src/keep.ignored.ts", 'import Image from "next/image";');
@@ -248,7 +249,7 @@ describe("scanImports", () => {
       scanImports(tmpDir)
         .map((item) => item.name)
         .sort(),
-    ).toEqual(["next/image", "next/link"]);
+    ).toEqual(["next/amp", "next/image", "next/link"]);
   });
 
   it("ignores imports used only by test modules and tool config files", () => {

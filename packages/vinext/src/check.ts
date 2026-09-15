@@ -382,7 +382,10 @@ function findSourceFiles(
 
   const gitignore = path.join(dir, ".gitignore");
   const rules = fs.existsSync(gitignore)
-    ? [...inherited, { dir, matcher: ignore().add(fs.readFileSync(gitignore, "utf-8")) }]
+    ? [
+        ...inherited,
+        { dir, matcher: ignore({ ignorecase: false }).add(fs.readFileSync(gitignore, "utf-8")) },
+      ]
     : inherited;
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
