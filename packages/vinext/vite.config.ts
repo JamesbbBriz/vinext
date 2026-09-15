@@ -63,6 +63,7 @@ const externalizeBareThirdPartySpecifiers = (
   // get bundled rather than externalized.
   if (
     id === "am-i-vibing" ||
+    id === "ignore" ||
     id === "image-size" ||
     id === "process-ancestry" ||
     id === "pathslash"
@@ -78,15 +79,14 @@ export default defineConfig({
     clean: true,
     deps: {
       resolveDepSubpath: true,
-      // Agent detection and image dimension extraction are build-time
-      // implementation details, so inline them rather than requiring vinext
-      // consumers to install them. Same for pathslash: it is our own ~90-line
-      // node:path wrapper (zero deps), so bundling it keeps it out of consumers'
-      // install graphs.
-      alwaysBundle: ["am-i-vibing", "image-size", "process-ancestry", "pathslash"],
+      // Build-time implementation details are inlined rather than installed by
+      // vinext consumers. Same for pathslash: it is our own ~90-line node:path
+      // wrapper (zero deps), so bundling it keeps it out of consumer installs.
+      alwaysBundle: ["am-i-vibing", "ignore", "image-size", "process-ancestry", "pathslash"],
       neverBundle: (id) =>
         id.includes("node_modules") &&
         !id.includes("am-i-vibing") &&
+        !id.includes("ignore") &&
         !id.includes("image-size") &&
         !id.includes("process-ancestry") &&
         !id.includes("pathslash"),
