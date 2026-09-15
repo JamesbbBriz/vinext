@@ -8,6 +8,7 @@
 import { detectPackageManager, findDir } from "./utils/project.js";
 import { parseAst, type ESTree } from "vite";
 import fs from "node:fs";
+import ignore, { type Ignore } from "ignore";
 import path from "pathslash";
 
 // ── Support status definitions ─────────────────────────────────────────────
@@ -359,16 +360,29 @@ const LIBRARY_SUPPORT: Record<string, { status: Status; detail?: string }> = {
 function findSourceFiles(
   dir: string,
   extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs"],
+  inherited: { dir: string; matcher: Ignore }[] = [],
 ): string[] {
   const results: string[] = [];
   if (!fs.existsSync(dir)) return results;
 
+  const gitignore = path.join(dir, ".gitignore");
+  const rules = fs.existsSync(gitignore)
+    ? [...inherited, { dir, matcher: ignore().add(fs.readFileSync(gitignore, "utf-8")) }]
+    : inherited;
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory() && IGNORED_DIRECTORIES.has(entry.name)) continue;
+    let ignored = false;
+    for (const rule of rules) {
+      const relative = path.relative(rule.dir, fullPath) + (entry.isDirectory() ? "/" : "");
+      const result = rule.matcher.test(relative);
+      if (result.ignored) ignored = true;
+      else if (result.unignored) ignored = false;
+    }
+    if (ignored) continue;
     if (entry.isDirectory()) {
-      if (IGNORED_DIRECTORIES.has(entry.name)) continue;
-      results.push(...findSourceFiles(fullPath, extensions));
+      results.push(...findSourceFiles(fullPath, extensions, rules));
     } else if (extensions.some((ext) => entry.name.endsWith(ext))) {
       results.push(fullPath);
     }
@@ -1006,6 +1020,7 @@ export function checkLibraries(root: string): CheckItem[] {
  */
 export function checkConventions(root: string): CheckItem[] {
   const items: CheckItem[] = [];
+  const sourceFiles = findSourceFiles(root);
 
   // Check for pages/ and app/ at root level, then fall back to src/
   const pagesDir = findDir(root, "pages", "src/pages");
@@ -1025,7 +1040,7 @@ export function checkConventions(root: string): CheckItem[] {
     });
 
     // Count pages
-    const pageFiles = findSourceFiles(pagesDir);
+    const pageFiles = sourceFiles.filter((file) => file.startsWith(`${pagesDir}/`));
     const pages = pageFiles.filter(
       (f) =>
         !f.includes("/api/") &&
@@ -1055,7 +1070,7 @@ export function checkConventions(root: string): CheckItem[] {
       status: "supported",
     });
 
-    const appFiles = findSourceFiles(appDirPath);
+    const appFiles = sourceFiles.filter((file) => file.startsWith(`${appDirPath}/`));
     const pages = appFiles.filter((f) => isAppRouterFile(f, "page"));
     const layouts = appFiles.filter((f) => isAppRouterFile(f, "layout"));
     const routes = appFiles.filter(
