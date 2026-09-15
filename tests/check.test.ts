@@ -1055,6 +1055,23 @@ describe("checkConventions", () => {
     expect(items.find((i) => i.name.includes("1 page"))?.status).toBe("supported");
   });
 
+  it.each([
+    ["app", "page.tsx", "ignored/page.tsx"],
+    ["pages", "index.tsx", "ignored.tsx"],
+  ])("counts files in a symlinked %s directory", (router, page, ignoredPage) => {
+    writeFile(`routes/${page}`, `export default function Page() { return null; }`);
+    writeFile(`routes/${ignoredPage}`, `export default function Ignored() { return null; }`);
+    writeFile(".gitignore", `${router}/${ignoredPage}\n`);
+    fs.symlinkSync(
+      path.join(tmpDir, "routes"),
+      path.join(tmpDir, router),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const items = checkConventions(tmpDir);
+    expect(items.find((item) => item.name === "1 page(s)")).toBeDefined();
+  });
+
   it("prefers root-level app/ over src/app/", () => {
     writeFile("app/page.tsx", `export default function Home() { return <div/>; }`);
     writeFile("src/app/page.tsx", `export default function Home() { return <div/>; }`);

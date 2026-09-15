@@ -355,8 +355,29 @@ const LIBRARY_SUPPORT: Record<string, { status: Status; detail?: string }> = {
 // ── Scanning functions ─────────────────────────────────────────────────────
 
 const IGNORED_DIRECTORIES = new Set(["node_modules", ".next", "dist", ".git"]);
+const SOURCE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs"];
 
 type GitignoreRule = { dir: string; matcher: Ignore };
+
+function readGitignoreRule(dir: string): GitignoreRule | undefined {
+  const gitignore = path.join(dir, ".gitignore");
+  if (!fs.existsSync(gitignore)) return;
+  return {
+    dir,
+    matcher: ignore({ ignorecase: false }).add(fs.readFileSync(gitignore, "utf-8")),
+  };
+}
+
+function ancestorGitignoreRules(root: string, dir: string): GitignoreRule[] {
+  const rules: GitignoreRule[] = [];
+  let current = root;
+  for (const segment of path.relative(root, dir).split("/")) {
+    const rule = readGitignoreRule(current);
+    if (rule) rules.push(rule);
+    current = path.join(current, segment);
+  }
+  return rules;
+}
 
 function isGitignored(fullPath: string, isDirectory: boolean, rules: GitignoreRule[]): boolean {
   let ignored = false;
@@ -374,19 +395,14 @@ function isGitignored(fullPath: string, isDirectory: boolean, rules: GitignoreRu
  */
 function findSourceFiles(
   dir: string,
-  extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs"],
+  extensions = SOURCE_EXTENSIONS,
   inherited: GitignoreRule[] = [],
 ): string[] {
   const results: string[] = [];
   if (!fs.existsSync(dir)) return results;
 
-  const gitignore = path.join(dir, ".gitignore");
-  const rules = fs.existsSync(gitignore)
-    ? [
-        ...inherited,
-        { dir, matcher: ignore({ ignorecase: false }).add(fs.readFileSync(gitignore, "utf-8")) },
-      ]
-    : inherited;
+  const localRule = readGitignoreRule(dir);
+  const rules = localRule ? [...inherited, localRule] : inherited;
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
@@ -1013,6 +1029,12 @@ export function checkLibraries(root: string): CheckItem[] {
 export function checkConventions(root: string): CheckItem[] {
   const items: CheckItem[] = [];
   const sourceFiles = findSourceFiles(root);
+  const routeFiles = (dir: string) => {
+    const files = sourceFiles.filter((file) => file.startsWith(`${dir}/`));
+    return files.length
+      ? files
+      : findSourceFiles(dir, SOURCE_EXTENSIONS, ancestorGitignoreRules(root, dir));
+  };
 
   // Check for pages/ and app/ at root level, then fall back to src/
   const pagesDir = findDir(root, "pages", "src/pages");
@@ -1032,7 +1054,7 @@ export function checkConventions(root: string): CheckItem[] {
     });
 
     // Count pages
-    const pageFiles = sourceFiles.filter((file) => file.startsWith(`${pagesDir}/`));
+    const pageFiles = routeFiles(pagesDir);
     const pages = pageFiles.filter(
       (f) =>
         !f.includes("/api/") &&
@@ -1062,7 +1084,7 @@ export function checkConventions(root: string): CheckItem[] {
       status: "supported",
     });
 
-    const appFiles = sourceFiles.filter((file) => file.startsWith(`${appDirPath}/`));
+    const appFiles = routeFiles(appDirPath);
     const pages = appFiles.filter((f) => isAppRouterFile(f, "page"));
     const layouts = appFiles.filter((f) => isAppRouterFile(f, "layout"));
     const routes = appFiles.filter(
