@@ -216,10 +216,11 @@ describe("scanImports", () => {
     expect(items[0].name).toBe("next/image");
   });
 
-  it("ignores build output from other toolchains during migrations", () => {
+  it("ignores gitignored build output from other toolchains during migrations", () => {
     // An OpenNext deployment's worker bundle and wrangler's local state
     // contain bundled next/* imports and CJS globals that are not
     // application source; reporting them blocks real migration findings.
+    writeFile(".gitignore", ".open-next/\n.wrangler/\n.output/\n");
     writeFile(".open-next/server-functions/default/handler.mjs", `import Link from "next/link";`);
     writeFile(".wrangler/state/v3/d1/cache.js", `import { useAmp } from "next/amp";`);
     writeFile(".output/server/index.mjs", `import Link from "next/link";`);
