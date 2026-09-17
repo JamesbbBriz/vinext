@@ -424,9 +424,14 @@ export function detectProject(root: string): ProjectInfo {
           .replace(/^npm:tailwindcss@/, "")
       : undefined;
   let installedTailwindMajor: number | undefined;
-  const tailwindManifest = declaredTailwind
-    ? findInNodeModules(root, "tailwindcss/package.json")
-    : null;
+  let tailwindManifest: string | null = null;
+  if (declaredTailwind) {
+    try {
+      tailwindManifest = createRequire(pkgPath).resolve("tailwindcss/package.json");
+    } catch {
+      tailwindManifest = findInNodeModules(root, "tailwindcss/package.json");
+    }
+  }
   if (tailwindManifest) {
     try {
       const version = (

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vite-plus/test"
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import Module from "node:module";
 import {
   init,
   generateViteConfig,
@@ -1138,6 +1139,40 @@ describe("init — generated project snapshots", () => {
     await runInit(tmpDir, { platform, install: false });
     expect(readFile(tmpDir, "vite.config.ts").includes("@tailwindcss/vite")).toBe(enabled);
     expect("@tailwindcss/vite" in (readPkg(tmpDir).devDependencies as object)).toBe(enabled);
+  });
+
+  it("detects an installed Tailwind v4 package resolved through Yarn PnP", async () => {
+    setupProject(tmpDir, {
+      router: "app",
+      extraPkg: { devDependencies: { tailwindcss: "latest" } },
+    });
+    const manifestPath = path.join(tmpDir, ".yarn/cache/tailwindcss/package.json");
+    writeFile(tmpDir, ".yarn/cache/tailwindcss/package.json", JSON.stringify({ version: "4.2.0" }));
+
+    const originalResolveFilename = Reflect.get(Module, "_resolveFilename") as (
+      request: string,
+      parent: { filename?: string } | undefined,
+      ...args: unknown[]
+    ) => string;
+    Reflect.set(
+      Module,
+      "_resolveFilename",
+      (request: string, parent: { filename?: string } | undefined, ...args: unknown[]) =>
+        request === "tailwindcss/package.json" &&
+        parent?.filename === path.join(tmpDir, "package.json")
+          ? manifestPath
+          : originalResolveFilename.call(Module, request, parent, ...args),
+    );
+
+    try {
+      await runInit(tmpDir, { platform: "node", install: false });
+    } finally {
+      Reflect.set(Module, "_resolveFilename", originalResolveFilename);
+    }
+
+    expect(readFile(tmpDir, "vite.config.ts")).toContain(
+      'import tailwindcss from "@tailwindcss/vite"',
+    );
   });
 
   it.each(["app", "pages"] as const)(
