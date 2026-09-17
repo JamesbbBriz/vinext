@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 import { parseSync } from "vite";
 import vm from "node:vm";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import {
   generateAppRouterViteConfig,
   generatePagesRouterViteConfig,
@@ -589,8 +591,62 @@ export default { plugins: [vinext(), ${tailwindCall}] };
     expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
   });
 
+  it("loads Tailwind's ESM-only Vite plugin from a CommonJS config", async () => {
+    const input = `const { defineConfig } = require("vite");
+const vinext = require("vinext");
+
+module.exports = defineConfig({ plugins: [vinext()] });
+`;
+    const options = {
+      isAppRouter: false,
+      hasTailwindV4: true,
+      nativeModulesToStub: [],
+      cache: {
+        dataCache: "none" as const,
+        cdnCache: "none" as const,
+        imageOptimization: "none" as const,
+      },
+    };
+    const output = updateViteConfigForCloudflare("vite.config.cjs", input, options);
+    expectValidConfig(output);
+    expect(output).not.toContain('require("@tailwindcss/vite")');
+    expect(output).toContain('import("@tailwindcss/vite")');
+    expect(updateViteConfigForCloudflare("vite.config.cjs", output, options)).toBe(output);
+
+    const configModule: { exports: { plugins?: unknown[] } } = { exports: {} };
+    const tailwindEntry = createRequire(
+      new URL("../examples/benchmarks/package.json", import.meta.url),
+    ).resolve("@tailwindcss/vite");
+    vm.runInNewContext(
+      output.replace(
+        'import("@tailwindcss/vite")',
+        `import(${JSON.stringify(pathToFileURL(tailwindEntry).href)})`,
+      ),
+      {
+        module: configModule,
+        require(id: string): unknown {
+          if (id === "vite") return { defineConfig: (config: unknown) => config };
+          if (id === "vinext") return () => "vinext";
+          if (id === "@cloudflare/vite-plugin") return { cloudflare: () => "cloudflare" };
+          throw new Error(`Unexpected require: ${id}`);
+        },
+      },
+      {
+        importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+      },
+    );
+
+    const plugins = (await Promise.all(configModule.exports.plugins ?? [])).flat(Infinity);
+    expect(plugins).toContain("vinext");
+    expect(plugins).toContain("cloudflare");
+    expect(plugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: expect.stringContaining("tailwindcss") }),
+      ]),
+    );
+  });
+
   it.each([
-    ["without an existing require", "", "tailwindcss()"],
     [
       "with an existing namespace require",
       'const tw = require("@tailwindcss/vite");\n',

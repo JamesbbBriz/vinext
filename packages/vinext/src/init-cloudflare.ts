@@ -1584,6 +1584,40 @@ function findDefaultRequiredBinding(
   return undefined;
 }
 
+function findDynamicImportPluginBinding(
+  program: ESTree.Program,
+  source: string,
+): string | undefined {
+  for (const statement of program.body) {
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations) {
+      const initializer = unwrapExpression(declaration.init);
+      if (declaration.id.type !== "Identifier" || initializer?.type !== "ArrowFunctionExpression") {
+        continue;
+      }
+      const body = unwrapExpression(initializer.body);
+      if (body?.type !== "CallExpression") continue;
+      const callee = unwrapExpression(body.callee);
+      if (
+        callee?.type === "MemberExpression" &&
+        !callee.computed &&
+        callee.property.type === "Identifier" &&
+        callee.property.name === "then"
+      ) {
+        const imported = unwrapExpression(callee.object);
+        if (
+          imported?.type === "ImportExpression" &&
+          imported.source.type === "Literal" &&
+          imported.source.value === source
+        ) {
+          return declaration.id.name;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
 function findRequiredBinding(
   program: ESTree.Program,
   source: string,
@@ -2429,14 +2463,24 @@ export function updateViteConfigForCloudflare(
     const existingRequire = commonJs
       ? findDefaultRequiredBinding(program, "@tailwindcss/vite")
       : undefined;
+    const existingDynamicImport = commonJs
+      ? findDynamicImportPluginBinding(program, "@tailwindcss/vite")
+      : undefined;
     const existingImport = commonJs
       ? undefined
       : findDefaultImportedBinding(program, "@tailwindcss/vite");
-    const tailwindBinding = commonJs
-      ? (existingRequire?.binding ??
-        ensureNamedRequire(program, output, "@tailwindcss/vite", "default", tailwindLocal))
-      : (existingImport?.binding ??
-        ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal));
+    let tailwindBinding: string;
+    if (commonJs && !existingRequire && !existingDynamicImport) {
+      const offset = requireInsertionOffset(program);
+      const sourceText = `const ${tailwindLocal} = () => import("@tailwindcss/vite").then(({ default: plugin }) => plugin());`;
+      output.appendLeft(offset, offset === 0 ? `${sourceText}\n` : `\n${sourceText}`);
+      tailwindBinding = tailwindLocal;
+    } else {
+      tailwindBinding = commonJs
+        ? (existingRequire?.binding ?? existingDynamicImport ?? tailwindLocal)
+        : (existingImport?.binding ??
+          ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal));
+    }
     const member = existingRequire?.namespace || existingImport?.namespace ? "default" : undefined;
     tailwindPlugin = {
       expression: `${tailwindBinding}${member ? `.${member}` : ""}()`,
