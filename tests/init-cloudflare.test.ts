@@ -11,6 +11,7 @@ import {
   getWranglerImagesBinding,
   getWranglerVersionMetadataBinding,
   updateViteConfigForCloudflare,
+  updateViteConfigForTailwind,
   updateWranglerConfigForCloudflare,
 } from "../packages/vinext/src/init-cloudflare.js";
 import { readPagesRouterEntrySource } from "./worker-entry-source.js";
@@ -1112,6 +1113,72 @@ export default { plugins };
     );
     expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
   });
+
+  it("updates a callback-local static plugin array", () => {
+    const input = `import { defineConfig } from "vite";
+import vinext from "vinext";
+export default defineConfig(() => {
+  const plugins = [vinext()];
+  return { plugins };
+});
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output).toContain('import tailwindcss from "@tailwindcss/vite"');
+    expect(output).toContain("const plugins = [");
+    expect(output).toContain("tailwindcss()");
+    expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
+  });
+
+  it("does not treat conditional required plugins as configured", () => {
+    const input = `import vinext from "vinext";
+import { cloudflare } from "@cloudflare/vite-plugin";
+const enabled = process.env.CLOUDFLARE === "true";
+export default { plugins: [vinext(), enabled && cloudflare()] };
+`;
+
+    const output = updateViteConfigForCloudflare("vite.config.ts", input, {
+      isAppRouter: true,
+      nativeModulesToStub: [],
+    });
+
+    expectValidConfig(output);
+    expect(output).toContain("enabled && cloudflare()");
+    expect(output).toMatch(
+      /cloudflare\(\{\s+viteEnvironment: \{\s+name: "rsc",\s+childEnvironments: \["ssr"\],/,
+    );
+  });
+
+  it("rejects a mutable variable-backed plugin array", () => {
+    expect(() =>
+      updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import vinext from "vinext";
+let plugins = [];
+plugins = [vinext()];
+export default { plugins };
+`,
+      ),
+    ).toThrow("plugins option must be an array");
+  });
+
+  it.each(["satisfies UserConfig", "as UserConfig"])(
+    "updates a config wrapped with %s",
+    (wrapper) => {
+      const output = updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import type { UserConfig } from "vite";
+import vinext from "vinext";
+export default ({ plugins: [vinext()] } ${wrapper});
+`,
+      );
+
+      expectValidConfig(output);
+      expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
+    },
+  );
 
   it("rejects dynamic plugin arrays", () => {
     expect(() =>

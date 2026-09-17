@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import MagicString from "magic-string";
 import type { ESTree } from "vite";
 import type { CloudflareInitOptions } from "./init-platform.js";
-import { unwrapExpression } from "./plugins/ast-utils.js";
+import { forEachAstChild, unwrapExpression } from "./plugins/ast-utils.js";
 import { detectProject } from "./utils/project.js";
 import { isUnknownRecord } from "./utils/record.js";
 
@@ -1271,9 +1271,8 @@ function findProperty(object: AstObject, name: string): AstProperty | undefined 
 }
 
 function unwrapObject(expression: ESTree.Expression): AstObject | undefined {
-  if (expression.type === "ObjectExpression") return expression as AstObject;
-  if (expression.type === "ParenthesizedExpression") return unwrapObject(expression.expression);
-  return undefined;
+  const unwrapped = unwrapExpression(expression);
+  return unwrapped?.type === "ObjectExpression" ? (unwrapped as AstObject) : undefined;
 }
 
 function findVariableObject(program: ESTree.Program, name: string): AstObject | undefined {
@@ -1839,6 +1838,56 @@ function findPluginCall(
     : undefined;
 }
 
+function findAstPath(root: ESTree.Node, target: ESTree.Node): ESTree.Node[] | undefined {
+  if (root === target) return [root];
+  let path: ESTree.Node[] | undefined;
+  forEachAstChild(root, (child) => {
+    if (path) return;
+    const childPath = findAstPath(child, target);
+    if (childPath) path = [root, ...childPath];
+  });
+  return path;
+}
+
+function findVisiblePluginArray(
+  program: ESTree.Program,
+  config: AstObject,
+  binding: string,
+): (ESTree.ArrayExpression & AstNode) | undefined {
+  const path = findAstPath(program, config);
+  if (!path) return undefined;
+  let array: (ESTree.ArrayExpression & AstNode) | undefined;
+  for (const node of path) {
+    if (
+      node.type === "FunctionDeclaration" ||
+      node.type === "FunctionExpression" ||
+      node.type === "ArrowFunctionExpression"
+    ) {
+      const parameterBindings = new Set<string>();
+      for (const parameter of node.params) collectPatternBindings(parameter, parameterBindings);
+      if (parameterBindings.has(binding)) array = undefined;
+    }
+    const statements =
+      node.type === "Program" || node.type === "BlockStatement" ? node.body : undefined;
+    if (!statements) continue;
+    for (const statement of statements) {
+      const declaration =
+        statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+      if (declaration?.type !== "VariableDeclaration") continue;
+      const declarator = declaration.declarations.find(
+        (candidate) => candidate.id.type === "Identifier" && candidate.id.name === binding,
+      );
+      if (!declarator) continue;
+      const initializer = unwrapExpression(declarator.init);
+      array =
+        declaration.kind === "const" && initializer?.type === "ArrayExpression"
+          ? (initializer as ESTree.ArrayExpression & AstNode)
+          : undefined;
+    }
+  }
+  return array;
+}
+
 function findPluginArray(
   config: AstObject,
   program: ESTree.Program,
@@ -1847,28 +1896,16 @@ function findPluginArray(
   if (!plugins) return undefined;
   if (plugins.value.type === "ArrayExpression") return plugins.value;
   if (plugins.value.type !== "Identifier") return undefined;
-  const pluginsBinding = plugins.value.name;
-  for (const statement of program.body) {
-    const statementDeclaration =
-      statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
-    if (statementDeclaration?.type !== "VariableDeclaration") continue;
-    const declaration = statementDeclaration.declarations.find(
-      (candidate) => candidate.id.type === "Identifier" && candidate.id.name === pluginsBinding,
-    );
-    const initializer = unwrapExpression(declaration?.init);
-    if (initializer?.type === "ArrayExpression") {
-      return initializer as ESTree.ArrayExpression & AstNode;
-    }
-  }
-  return undefined;
+  return findVisiblePluginArray(program, config, plugins.value.name);
 }
 
 function findCallInPluginArray(
   array: ESTree.ArrayExpression,
   matches: (call: ESTree.CallExpression) => boolean,
+  allowConditional = false,
 ): (ESTree.CallExpression & AstNode) | undefined {
   for (const element of array.elements) {
-    const call = findCallInPluginExpression(element, matches);
+    const call = findCallInPluginExpression(element, matches, allowConditional);
     if (call) return call;
   }
   return undefined;
@@ -1877,21 +1914,22 @@ function findCallInPluginArray(
 function findCallInPluginExpression(
   node: ESTree.Node | null,
   matches: (call: ESTree.CallExpression) => boolean,
+  allowConditional: boolean,
 ): (ESTree.CallExpression & AstNode) | undefined {
   const expression = unwrapExpression(node?.type === "SpreadElement" ? node.argument : node);
   if (expression?.type === "ArrayExpression") {
-    return findCallInPluginArray(expression, matches);
+    return findCallInPluginArray(expression, matches, allowConditional);
   }
-  if (expression?.type === "LogicalExpression") {
+  if (allowConditional && expression?.type === "LogicalExpression") {
     return (
-      findCallInPluginExpression(expression.left, matches) ??
-      findCallInPluginExpression(expression.right, matches)
+      findCallInPluginExpression(expression.left, matches, true) ??
+      findCallInPluginExpression(expression.right, matches, true)
     );
   }
-  if (expression?.type === "ConditionalExpression") {
+  if (allowConditional && expression?.type === "ConditionalExpression") {
     return (
-      findCallInPluginExpression(expression.consequent, matches) ??
-      findCallInPluginExpression(expression.alternate, matches)
+      findCallInPluginExpression(expression.consequent, matches, true) ??
+      findCallInPluginExpression(expression.alternate, matches, true)
     );
   }
   if (expression?.type === "CallExpression" && matches(expression)) {
@@ -2142,10 +2180,17 @@ function indentBlock(source: string, indent: string): string {
     .join("\n");
 }
 
+type PluginAddition = {
+  expression: string;
+  binding: string;
+  member?: string;
+  allowConditional?: boolean;
+};
+
 function ensurePlugins(
   output: MagicString,
   config: AstObject,
-  additions: Array<{ expression: string; binding: string; member?: string }>,
+  additions: PluginAddition[],
   code: string,
   program: ESTree.Program,
 ): void {
@@ -2170,23 +2215,27 @@ function ensurePlugins(
   const elementIndent = `${propertyIndent}  `;
   const missingExpressions: string[] = [];
   for (const addition of additions) {
-    const alreadyConfigured = findCallInPluginArray(array, (expression) => {
-      if (expression.callee.type === "Identifier") {
-        return expression.callee.name === addition.binding;
-      }
-      return (
-        addition.member !== undefined &&
-        expression.callee.type === "MemberExpression" &&
-        expression.callee.object.type === "Identifier" &&
-        expression.callee.object.name === addition.binding &&
-        ((!expression.callee.computed &&
-          expression.callee.property.type === "Identifier" &&
-          expression.callee.property.name === addition.member) ||
-          (expression.callee.computed &&
-            expression.callee.property.type === "Literal" &&
-            expression.callee.property.value === addition.member))
-      );
-    });
+    const alreadyConfigured = findCallInPluginArray(
+      array,
+      (expression) => {
+        if (expression.callee.type === "Identifier") {
+          return expression.callee.name === addition.binding;
+        }
+        return (
+          addition.member !== undefined &&
+          expression.callee.type === "MemberExpression" &&
+          expression.callee.object.type === "Identifier" &&
+          expression.callee.object.name === addition.binding &&
+          ((!expression.callee.computed &&
+            expression.callee.property.type === "Identifier" &&
+            expression.callee.property.name === addition.member) ||
+            (expression.callee.computed &&
+              expression.callee.property.type === "Literal" &&
+              expression.callee.property.value === addition.member))
+        );
+      },
+      addition.allowConditional,
+    );
     if (!alreadyConfigured) missingExpressions.push(addition.expression);
   }
   if (missingExpressions.length === 0) return;
@@ -2240,7 +2289,7 @@ function prepareTailwindPlugin(
   output: MagicString,
   bindings: Set<string>,
   commonJs: boolean,
-): { expression: string; binding: string; member?: string } {
+): PluginAddition {
   const tailwindLocal = allocateBinding(bindings, "tailwindcss");
   const existingRequire = commonJs
     ? findDefaultRequiredBinding(program, "@tailwindcss/vite")
@@ -2268,6 +2317,7 @@ function prepareTailwindPlugin(
     expression: `${tailwindBinding}${member ? `.${member}` : ""}()`,
     binding: tailwindBinding,
     member,
+    allowConditional: true,
   };
 }
 
@@ -2570,7 +2620,7 @@ export function updateViteConfigForCloudflare(
   const cloudflareBinding = commonJs
     ? ensureNamedRequire(program, output, "@cloudflare/vite-plugin", "cloudflare", cloudflareLocal)
     : ensureNamedImport(program, output, "@cloudflare/vite-plugin", "cloudflare", cloudflareLocal);
-  let tailwindPlugin: { expression: string; binding: string; member?: string } | undefined;
+  let tailwindPlugin: PluginAddition | undefined;
   if (options.hasTailwindV4) {
     tailwindPlugin = prepareTailwindPlugin(program, output, bindings, commonJs);
   }
