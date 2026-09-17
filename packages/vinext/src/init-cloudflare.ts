@@ -2211,6 +2211,9 @@ function findCallInPluginExpression(
     return findCallInPluginArray(expression, matches, allowConditional);
   }
   if (allowConditional && expression?.type === "LogicalExpression") {
+    if (expression.operator === "&&") {
+      return findCallInPluginExpression(expression.right, matches, true);
+    }
     return (
       findCallInPluginExpression(expression.left, matches, true) ??
       findCallInPluginExpression(expression.right, matches, true)

@@ -616,6 +616,18 @@ export default { plugins: [vinext(), ${tailwindCall}] };
     expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
   });
 
+  it("does not treat a discarded logical-expression call as configured", () => {
+    const input = `import tw from "@tailwindcss/vite";
+export default { plugins: [tw() && react()] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output.match(/tw\(\)/g)).toHaveLength(2);
+    expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
+  });
+
   it("loads Tailwind's ESM-only Vite plugin from a CommonJS config", async () => {
     const input = `const { defineConfig } = require("vite");
 const vinext = require("vinext");
