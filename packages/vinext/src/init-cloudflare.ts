@@ -1499,6 +1499,27 @@ function ensureDefaultImport(
   return binding;
 }
 
+function findDefaultImportedBinding(
+  program: ESTree.Program,
+  source: string,
+): { binding: string; namespace: boolean } | undefined {
+  const declaration = program.body.find(
+    (statement): statement is ESTree.ImportDeclaration =>
+      statement.type === "ImportDeclaration" && statement.source.value === source,
+  );
+  const specifier = declaration?.specifiers.find(
+    (candidate) =>
+      candidate.type === "ImportDefaultSpecifier" ||
+      candidate.type === "ImportNamespaceSpecifier" ||
+      (candidate.type === "ImportSpecifier" &&
+        candidate.imported.type === "Identifier" &&
+        candidate.imported.name === "default"),
+  );
+  return specifier
+    ? { binding: specifier.local.name, namespace: specifier.type === "ImportNamespaceSpecifier" }
+    : undefined;
+}
+
 function findDefaultRequiredBinding(
   program: ESTree.Program,
   source: string,
@@ -2375,11 +2396,15 @@ export function updateViteConfigForCloudflare(
     const existingRequire = commonJs
       ? findDefaultRequiredBinding(program, "@tailwindcss/vite")
       : undefined;
+    const existingImport = commonJs
+      ? undefined
+      : findDefaultImportedBinding(program, "@tailwindcss/vite");
     const tailwindBinding = commonJs
       ? (existingRequire?.binding ??
         ensureNamedRequire(program, output, "@tailwindcss/vite", "default", tailwindLocal))
-      : ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal);
-    const member = existingRequire?.namespace ? "default" : undefined;
+      : (existingImport?.binding ??
+        ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal));
+    const member = existingRequire?.namespace || existingImport?.namespace ? "default" : undefined;
     tailwindPlugin = {
       expression: `${tailwindBinding}${member ? `.${member}` : ""}()`,
       binding: tailwindBinding,

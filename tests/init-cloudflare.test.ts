@@ -534,6 +534,29 @@ module.exports = defineConfig({ plugins: [vinext()] });
   });
 
   it.each([
+    ["default import", 'import tw from "@tailwindcss/vite";', "tw()"],
+    ["named default import", 'import { default as tw } from "@tailwindcss/vite";', "tw()"],
+    ["namespace import", 'import * as tw from "@tailwindcss/vite";', "tw.default()"],
+  ])("reuses an existing Tailwind v4 %s", (_, tailwindImport, tailwindCall) => {
+    const input = `${tailwindImport}
+import vinext from "vinext";
+
+export default { plugins: [vinext(), ${tailwindCall}] };
+`;
+    const options = {
+      isAppRouter: false,
+      hasTailwindV4: true,
+      nativeModulesToStub: [],
+    };
+    const output = updateViteConfigForCloudflare("vite.config.ts", input, options);
+
+    expectValidConfig(output);
+    expect(output.split("@tailwindcss/vite")).toHaveLength(2);
+    expect(output.split(tailwindCall)).toHaveLength(2);
+    expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
+  });
+
+  it.each([
     ["without an existing require", "", "tailwindcss()"],
     [
       "with an existing namespace require",
@@ -543,6 +566,11 @@ module.exports = defineConfig({ plugins: [vinext()] });
     [
       "with an existing unwrapped require",
       'const tw = require("@tailwindcss/vite").default;\n',
+      "tw()",
+    ],
+    [
+      "with an existing destructured require",
+      'const { default: tw } = require("@tailwindcss/vite");\n',
       "tw()",
     ],
   ])("loads Tailwind v4 from a CommonJS config %s", (_, tailwindRequire, tailwindCall) => {
