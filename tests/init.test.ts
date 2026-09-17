@@ -1129,8 +1129,13 @@ describe("init — generated project snapshots", () => {
     ["node", "app", ">=4 <5"],
   ] as const)("wires Tailwind %s %s %s without upgrading v3", async (platform, router, version) => {
     setupProject(tmpDir, { router, extraPkg: { devDependencies: { tailwindcss: version } } });
-    await runInit(tmpDir, { platform, install: false });
     const enabled = version !== "^3.4.0";
+    writeFile(
+      tmpDir,
+      "node_modules/tailwindcss/package.json",
+      JSON.stringify({ version: enabled ? "4.2.0" : "3.4.17" }),
+    );
+    await runInit(tmpDir, { platform, install: false });
     expect(readFile(tmpDir, "vite.config.ts").includes("@tailwindcss/vite")).toBe(enabled);
     expect("@tailwindcss/vite" in (readPkg(tmpDir).devDependencies as object)).toBe(enabled);
   });
@@ -1697,6 +1702,11 @@ describe("init — guard rails", () => {
       router: "app",
       extraPkg: { devDependencies: { tailwindcss: ">=4 <5" } },
     });
+    writeFile(
+      tmpDir,
+      "node_modules/tailwindcss/package.json",
+      JSON.stringify({ version: "4.2.0" }),
+    );
     writeFile(
       tmpDir,
       "vite.config.ts",

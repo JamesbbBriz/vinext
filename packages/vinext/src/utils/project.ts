@@ -10,44 +10,7 @@ import fs from "node:fs";
 import path from "pathslash";
 import { createRequire } from "node:module";
 
-const TAILWIND_V4_VERSION = /^(?:[~^=]\s*)?v?4(?:\.(?:\d+|[xX*])){0,2}(?:-[\w.-]+)?$/;
-const SEMVER_COMPARATOR =
-  /(?:^|\s)(<=|>=|<|>|=)\s*v?(\d+)(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?(?:-([\w.-]+))?(?=\s|$)/g;
-
-/** Return true only when every declared range alternative is confined to Tailwind major 4. */
-function isTailwindV4Range(specifier: string): boolean {
-  const range = specifier
-    .trim()
-    .replace(/^workspace:/, "")
-    .replace(/^npm:tailwindcss@/, "");
-  return range.split(/\s*\|\|\s*/).every((alternative) => {
-    if (TAILWIND_V4_VERSION.test(alternative)) return true;
-    if (/^v?4(?:\.\d+){0,2}\s+-\s+v?4(?:\.\d+){0,2}$/.test(alternative)) return true;
-
-    const comparators = [...alternative.matchAll(SEMVER_COMPARATOR)];
-    if (comparators.length === 0 || alternative.replace(SEMVER_COMPARATOR, "").trim()) return false;
-
-    const excludesOlderMajors = comparators.some(([, operator, major, minor]) => {
-      if (operator === "=") return major === "4";
-      if (operator === ">=") return major === "4";
-      return operator === ">" && (major === "4" || (major === "3" && minor === undefined));
-    });
-    const excludesNewerMajors = comparators.some(
-      ([, operator, major, minor, patch, prerelease]) => {
-        if (operator === "=") return major === "4";
-        if (operator === "<=") return major === "4";
-        if (operator !== "<") return false;
-        if (major === "4") return minor !== undefined && (minor !== "0" || patch !== "0");
-        return (
-          major === "5" &&
-          (prerelease === undefined || prerelease === "0") &&
-          (minor === undefined || (minor === "0" && (patch === undefined || patch === "0")))
-        );
-      },
-    );
-    return excludesOlderMajors && excludesNewerMajors;
-  });
-}
+const DECLARED_TAILWIND_V4_VERSION = /^(?:[~^=]\s*)?v?4(?:\.(?:\d+|[xX*])){0,2}(?:-[\w.-]+)?$/;
 
 // ─── CJS Config Handling ─────────────────────────────────────────────────────
 
@@ -453,10 +416,36 @@ export function detectProject(root: string): ProjectInfo {
   const hasCodeHike = "codehike" in allDeps;
   // Tailwind v3 uses its PostCSS plugin and must not be upgraded by init.
   // https://v3.tailwindcss.com/docs/guides/vite
+  const declaredTailwind =
+    typeof allDeps.tailwindcss === "string"
+      ? allDeps.tailwindcss
+          .trim()
+          .replace(/^workspace:/, "")
+          .replace(/^npm:tailwindcss@/, "")
+      : undefined;
+  let installedTailwindMajor: number | undefined;
+  const tailwindManifest = declaredTailwind
+    ? findInNodeModules(root, "tailwindcss/package.json")
+    : null;
+  if (tailwindManifest) {
+    try {
+      const version = (
+        JSON.parse(fs.readFileSync(tailwindManifest, "utf-8")) as { version?: unknown }
+      ).version;
+      if (typeof version === "string" && /^\d+\./.test(version)) {
+        installedTailwindMajor = Number.parseInt(version, 10);
+      }
+    } catch {
+      // Fall back to a simple declared version below.
+    }
+  }
   const hasTailwindV4 =
     "@tailwindcss/postcss" in allDeps ||
     "@tailwindcss/vite" in allDeps ||
-    (typeof allDeps.tailwindcss === "string" && isTailwindV4Range(allDeps.tailwindcss));
+    installedTailwindMajor === 4 ||
+    (installedTailwindMajor === undefined &&
+      declaredTailwind !== undefined &&
+      DECLARED_TAILWIND_V4_VERSION.test(declaredTailwind));
   const nativeModulesToStub = detectNativeModules(allDeps);
 
   return {
