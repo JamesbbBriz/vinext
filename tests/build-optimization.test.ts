@@ -272,7 +272,10 @@ describe("optimizeDeps.exclude for vinext", () => {
       path.join(tmpDir, "pages", "index.tsx"),
       `export default function Home() { return <h1>Home</h1>; }`,
     );
-    await fsp.writeFile(path.join(tmpDir, "next.config.mjs"), `export default {};`);
+    await fsp.writeFile(
+      path.join(tmpDir, "next.config.mjs"),
+      `export default { serverExternalPackages: ["jose"] };`,
+    );
 
     try {
       const mockConfig = {
@@ -287,11 +290,15 @@ describe("optimizeDeps.exclude for vinext", () => {
 
       expect(result.optimizeDeps?.exclude).toContain("vinext");
       expect(result.optimizeDeps?.exclude).toContain("@vercel/og");
+      expect(result.optimizeDeps?.exclude).toContain("file-type");
+      expect(result.optimizeDeps?.exclude).toContain("jose");
       // Incoming excludes from other plugins must survive the merge
       expect(result.optimizeDeps?.exclude).toContain("@lingui/macro");
       // No duplicates
       expect(new Set(result.optimizeDeps.exclude).size).toBe(result.optimizeDeps.exclude.length);
       expect(result.environments.ssr.resolve.external).toContain("typescript");
+      expect(result.environments.ssr.optimizeDeps.exclude).toContain("file-type");
+      expect(result.environments.ssr.optimizeDeps.exclude).toContain("jose");
       expect(result.define?.["process.env.__VINEXT_HAS_PAGES_ROUTER"]).toBe('"true"');
       expect(
         aliasEntriesToRecord(result.resolve.alias)["vinext/server/pages-client-assets"],
@@ -750,7 +757,10 @@ describe("optimizeDeps.exclude for vinext", () => {
       path.join(tmpDir, "pages", "index.tsx"),
       `export default function Home() { return <h1>Home</h1>; }`,
     );
-    await fsp.writeFile(path.join(tmpDir, "next.config.mjs"), `export default {};`);
+    await fsp.writeFile(
+      path.join(tmpDir, "next.config.mjs"),
+      `export default { serverExternalPackages: ["jose"] };`,
+    );
 
     try {
       await (mainPlugin as any).config(
@@ -782,6 +792,8 @@ describe("optimizeDeps.exclude for vinext", () => {
       );
       expect(workerEnvConfig.optimizeDeps.exclude).toContain("already-excluded");
       expect(workerEnvConfig.optimizeDeps.exclude).toContain("vinext");
+      expect(workerEnvConfig.optimizeDeps.exclude).toContain("file-type");
+      expect(workerEnvConfig.optimizeDeps.exclude).toContain("jose");
       expect(workerEnvConfig.optimizeDeps.exclude).toContain("vinext/server/fetch-handler");
       expect(workerEnvConfig.optimizeDeps.exclude).toContain("vinext/server/pages-router-entry");
     } finally {

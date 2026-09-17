@@ -3388,10 +3388,14 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // Apply the define to the default optimizer and explicitly to server
         // environments, where Vite's keepProcessEnv default prevents replacement.
         viteConfig.optimizeDeps = {
-          // @tailwindcss/oxide contains native .node bindings that Rolldown cannot process
-          exclude: mergeOptimizeDepsExclude(incomingExclude, VINEXT_OPTIMIZE_DEPS_EXCLUDE, [
-            "@tailwindcss/oxide",
-          ]),
+          // @tailwindcss/oxide contains native .node bindings that Rolldown cannot process.
+          // Pages Router client environments inherit this top-level list.
+          exclude: mergeOptimizeDepsExclude(
+            incomingExclude,
+            VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+            nextServerExternal,
+            ["@tailwindcss/oxide"],
+          ),
           ...(incomingInclude.length > 0 ? { include: incomingInclude } : {}),
           ...depOptimizeNodeEnvOptions,
           rolldownOptions: {
@@ -3699,6 +3703,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 exclude: mergeOptimizeDepsExclude(
                   incomingExclude,
                   VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+                  nextServerExternal,
                   ["ipaddr.js"],
                   Object.keys(nextShimMap),
                 ),
@@ -3780,6 +3785,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           config.optimizeDeps.exclude = mergeOptimizeDepsExclude(
             config.optimizeDeps.exclude ?? [],
             VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+            resolvedServerExternalPackages,
             PAGES_CLOUDFLARE_WORKER_OPTIMIZE_DEPS_EXCLUDE,
           );
         }

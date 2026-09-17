@@ -14,11 +14,10 @@ const RSC_CLIENT_SHIM_OPTIMIZE_DEPS_EXCLUDE = Object.freeze([
 export const VINEXT_OPTIMIZE_DEPS_EXCLUDE = Object.freeze([
   "vinext",
   "@vercel/og",
-  // file-type ships a dual CJS/ESM package: when the dep optimizer
-  // pre-bundles it (e.g. reached through payload/dist/uploads), Rolldown
-  // resolves the core entry and loses the named exports — MISSING_EXPORT
-  // on fileTypeFromFile and friends, which kills the dev server. Every
-  // runtime resolver loads it fine, so keep it out of all pre-bundles.
+  // file-type's conditional exports expose Node-only APIs from index.js.
+  // When the dep optimizer reaches it through packages such as Payload,
+  // Rolldown can select core.js instead and report missing named exports.
+  // Runtime resolvers select the correct entry, so keep it out of pre-bundles.
   "file-type",
   // Aliased to the user's instrumentation-client source file (or an empty
   // shim). Not a real npm dep, so pre-bundling it would break HMR and cause
