@@ -2941,7 +2941,7 @@ describe("detectProject — new detection features", () => {
     },
   );
 
-  it.each(["^3.4.0", ">=3 <5", "^3 || ^4", ">=4 <5.1.0"])(
+  it.each(["^3.4.0", ">=3 <5", "^3 || ^4", ">=4 <5.1.0", ">=4 <5.0.0-beta"])(
     "does not guess Tailwind v4 from the ambiguous or non-v4 range %s",
     (version) => {
       mkdir(tmpDir, "app");

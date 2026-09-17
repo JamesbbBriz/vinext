@@ -1692,6 +1692,25 @@ describe("init — guard rails", () => {
     expect(config).toContain("cloudflare(");
   });
 
+  it("adds Tailwind v4 to an existing Cloudflare Vite config", async () => {
+    setupProject(tmpDir, {
+      router: "app",
+      extraPkg: { devDependencies: { tailwindcss: ">=4 <5" } },
+    });
+    writeFile(
+      tmpDir,
+      "vite.config.ts",
+      'import vinext from "vinext";\nexport default { plugins: [vinext()] };',
+    );
+
+    await runInit(tmpDir, { platform: "cloudflare", install: false });
+    await runInit(tmpDir, { platform: "cloudflare", install: false });
+
+    const config = readFile(tmpDir, "vite.config.ts");
+    expect(config.match(/import tailwindcss from "@tailwindcss\/vite"/g)).toHaveLength(1);
+    expect(config.match(/tailwindcss\(\)/g)).toHaveLength(1);
+  });
+
   it("uses an existing Cloudflare plugin import when adding the call", async () => {
     setupProject(tmpDir, { router: "app" });
     writeFile(

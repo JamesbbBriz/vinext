@@ -93,6 +93,7 @@ export function validateCloudflarePlatformSetup(
       fs.readFileSync(context.existingViteConfigPath, "utf-8"),
       {
         isAppRouter: context.isAppRouter,
+        hasTailwindV4: projectInfo.hasTailwindV4,
         nativeModulesToStub: projectInfo.nativeModulesToStub,
         cache: cloudflare,
         imagesBinding,
@@ -131,6 +132,7 @@ export function setupCloudflarePlatform(
       currentConfig,
       {
         isAppRouter: context.isAppRouter,
+        hasTailwindV4: projectInfo.hasTailwindV4,
         nativeModulesToStub: projectInfo.nativeModulesToStub,
         cache: cloudflare,
         imagesBinding,
@@ -2098,6 +2100,7 @@ export function updateViteConfigForCloudflare(
   code: string,
   options: {
     isAppRouter: boolean;
+    hasTailwindV4?: boolean;
     nativeModulesToStub: string[];
     cache?: CloudflareInitOptions;
     imagesBinding?: string;
@@ -2315,10 +2318,19 @@ export function updateViteConfigForCloudflare(
   const cloudflareBinding = commonJs
     ? ensureNamedRequire(program, output, "@cloudflare/vite-plugin", "cloudflare", cloudflareLocal)
     : ensureNamedImport(program, output, "@cloudflare/vite-plugin", "cloudflare", cloudflareLocal);
+  let tailwindPlugin: { expression: string; binding: string } | undefined;
+  if (options.hasTailwindV4) {
+    const tailwindLocal = allocateBinding(bindings, "tailwindcss");
+    const tailwindBinding = commonJs
+      ? ensureDefaultRequire(program, output, "@tailwindcss/vite", tailwindLocal)
+      : ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal);
+    tailwindPlugin = { expression: `${tailwindBinding}()`, binding: tailwindBinding };
+  }
   ensurePlugins(
     output,
     config,
     [
+      ...(tailwindPlugin ? [tailwindPlugin] : []),
       {
         expression: existingVinextCall
           ? `${vinextBinding}()`
