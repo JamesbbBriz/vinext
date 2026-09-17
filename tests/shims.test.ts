@@ -24529,6 +24529,8 @@ describe("next/image component rendering", () => {
     expect(html).not.toContain("height=");
   });
 
+  // Ported from Next.js: test/e2e/next-image-new/default/default.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/next-image-new/default/default.test.ts
   it("fill images leave object-fit to the caller, matching Next.js", async () => {
     const React = await import("react");
     const { renderToStaticMarkup } = await import("react-dom/server");
@@ -24538,8 +24540,6 @@ describe("next/image component rendering", () => {
       React.createElement(Image, { src: "/logo.png", alt: "Logo", fill: true }),
     );
     expect(html).toContain("position:absolute");
-    // No inline object-fit: the value comes from the caller's style or CSS,
-    // exactly like next/image. A hardcoded cover crops non-cover images.
     expect(html).not.toContain("object-fit");
 
     const contained = renderToStaticMarkup(
