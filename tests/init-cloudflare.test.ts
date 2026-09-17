@@ -628,6 +628,18 @@ export default { plugins: [tw() && react()] };
     expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
   });
 
+  it("recognizes an identifier-backed Tailwind plugin instance", () => {
+    const input = `import tw from "@tailwindcss/vite";
+const tailwindPlugin = tw({ optimize: false });
+export default { plugins: [tailwindPlugin] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output).toBe(input);
+  });
+
   it("loads Tailwind's ESM-only Vite plugin from a CommonJS config", async () => {
     const input = `const { defineConfig } = require("vite");
 const vinext = require("vinext");

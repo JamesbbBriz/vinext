@@ -2093,6 +2093,7 @@ function findPluginCall(
     ? findCallInPluginArray(
         array,
         (call) => call.callee.type === "Identifier" && call.callee.name === binding,
+        program,
       )
     : undefined;
 }
@@ -2138,14 +2139,14 @@ function collectConfigShadowedBindings(program: ESTree.Program, config: AstObjec
   return bindings;
 }
 
-function findVisiblePluginArray(
+function findVisibleConstInitializer(
   program: ESTree.Program,
-  config: AstObject,
+  target: ESTree.Node,
   binding: string,
-): (ESTree.ArrayExpression & AstNode) | undefined {
-  const path = findAstPath(program, config);
+): ESTree.Node | undefined {
+  const path = findAstPath(program, target);
   if (!path) return undefined;
-  let array: (ESTree.ArrayExpression & AstNode) | undefined;
+  let initializer: ESTree.Node | undefined;
   for (const node of path) {
     if (
       node.type === "FunctionDeclaration" ||
@@ -2154,9 +2155,9 @@ function findVisiblePluginArray(
     ) {
       const parameterBindings = new Set<string>();
       for (const parameter of node.params) collectPatternBindings(parameter, parameterBindings);
-      if (parameterBindings.has(binding)) array = undefined;
+      if (parameterBindings.has(binding)) initializer = undefined;
     }
-    if (node.type === "FunctionExpression" && node.id?.name === binding) array = undefined;
+    if (node.type === "FunctionExpression" && node.id?.name === binding) initializer = undefined;
     const statements =
       node.type === "Program" || node.type === "BlockStatement" ? node.body : undefined;
     if (!statements) continue;
@@ -2168,14 +2169,22 @@ function findVisiblePluginArray(
         (candidate) => candidate.id.type === "Identifier" && candidate.id.name === binding,
       );
       if (!declarator) continue;
-      const initializer = unwrapExpression(declarator.init);
-      array =
-        declaration.kind === "const" && initializer?.type === "ArrayExpression"
-          ? (initializer as ESTree.ArrayExpression & AstNode)
-          : undefined;
+      initializer =
+        declaration.kind === "const" ? (unwrapExpression(declarator.init) ?? undefined) : undefined;
     }
   }
-  return array;
+  return initializer;
+}
+
+function findVisiblePluginArray(
+  program: ESTree.Program,
+  config: AstObject,
+  binding: string,
+): (ESTree.ArrayExpression & AstNode) | undefined {
+  const initializer = findVisibleConstInitializer(program, config, binding);
+  return initializer?.type === "ArrayExpression"
+    ? (initializer as ESTree.ArrayExpression & AstNode)
+    : undefined;
 }
 
 function findPluginArray(
@@ -2192,10 +2201,20 @@ function findPluginArray(
 function findCallInPluginArray(
   array: ESTree.ArrayExpression,
   matches: (call: ESTree.CallExpression) => boolean,
+  program: ESTree.Program,
   allowConditional = false,
+  scopeTarget: ESTree.Node = array,
+  seenBindings = new Set<string>(),
 ): (ESTree.CallExpression & AstNode) | undefined {
   for (const element of array.elements) {
-    const call = findCallInPluginExpression(element, matches, allowConditional);
+    const call = findCallInPluginExpression(
+      element,
+      matches,
+      program,
+      allowConditional,
+      scopeTarget,
+      seenBindings,
+    );
     if (call) return call;
   }
   return undefined;
@@ -2204,25 +2223,83 @@ function findCallInPluginArray(
 function findCallInPluginExpression(
   node: ESTree.Node | null,
   matches: (call: ESTree.CallExpression) => boolean,
+  program: ESTree.Program,
   allowConditional: boolean,
+  scopeTarget: ESTree.Node,
+  seenBindings: Set<string>,
 ): (ESTree.CallExpression & AstNode) | undefined {
   const expression = unwrapExpression(node?.type === "SpreadElement" ? node.argument : node);
   if (expression?.type === "ArrayExpression") {
-    return findCallInPluginArray(expression, matches, allowConditional);
+    return findCallInPluginArray(
+      expression,
+      matches,
+      program,
+      allowConditional,
+      scopeTarget,
+      seenBindings,
+    );
+  }
+  if (expression?.type === "Identifier" && !seenBindings.has(expression.name)) {
+    const initializer = findVisibleConstInitializer(program, scopeTarget, expression.name);
+    if (!initializer) return undefined;
+    const nextSeenBindings = new Set(seenBindings).add(expression.name);
+    return findCallInPluginExpression(
+      initializer,
+      matches,
+      program,
+      allowConditional,
+      scopeTarget,
+      nextSeenBindings,
+    );
   }
   if (allowConditional && expression?.type === "LogicalExpression") {
     if (expression.operator === "&&") {
-      return findCallInPluginExpression(expression.right, matches, true);
+      return findCallInPluginExpression(
+        expression.right,
+        matches,
+        program,
+        true,
+        scopeTarget,
+        seenBindings,
+      );
     }
     return (
-      findCallInPluginExpression(expression.left, matches, true) ??
-      findCallInPluginExpression(expression.right, matches, true)
+      findCallInPluginExpression(
+        expression.left,
+        matches,
+        program,
+        true,
+        scopeTarget,
+        seenBindings,
+      ) ??
+      findCallInPluginExpression(
+        expression.right,
+        matches,
+        program,
+        true,
+        scopeTarget,
+        seenBindings,
+      )
     );
   }
   if (allowConditional && expression?.type === "ConditionalExpression") {
     return (
-      findCallInPluginExpression(expression.consequent, matches, true) ??
-      findCallInPluginExpression(expression.alternate, matches, true)
+      findCallInPluginExpression(
+        expression.consequent,
+        matches,
+        program,
+        true,
+        scopeTarget,
+        seenBindings,
+      ) ??
+      findCallInPluginExpression(
+        expression.alternate,
+        matches,
+        program,
+        true,
+        scopeTarget,
+        seenBindings,
+      )
     );
   }
   if (expression?.type === "CallExpression" && matches(expression)) {
@@ -2527,6 +2604,7 @@ function ensurePlugins(
               expression.callee.property.value === addition.member))
         );
       },
+      program,
       addition.allowConditional,
     );
     if (!alreadyConfigured) missingExpressions.push(addition.expression);
