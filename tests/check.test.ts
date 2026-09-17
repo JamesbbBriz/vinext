@@ -252,6 +252,14 @@ describe("scanImports", () => {
     ).toEqual(["next/amp", "next/image", "next/link"]);
   });
 
+  it.runIf(process.platform !== "win32")("does not follow a symlinked .gitignore", () => {
+    writeFile("ignore-rules", "generated/\n");
+    writeFile("generated/page.ts", 'import { useAmp } from "next/amp";');
+    fs.symlinkSync(path.join(tmpDir, "ignore-rules"), path.join(tmpDir, ".gitignore"));
+
+    expect(scanImports(tmpDir).map((item) => item.name)).toEqual(["next/amp"]);
+  });
+
   it("ignores imports used only by test modules and tool config files", () => {
     writeFile("app/page.test.tsx", `import { useAmp } from "next/amp";`);
     writeFile("vitest.config.ts", `import { useAmp } from "next/amp";`);
@@ -1076,6 +1084,20 @@ describe("checkConventions", () => {
     writeFile(".gitignore", "app/\n");
     writeFile("app/.gitignore", "!page.tsx\n");
     writeFile("app/page.tsx", `export default function Page() { return null; }`);
+
+    const items = checkConventions(tmpDir);
+    expect(items.find((item) => item.name === "0 page(s)")).toBeDefined();
+  });
+
+  it("does not re-include a symlinked route directory ignored by its parent", () => {
+    writeFile(".gitignore", "app/\n");
+    writeFile("routes/.gitignore", "!page.tsx\n");
+    writeFile("routes/page.tsx", `export default function Page() { return null; }`);
+    fs.symlinkSync(
+      path.join(tmpDir, "routes"),
+      path.join(tmpDir, "app"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
 
     const items = checkConventions(tmpDir);
     expect(items.find((item) => item.name === "0 page(s)")).toBeDefined();

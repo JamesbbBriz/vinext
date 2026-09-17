@@ -361,7 +361,13 @@ type GitignoreRule = { dir: string; matcher: Ignore };
 
 function readGitignoreRule(dir: string): GitignoreRule | undefined {
   const gitignore = path.join(dir, ".gitignore");
-  if (!fs.existsSync(gitignore)) return;
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(gitignore);
+  } catch {
+    return;
+  }
+  if (!stat.isFile()) return;
   return {
     dir,
     matcher: ignore({ ignorecase: false }).add(fs.readFileSync(gitignore, "utf-8")),
@@ -1032,7 +1038,9 @@ export function checkConventions(root: string): CheckItem[] {
   const routeFiles = (dir: string) => {
     const files = sourceFiles.filter((file) => file.startsWith(`${dir}/`));
     if (files.length || !fs.lstatSync(dir).isSymbolicLink()) return files;
-    return findSourceFiles(dir, SOURCE_EXTENSIONS, ancestorGitignoreRules(root, dir));
+    const rules = ancestorGitignoreRules(root, dir);
+    if (isGitignored(dir, true, rules)) return [];
+    return findSourceFiles(dir, SOURCE_EXTENSIONS, rules);
   };
 
   // Check for pages/ and app/ at root level, then fall back to src/
