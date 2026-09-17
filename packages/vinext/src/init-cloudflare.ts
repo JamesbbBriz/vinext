@@ -1841,15 +1841,34 @@ function findCallInPluginArray(
   matches: (call: ESTree.CallExpression) => boolean,
 ): (ESTree.CallExpression & AstNode) | undefined {
   for (const element of array.elements) {
-    const expression = unwrapExpression(
-      element?.type === "SpreadElement" ? element.argument : element,
+    const call = findCallInPluginExpression(element, matches);
+    if (call) return call;
+  }
+  return undefined;
+}
+
+function findCallInPluginExpression(
+  node: ESTree.Node | null,
+  matches: (call: ESTree.CallExpression) => boolean,
+): (ESTree.CallExpression & AstNode) | undefined {
+  const expression = unwrapExpression(node?.type === "SpreadElement" ? node.argument : node);
+  if (expression?.type === "ArrayExpression") {
+    return findCallInPluginArray(expression, matches);
+  }
+  if (expression?.type === "LogicalExpression") {
+    return (
+      findCallInPluginExpression(expression.left, matches) ??
+      findCallInPluginExpression(expression.right, matches)
     );
-    if (expression?.type === "ArrayExpression") {
-      const nested = findCallInPluginArray(expression, matches);
-      if (nested) return nested;
-    } else if (expression?.type === "CallExpression" && matches(expression)) {
-      return expression as ESTree.CallExpression & AstNode;
-    }
+  }
+  if (expression?.type === "ConditionalExpression") {
+    return (
+      findCallInPluginExpression(expression.consequent, matches) ??
+      findCallInPluginExpression(expression.alternate, matches)
+    );
+  }
+  if (expression?.type === "CallExpression" && matches(expression)) {
+    return expression as ESTree.CallExpression & AstNode;
   }
   return undefined;
 }

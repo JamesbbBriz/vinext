@@ -553,6 +553,18 @@ module.exports = defineConfig({ plugins: [vinext()] });
       1,
     ],
     [
+      "conditional plugin call",
+      'import tw from "@tailwindcss/vite";',
+      "enabled ? tw({ optimize: false }) : null",
+      1,
+    ],
+    [
+      "logical plugin call",
+      'import tw from "@tailwindcss/vite";',
+      "isProduction && tw({ optimize: false })",
+      1,
+    ],
+    [
       "call wrapped with satisfies",
       'import tw from "@tailwindcss/vite";',
       "tw({ optimize: false }) satisfies PluginOption",
