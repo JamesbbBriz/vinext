@@ -586,6 +586,16 @@ export async function init(options: InitOptions): Promise<InitResult> {
       },
       options.cloudflare!,
     );
+  } else if (
+    viteConfigExists &&
+    !options.force &&
+    projectInfo.hasTailwindV4 &&
+    existingViteConfigPath
+  ) {
+    updateViteConfigForTailwind(
+      existingViteConfigPath,
+      fs.readFileSync(existingViteConfigPath, "utf-8"),
+    );
   }
 
   // ── Step 1: Compatibility check ────────────────────────────────────────

@@ -1302,11 +1302,135 @@ function unwrapObject(expression: ESTree.Node): AstObject | undefined {
   return unwrapped?.type === "ObjectExpression" ? (unwrapped as AstObject) : undefined;
 }
 
+function isViteNamespaceBinding(program: ESTree.Program, name: string): boolean {
+  for (const statement of program.body) {
+    if (statement.type === "ImportDeclaration" && statement.source.value === "vite") {
+      if (
+        statement.specifiers.some(
+          (specifier) =>
+            specifier.type === "ImportNamespaceSpecifier" && specifier.local.name === name,
+        )
+      ) {
+        return true;
+      }
+      continue;
+    }
+    const variableDeclaration =
+      statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+    if (variableDeclaration?.type !== "VariableDeclaration" || variableDeclaration.kind !== "const")
+      continue;
+    for (const declaration of variableDeclaration.declarations) {
+      const initializer = unwrapExpression(declaration.init);
+      if (
+        declaration.id.type === "Identifier" &&
+        declaration.id.name === name &&
+        initializer?.type === "CallExpression" &&
+        initializer.callee.type === "Identifier" &&
+        initializer.callee.name === "require" &&
+        initializer.arguments[0]?.type === "Literal" &&
+        initializer.arguments[0].value === "vite"
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isViteDefineConfigBinding(program: ESTree.Program, name: string): boolean {
+  for (const statement of program.body) {
+    if (statement.type === "ImportDeclaration" && statement.source.value === "vite") {
+      if (
+        statement.specifiers.some(
+          (specifier) =>
+            specifier.type === "ImportSpecifier" &&
+            specifier.imported.type === "Identifier" &&
+            specifier.imported.name === "defineConfig" &&
+            specifier.local.name === name,
+        )
+      ) {
+        return true;
+      }
+      continue;
+    }
+    const variableDeclaration =
+      statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+    if (variableDeclaration?.type !== "VariableDeclaration" || variableDeclaration.kind !== "const")
+      continue;
+    for (const declaration of variableDeclaration.declarations) {
+      const initializer = unwrapExpression(declaration.init);
+      if (
+        declaration.id.type !== "ObjectPattern" ||
+        initializer?.type !== "CallExpression" ||
+        initializer.callee.type !== "Identifier" ||
+        initializer.callee.name !== "require" ||
+        initializer.arguments[0]?.type !== "Literal" ||
+        initializer.arguments[0].value !== "vite"
+      ) {
+        continue;
+      }
+      if (
+        declaration.id.properties.some(
+          (property) =>
+            property.type === "Property" &&
+            property.key.type === "Identifier" &&
+            property.key.name === "defineConfig" &&
+            property.value.type === "Identifier" &&
+            property.value.name === name,
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isViteDefineConfigCall(program: ESTree.Program, call: ESTree.CallExpression): boolean {
+  const callee = unwrapExpression(call.callee) ?? call.callee;
+  if (callee.type === "Identifier") return isViteDefineConfigBinding(program, callee.name);
+  if (callee.type !== "MemberExpression") return false;
+  const property = unwrapExpression(callee.property) ?? callee.property;
+  const propertyIsDefineConfig = callee.computed
+    ? property.type === "Literal" && property.value === "defineConfig"
+    : property.type === "Identifier" && property.name === "defineConfig";
+  const object = unwrapExpression(callee.object) ?? callee.object;
+  return (
+    propertyIsDefineConfig &&
+    object.type === "Identifier" &&
+    isViteNamespaceBinding(program, object.name)
+  );
+}
+
+function findConfigObjectInCall(
+  program: ESTree.Program,
+  call: ESTree.CallExpression,
+): AstObject | undefined {
+  if (!isViteDefineConfigCall(program, call) || call.arguments.length === 0) return undefined;
+  const firstArgument = call.arguments[0];
+  if (firstArgument.type === "SpreadElement") return undefined;
+  const argumentObject = unwrapObject(firstArgument);
+  if (argumentObject) return argumentObject;
+  if (
+    firstArgument.type !== "ArrowFunctionExpression" &&
+    firstArgument.type !== "FunctionExpression"
+  ) {
+    return undefined;
+  }
+  if (!firstArgument.body) return undefined;
+  if (firstArgument.body.type !== "BlockStatement") return unwrapObject(firstArgument.body);
+  const returnStatement = firstArgument.body.body.find(
+    (statement): statement is ESTree.ReturnStatement => statement.type === "ReturnStatement",
+  );
+  return returnStatement?.argument ? unwrapObject(returnStatement.argument) : undefined;
+}
+
 function findVariableObject(program: ESTree.Program, name: string): AstObject | undefined {
   for (const statement of program.body) {
     const variableDeclaration =
       statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
-    if (variableDeclaration?.type !== "VariableDeclaration") continue;
+    if (variableDeclaration?.type !== "VariableDeclaration" || variableDeclaration.kind !== "const")
+      continue;
     for (const declaration of variableDeclaration.declarations) {
       if (
         declaration.id.type !== "Identifier" ||
@@ -1318,10 +1442,8 @@ function findVariableObject(program: ESTree.Program, name: string): AstObject | 
       const initializer = unwrapExpression(declaration.init) ?? declaration.init;
       const direct = unwrapObject(initializer);
       if (direct) return direct;
-      if (initializer.type === "CallExpression" && initializer.arguments.length > 0) {
-        const firstArgument = initializer.arguments[0];
-        if (firstArgument.type !== "SpreadElement") return unwrapObject(firstArgument);
-      }
+      if (initializer.type === "CallExpression")
+        return findConfigObjectInCall(program, initializer);
       return undefined;
     }
   }
@@ -1350,10 +1472,8 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
       const right = unwrapExpression(expression.right) ?? expression.right;
       const direct = unwrapObject(right);
       if (direct) return direct;
-      if (right.type === "CallExpression" && right.arguments.length > 0) {
-        const firstArgument = right.arguments[0];
-        if (firstArgument.type !== "SpreadElement") return unwrapObject(firstArgument);
-      }
+      if (right.type === "Identifier") return findVariableObject(program, right.name);
+      if (right.type === "CallExpression") return findConfigObjectInCall(program, right);
     }
     return undefined;
   }
@@ -1367,25 +1487,9 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
   const direct = unwrapObject(declaration);
   if (direct) return direct;
   if (declaration.type === "Identifier") return findVariableObject(program, declaration.name);
-  if (declaration.type !== "CallExpression" || declaration.arguments.length === 0) return undefined;
-
-  const firstArgument = declaration.arguments[0];
-  if (firstArgument.type === "SpreadElement") return undefined;
-  const argumentObject = unwrapObject(firstArgument);
-  if (argumentObject) return argumentObject;
-  if (
-    firstArgument.type !== "ArrowFunctionExpression" &&
-    firstArgument.type !== "FunctionExpression"
-  ) {
-    return undefined;
-  }
-
-  if (!firstArgument.body) return undefined;
-  if (firstArgument.body.type !== "BlockStatement") return unwrapObject(firstArgument.body);
-  const returnStatement = firstArgument.body.body.find(
-    (statement): statement is ESTree.ReturnStatement => statement.type === "ReturnStatement",
-  );
-  return returnStatement?.argument ? unwrapObject(returnStatement.argument) : undefined;
+  return declaration.type === "CallExpression"
+    ? findConfigObjectInCall(program, declaration)
+    : undefined;
 }
 
 function importInsertionOffset(program: ESTree.Program): number {

@@ -1745,6 +1745,28 @@ describe("init — guard rails", () => {
     expect(config.match(/tailwindcss\(\)/g)).toHaveLength(1);
   });
 
+  it("rejects an unsupported Tailwind v4 Node config before mutating the project", async () => {
+    setupProject(tmpDir, {
+      router: "app",
+      extraPkg: { devDependencies: { tailwindcss: "^4.2.0" } },
+    });
+    writeFile(
+      tmpDir,
+      "node_modules/tailwindcss/package.json",
+      JSON.stringify({ version: "4.2.0" }),
+    );
+    writeFile(tmpDir, "vite.config.ts", `const config = getConfig(); export default config;\n`);
+    writeFile(tmpDir, "postcss.config.js", "module.exports = { plugins: {} };\n");
+    const before = snapshotProject(tmpDir);
+    const exec = vi.fn();
+
+    await expect(
+      runInit(tmpDir, { platform: "node", install: false, _exec: exec }),
+    ).rejects.toThrow("Could not find a static Vite config object");
+    expect(exec).not.toHaveBeenCalled();
+    expect(snapshotProject(tmpDir)).toBe(before);
+  });
+
   it("AST-updates a Cloudflare init when the existing Vite config lacks plugins", async () => {
     setupProject(tmpDir, { router: "app" });
     writeFile(tmpDir, "vite.config.ts", "export default {}");

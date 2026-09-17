@@ -1191,6 +1191,7 @@ export default (defineConfig({ plugins: [vinext()] }) satisfies UserConfig);
 
     expectValidConfig(output);
     expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
+    expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
   });
 
   it.each(["const", "export const"])(
@@ -1209,6 +1210,76 @@ export default config;
       expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
     },
   );
+
+  it("updates a callback config exported through a variable", () => {
+    const output = updateViteConfigForTailwind(
+      "vite.config.ts",
+      `import { defineConfig } from "vite";
+import vinext from "vinext";
+const config = defineConfig(() => ({ plugins: [vinext()] }));
+export default config;
+`,
+    );
+
+    expectValidConfig(output);
+    expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
+    expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
+  });
+
+  it("recognizes the defineConfig alias used by the exported variable", () => {
+    const output = updateViteConfigForTailwind(
+      "vite.config.ts",
+      `import { defineConfig as first, defineConfig as second } from "vite";
+import vinext from "vinext";
+void first;
+const config = second({ plugins: [vinext()] });
+export default config;
+`,
+    );
+
+    expectValidConfig(output);
+    expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
+  });
+
+  it("rejects an unrecognized config factory", () => {
+    expect(() =>
+      updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import vinext from "vinext";
+const second = (_first, value) => value;
+const config = second({ plugins: [] }, { plugins: [vinext()] });
+export default config;
+`,
+      ),
+    ).toThrow("Could not find a static Vite config object");
+  });
+
+  it("updates a CommonJS config exported through a variable", () => {
+    const output = updateViteConfigForTailwind(
+      "vite.config.cjs",
+      `const vinext = require("vinext");
+const config = { plugins: [vinext()] };
+module.exports = config;
+`,
+    );
+
+    expectValidConfig(output);
+    expect(output).toContain("tailwindcss()");
+    expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
+  });
+
+  it("rejects a mutable variable-backed config", () => {
+    expect(() =>
+      updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import vinext from "vinext";
+let config = { plugins: [vinext()] };
+config = getConfig();
+export default config;
+`,
+      ),
+    ).toThrow("Could not find a static Vite config object");
+  });
 
   it("does not reuse a dynamic import helper that only returns the Tailwind factory", () => {
     const input = `const vinext = require("vinext");
