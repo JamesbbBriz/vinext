@@ -2124,11 +2124,14 @@ function ensurePlugins(
       return (
         addition.member !== undefined &&
         expression.callee.type === "MemberExpression" &&
-        !expression.callee.computed &&
         expression.callee.object.type === "Identifier" &&
         expression.callee.object.name === addition.binding &&
-        expression.callee.property.type === "Identifier" &&
-        expression.callee.property.name === addition.member
+        ((!expression.callee.computed &&
+          expression.callee.property.type === "Identifier" &&
+          expression.callee.property.name === addition.member) ||
+          (expression.callee.computed &&
+            expression.callee.property.type === "Literal" &&
+            expression.callee.property.value === addition.member))
       );
     });
     if (!alreadyConfigured) missingExpressions.push(addition.expression);
