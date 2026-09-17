@@ -533,11 +533,24 @@ module.exports = defineConfig({ plugins: [vinext()] });
     expect(output).toContain("cloudflare()");
   });
 
-  it("loads Tailwind v4 from an existing CommonJS config", () => {
+  it.each([
+    ["without an existing require", "", "tailwindcss()"],
+    [
+      "with an existing namespace require",
+      'const tw = require("@tailwindcss/vite");\n',
+      "tw.default()",
+    ],
+    [
+      "with an existing unwrapped require",
+      'const tw = require("@tailwindcss/vite").default;\n',
+      "tw()",
+    ],
+  ])("loads Tailwind v4 from a CommonJS config %s", (_, tailwindRequire, tailwindCall) => {
     const input = `const { defineConfig } = require("vite");
 const vinext = require("vinext");
+${tailwindRequire}
 
-module.exports = defineConfig({ plugins: [vinext()] });
+module.exports = defineConfig({ plugins: [vinext()${tailwindRequire ? `, ${tailwindCall}` : ""}] });
 `;
     const output = updateViteConfigForCloudflare("vite.config.cjs", input, {
       isAppRouter: false,
@@ -545,7 +558,7 @@ module.exports = defineConfig({ plugins: [vinext()] });
       nativeModulesToStub: [],
       cache: { dataCache: "none", cdnCache: "none", imageOptimization: "none" },
     });
-    expect(output).toContain('const { default: tailwindcss } = require("@tailwindcss/vite");');
+    expect(output.split(tailwindCall).length - 1).toBe(1);
 
     const configModule: { exports: unknown } = { exports: {} };
     vm.runInNewContext(output, {

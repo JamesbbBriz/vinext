@@ -1499,11 +1499,58 @@ function ensureDefaultImport(
   return binding;
 }
 
+function findDefaultRequiredBinding(
+  program: ESTree.Program,
+  source: string,
+): { binding: string; namespace: boolean } | undefined {
+  for (const statement of program.body) {
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations) {
+      const requireCall: ESTree.CallExpression | undefined =
+        declaration.init?.type === "CallExpression"
+          ? declaration.init
+          : declaration.init?.type === "MemberExpression" &&
+              !declaration.init.computed &&
+              declaration.init.property.type === "Identifier" &&
+              declaration.init.property.name === "default" &&
+              declaration.init.object.type === "CallExpression"
+            ? declaration.init.object
+            : undefined;
+      const namespace = declaration.init?.type === "CallExpression";
+      if (
+        !requireCall ||
+        requireCall.callee.type !== "Identifier" ||
+        requireCall.callee.name !== "require" ||
+        requireCall.arguments[0]?.type !== "Literal" ||
+        requireCall.arguments[0].value !== source
+      ) {
+        continue;
+      }
+      if (declaration.id.type === "Identifier") {
+        return { binding: declaration.id.name, namespace };
+      }
+      if (declaration.id.type !== "ObjectPattern") continue;
+      for (const property of declaration.id.properties) {
+        if (
+          property.type === "Property" &&
+          property.key.type === "Identifier" &&
+          property.key.name === "default" &&
+          property.value.type === "Identifier"
+        ) {
+          return { binding: property.value.name, namespace: false };
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
 function findRequiredBinding(
   program: ESTree.Program,
   source: string,
   imported: string,
 ): string | undefined {
+  if (imported === "default") return findDefaultRequiredBinding(program, source)?.binding;
   for (const statement of program.body) {
     if (statement.type !== "VariableDeclaration") continue;
     for (const declaration of statement.declarations) {
@@ -1516,9 +1563,6 @@ function findRequiredBinding(
         declaration.init.arguments[0].value !== source
       ) {
         continue;
-      }
-      if (imported === "default" && declaration.id.type === "Identifier") {
-        return declaration.id.name;
       }
       if (declaration.id.type !== "ObjectPattern") continue;
       for (const property of declaration.id.properties) {
@@ -1962,7 +2006,7 @@ function indentBlock(source: string, indent: string): string {
 function ensurePlugins(
   output: MagicString,
   config: AstObject,
-  additions: Array<{ expression: string; binding: string }>,
+  additions: Array<{ expression: string; binding: string; member?: string }>,
   code: string,
 ): void {
   const plugins = findProperty(config, "plugins");
@@ -1986,12 +2030,19 @@ function ensurePlugins(
   const elementIndent = `${propertyIndent}  `;
   const missingExpressions: string[] = [];
   for (const addition of additions) {
-    const alreadyConfigured = array.elements.some(
-      (element) =>
-        element?.type === "CallExpression" &&
-        element.callee.type === "Identifier" &&
-        element.callee.name === addition.binding,
-    );
+    const alreadyConfigured = array.elements.some((element) => {
+      if (element?.type !== "CallExpression") return false;
+      if (element.callee.type === "Identifier") return element.callee.name === addition.binding;
+      return (
+        addition.member !== undefined &&
+        element.callee.type === "MemberExpression" &&
+        !element.callee.computed &&
+        element.callee.object.type === "Identifier" &&
+        element.callee.object.name === addition.binding &&
+        element.callee.property.type === "Identifier" &&
+        element.callee.property.name === addition.member
+      );
+    });
     if (!alreadyConfigured) missingExpressions.push(addition.expression);
   }
   if (missingExpressions.length === 0) return;
@@ -2318,13 +2369,22 @@ export function updateViteConfigForCloudflare(
   const cloudflareBinding = commonJs
     ? ensureNamedRequire(program, output, "@cloudflare/vite-plugin", "cloudflare", cloudflareLocal)
     : ensureNamedImport(program, output, "@cloudflare/vite-plugin", "cloudflare", cloudflareLocal);
-  let tailwindPlugin: { expression: string; binding: string } | undefined;
+  let tailwindPlugin: { expression: string; binding: string; member?: string } | undefined;
   if (options.hasTailwindV4) {
     const tailwindLocal = allocateBinding(bindings, "tailwindcss");
+    const existingRequire = commonJs
+      ? findDefaultRequiredBinding(program, "@tailwindcss/vite")
+      : undefined;
     const tailwindBinding = commonJs
-      ? ensureNamedRequire(program, output, "@tailwindcss/vite", "default", tailwindLocal)
+      ? (existingRequire?.binding ??
+        ensureNamedRequire(program, output, "@tailwindcss/vite", "default", tailwindLocal))
       : ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal);
-    tailwindPlugin = { expression: `${tailwindBinding}()`, binding: tailwindBinding };
+    const member = existingRequire?.namespace ? "default" : undefined;
+    tailwindPlugin = {
+      expression: `${tailwindBinding}${member ? `.${member}` : ""}()`,
+      binding: tailwindBinding,
+      member,
+    };
   }
   ensurePlugins(
     output,
