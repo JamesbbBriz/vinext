@@ -2928,6 +2928,32 @@ describe("detectProject — new detection features", () => {
     expect(info.hasCodeHike).toBe(false);
   });
 
+  it.each(["^4.2.0", ">=4 <5", ">=4.1.0 <5.0.0", "=4.2.0", "4.1.0 - 4.9.0"])(
+    "detects Tailwind v4 from the declared range %s",
+    (version) => {
+      mkdir(tmpDir, "app");
+      writeFile(
+        tmpDir,
+        "package.json",
+        JSON.stringify({ devDependencies: { tailwindcss: version } }),
+      );
+      expect(detectProject(tmpDir).hasTailwindV4).toBe(true);
+    },
+  );
+
+  it.each(["^3.4.0", ">=3 <5", "^3 || ^4", ">=4 <5.1.0"])(
+    "does not guess Tailwind v4 from the ambiguous or non-v4 range %s",
+    (version) => {
+      mkdir(tmpDir, "app");
+      writeFile(
+        tmpDir,
+        "package.json",
+        JSON.stringify({ devDependencies: { tailwindcss: version } }),
+      );
+      expect(detectProject(tmpDir).hasTailwindV4).toBe(false);
+    },
+  );
+
   it("detects native modules to stub", () => {
     mkdir(tmpDir, "app");
     writeFile(

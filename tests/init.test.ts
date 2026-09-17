@@ -1126,10 +1126,11 @@ describe("init — generated project snapshots", () => {
     ["cloudflare", "app", "^4.2.0"],
     ["cloudflare", "pages", "^3.4.0"],
     ["cloudflare", "pages", "^4.2.0"],
+    ["node", "app", ">=4 <5"],
   ] as const)("wires Tailwind %s %s %s without upgrading v3", async (platform, router, version) => {
     setupProject(tmpDir, { router, extraPkg: { devDependencies: { tailwindcss: version } } });
     await runInit(tmpDir, { platform, install: false });
-    const enabled = version.startsWith("^4");
+    const enabled = version !== "^3.4.0";
     expect(readFile(tmpDir, "vite.config.ts").includes("@tailwindcss/vite")).toBe(enabled);
     expect("@tailwindcss/vite" in (readPkg(tmpDir).devDependencies as object)).toBe(enabled);
   });
