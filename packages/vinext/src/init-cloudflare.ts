@@ -1723,7 +1723,7 @@ function findDefaultRequiredBinding(
   excludedBindings?: Set<string>,
 ): { binding: string; namespace: boolean } | undefined {
   for (const statement of program.body) {
-    if (statement.type !== "VariableDeclaration") continue;
+    if (statement.type !== "VariableDeclaration" || statement.kind !== "const") continue;
     for (const declaration of statement.declarations) {
       const initializer = unwrapExpression(declaration.init);
       let requireCall: ESTree.CallExpression | undefined;
@@ -1779,7 +1779,7 @@ function findDynamicImportPluginBinding(
   excludedBindings?: Set<string>,
 ): string | undefined {
   for (const statement of program.body) {
-    if (statement.type !== "VariableDeclaration") continue;
+    if (statement.type !== "VariableDeclaration" || statement.kind !== "const") continue;
     for (const declaration of statement.declarations) {
       const initializer = unwrapExpression(declaration.init);
       if (
@@ -1899,11 +1899,9 @@ function findRequiredBinding(
 }
 
 function requireInsertionOffset(program: ESTree.Program): number {
-  let offset = 0;
-  let inDirectivePrologue = true;
+  let offset = program.hashbang?.end ?? 0;
   for (const statement of program.body) {
     if (
-      inDirectivePrologue &&
       statement.type === "ExpressionStatement" &&
       statement.expression.type === "Literal" &&
       typeof statement.expression.value === "string"
@@ -1911,9 +1909,7 @@ function requireInsertionOffset(program: ESTree.Program): number {
       offset = (statement as AstNode).end;
       continue;
     }
-    inDirectivePrologue = false;
-    if (statement.type !== "VariableDeclaration") break;
-    offset = (statement as AstNode).end;
+    break;
   }
   return offset;
 }
@@ -1958,7 +1954,10 @@ function insertObjectProperty(
 ): void {
   const offset = object.end - 1;
   const hasProperties = object.properties.length > 0;
-  const hasTrailingComma = /,\s*$/.test(code.slice(object.start + 1, offset));
+  const finalProperty = object.properties.at(-1);
+  const hasTrailingComma = finalProperty
+    ? endsWithCommaIgnoringWhitespaceAndComments(code.slice(finalProperty.end, offset))
+    : false;
   output.appendLeft(offset, `${hasProperties && !hasTrailingComma ? "," : ""}\n${source}\n`);
 }
 
@@ -2570,12 +2569,126 @@ function indentBlock(source: string, indent: string): string {
     .join("\n");
 }
 
-type PluginAddition = {
-  expression: string;
+type PluginBindingReference = {
   binding: string;
   member?: string;
+};
+
+type PluginAddition = PluginBindingReference & {
+  expression: string;
+  equivalentBindings?: PluginBindingReference[];
   allowConditional?: boolean;
 };
+
+function expressionReferencesBinding(
+  node: ESTree.Node,
+  binding: string,
+  program: ESTree.Program,
+  scopeTarget: ESTree.Node,
+  seenBindings = new Set<string>(),
+): boolean {
+  const expression = unwrapExpression(node);
+  if (expression?.type !== "Identifier") return false;
+  if (expression.name === binding) return true;
+  if (seenBindings.has(expression.name)) return false;
+  const initializer = findVisibleConstInitializer(program, scopeTarget, expression.name);
+  return initializer
+    ? expressionReferencesBinding(
+        initializer,
+        binding,
+        program,
+        scopeTarget,
+        new Set(seenBindings).add(expression.name),
+      )
+    : false;
+}
+
+function calleeMatchesPluginAddition(
+  node: ESTree.Node,
+  addition: PluginBindingReference,
+  program: ESTree.Program,
+  scopeTarget: ESTree.Node,
+  seenBindings = new Set<string>(),
+): boolean {
+  const callee = unwrapExpression(node);
+  if (!callee) return false;
+  if (addition.member === undefined) {
+    return expressionReferencesBinding(
+      callee,
+      addition.binding,
+      program,
+      scopeTarget,
+      seenBindings,
+    );
+  }
+  if (callee.type === "Identifier") {
+    if (seenBindings.has(callee.name)) return false;
+    const initializer = findVisibleConstInitializer(program, scopeTarget, callee.name);
+    return initializer
+      ? calleeMatchesPluginAddition(
+          initializer,
+          addition,
+          program,
+          scopeTarget,
+          new Set(seenBindings).add(callee.name),
+        )
+      : false;
+  }
+  return (
+    callee.type === "MemberExpression" &&
+    ((!callee.computed &&
+      callee.property.type === "Identifier" &&
+      callee.property.name === addition.member) ||
+      (callee.computed &&
+        callee.property.type === "Literal" &&
+        callee.property.value === addition.member)) &&
+    expressionReferencesBinding(callee.object, addition.binding, program, scopeTarget)
+  );
+}
+
+function findUnshadowedTopLevelAliases(
+  program: ESTree.Program,
+  source: PluginBindingReference,
+  excludedBindings: Set<string>,
+): PluginBindingReference[] {
+  const known = [source];
+  let foundAlias = true;
+  while (foundAlias) {
+    foundAlias = false;
+    for (const statement of program.body) {
+      const declaration =
+        statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+      if (declaration?.type !== "VariableDeclaration" || declaration.kind !== "const") continue;
+      for (const declarator of declaration.declarations) {
+        if (declarator.id.type !== "Identifier") continue;
+        const aliasName = declarator.id.name;
+        if (known.some(({ binding }) => binding === aliasName)) continue;
+        const initializer = unwrapExpression(declarator.init);
+        const referenced = known.find(({ binding, member }) => {
+          if (initializer?.type === "Identifier") return initializer.name === binding;
+          return (
+            member !== undefined &&
+            initializer?.type === "MemberExpression" &&
+            expressionReferencesBinding(initializer.object, binding, program, program) &&
+            ((!initializer.computed &&
+              initializer.property.type === "Identifier" &&
+              initializer.property.name === member) ||
+              (initializer.computed &&
+                initializer.property.type === "Literal" &&
+                initializer.property.value === member))
+          );
+        });
+        if (!referenced) continue;
+        known.push({
+          binding: aliasName,
+          member: initializer?.type === "Identifier" ? referenced.member : undefined,
+        });
+        foundAlias = true;
+      }
+    }
+  }
+  return known.filter(({ binding }) => !excludedBindings.has(binding));
+}
 
 function ensurePlugins(
   output: MagicString,
@@ -2607,23 +2720,10 @@ function ensurePlugins(
   for (const addition of additions) {
     const alreadyConfigured = findCallInPluginArray(
       array,
-      (expression) => {
-        if (expression.callee.type === "Identifier") {
-          return expression.callee.name === addition.binding;
-        }
-        return (
-          addition.member !== undefined &&
-          expression.callee.type === "MemberExpression" &&
-          expression.callee.object.type === "Identifier" &&
-          expression.callee.object.name === addition.binding &&
-          ((!expression.callee.computed &&
-            expression.callee.property.type === "Identifier" &&
-            expression.callee.property.name === addition.member) ||
-            (expression.callee.computed &&
-              expression.callee.property.type === "Literal" &&
-              expression.callee.property.value === addition.member))
-        );
-      },
+      (expression) =>
+        [addition, ...(addition.equivalentBindings ?? [])].some((reference) =>
+          calleeMatchesPluginAddition(expression.callee, reference, program, array),
+        ),
       program,
       addition.allowConditional,
     );
@@ -2683,6 +2783,27 @@ function prepareTailwindPlugin(
   shadowedBindings: Set<string>,
 ): PluginAddition {
   const tailwindLocal = allocateBinding(bindings, "tailwindcss");
+  const requiredPackageBinding = commonJs
+    ? findDefaultRequiredBinding(program, "@tailwindcss/vite")
+    : undefined;
+  const dynamicPackageBinding = commonJs
+    ? findDynamicImportPluginBinding(program, "@tailwindcss/vite")
+    : undefined;
+  const packageBinding = commonJs
+    ? (requiredPackageBinding ??
+      (dynamicPackageBinding ? { binding: dynamicPackageBinding, namespace: false } : undefined))
+    : findDefaultImportedBinding(program, "@tailwindcss/vite");
+  const equivalentBindings = packageBinding
+    ? findUnshadowedTopLevelAliases(
+        program,
+        {
+          binding: packageBinding.binding,
+          member: packageBinding.namespace ? "default" : undefined,
+        },
+        shadowedBindings,
+      )
+    : [];
+  const existingAlias = equivalentBindings[0];
   const existingRequire = commonJs
     ? findDefaultRequiredBinding(program, "@tailwindcss/vite", shadowedBindings)
     : undefined;
@@ -2693,22 +2814,28 @@ function prepareTailwindPlugin(
     ? undefined
     : findDefaultImportedBinding(program, "@tailwindcss/vite", shadowedBindings);
   let tailwindBinding: string;
-  if (commonJs && !existingRequire && !existingDynamicImport) {
+  if (commonJs && !existingRequire && !existingDynamicImport && !existingAlias) {
     const offset = requireInsertionOffset(program);
     const sourceText = `const ${tailwindLocal} = () => import("@tailwindcss/vite").then(({ default: plugin }) => plugin());`;
     output.appendLeft(offset, offset === 0 ? `${sourceText}\n` : `\n${sourceText}`);
     tailwindBinding = tailwindLocal;
   } else {
     tailwindBinding = commonJs
-      ? (existingRequire?.binding ?? existingDynamicImport ?? tailwindLocal)
+      ? (existingRequire?.binding ??
+        existingDynamicImport ??
+        existingAlias?.binding ??
+        tailwindLocal)
       : (existingImport?.binding ??
+        existingAlias?.binding ??
         ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal, false));
   }
-  const member = existingRequire?.namespace || existingImport?.namespace ? "default" : undefined;
+  const member =
+    existingRequire?.namespace || existingImport?.namespace ? "default" : existingAlias?.member;
   return {
     expression: `${tailwindBinding}${member ? `.${member}` : ""}()`,
     binding: tailwindBinding,
     member,
+    equivalentBindings,
     allowConditional: true,
   };
 }

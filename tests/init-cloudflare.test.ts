@@ -640,6 +640,34 @@ export default { plugins: [tailwindPlugin] };
     expect(output).toBe(input);
   });
 
+  it("recognizes an immutable alias of the Tailwind factory", () => {
+    const input = `import tailwind from "@tailwindcss/vite";
+const tw = tailwind;
+export default { plugins: [tw({ optimize: false })] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output).toBe(input);
+  });
+
+  it("recognizes an unshadowed alias of a shadowed Tailwind import", () => {
+    const input = `import { defineConfig } from "vite";
+import tailwind from "@tailwindcss/vite";
+const tw = tailwind;
+export default defineConfig(() => {
+  const tailwind = customPlugin;
+  return { plugins: [tw({ optimize: false })] };
+});
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output).toBe(input);
+  });
+
   it("loads Tailwind's ESM-only Vite plugin from a CommonJS config", async () => {
     const input = `const { defineConfig } = require("vite");
 const vinext = require("vinext");
@@ -1308,18 +1336,50 @@ export default config;
     ).toThrow("Could not find a static Vite config object");
   });
 
-  it("updates a CommonJS config exported through a variable", () => {
+  it("loads an updated CommonJS config and plugin array exported through variables", async () => {
     const output = updateViteConfigForTailwind(
       "vite.config.cjs",
-      `const vinext = require("vinext");
-const config = { plugins: [vinext()] };
+      `#!/usr/bin/env node
+const vinext = require("vinext");
+const plugins = [vinext()];
+const config = { plugins };
 module.exports = config;
 `,
     );
 
     expectValidConfig(output);
+    expect(output.startsWith("#!/usr/bin/env node")).toBe(true);
     expect(output).toContain("tailwindcss()");
     expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
+
+    const configModule: { exports: { plugins?: unknown[] } } = { exports: {} };
+    const tailwindEntry = createRequire(
+      new URL("../examples/benchmarks/package.json", import.meta.url),
+    ).resolve("@tailwindcss/vite");
+    vm.runInNewContext(
+      output.replace(
+        'import("@tailwindcss/vite")',
+        `import(${JSON.stringify(pathToFileURL(tailwindEntry).href)})`,
+      ),
+      {
+        module: configModule,
+        require(id: string): unknown {
+          if (id === "vinext") return () => "vinext";
+          throw new Error(`Unexpected require: ${id}`);
+        },
+      },
+      {
+        importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+      },
+    );
+
+    const plugins = (await Promise.all(configModule.exports.plugins ?? [])).flat(Infinity);
+    expect(plugins).toContain("vinext");
+    expect(plugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: expect.stringContaining("tailwindcss") }),
+      ]),
+    );
   });
 
   it("rejects a mutable variable-backed config", () => {
@@ -1385,6 +1445,39 @@ module.exports = { plugins: [vinext()] };
     expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
   });
 
+  it("recognizes an unshadowed alias of a shadowed dynamic import helper", () => {
+    const input = `const { defineConfig } = require("vite");
+const loadTailwind = () => import("@tailwindcss/vite").then(({ default: plugin }) => plugin());
+const tw = loadTailwind;
+module.exports = defineConfig(() => {
+  const loadTailwind = customPlugin;
+  return { plugins: [tw()] };
+});
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.cjs", input);
+
+    expectValidConfig(output);
+    expect(output).toBe(input);
+  });
+
+  it("does not reuse an alias derived from a mutable dynamic import helper", () => {
+    const input = `let loadTailwind = () => import("@tailwindcss/vite").then(({ default: plugin }) => plugin());
+loadTailwind = customPlugin;
+const tw = loadTailwind;
+module.exports = { plugins: [tw()] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.cjs", input);
+
+    expectValidConfig(output);
+    expect(output).toContain(
+      'const tailwindcss = () => import("@tailwindcss/vite").then(({ default: plugin }) => plugin());',
+    );
+    expect(output).toContain("tailwindcss()");
+    expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
+  });
+
   it("preserves a CommonJS directive prologue", () => {
     const input = `"use strict";
 const vinext = require("vinext");
@@ -1419,6 +1512,20 @@ export default { plugins: [vinext()], ["resolve"]: {} };
 
     expectValidConfig(output);
     expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
+    expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
+  });
+
+  it("preserves a trailing property comma followed by a comment", () => {
+    const input = `export default {
+  resolve: {}, // keep
+};
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output).toContain("resolve: {}, // keep");
+    expect(output).toContain("plugins: [");
     expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
   });
 
