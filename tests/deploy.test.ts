@@ -3162,6 +3162,34 @@ describe("getMissingDeps — MDX", () => {
   });
 });
 
+describe("getMissingDeps — Tailwind v4", () => {
+  it("reports @tailwindcss/vite when Tailwind v4 is detected but the plugin is missing", () => {
+    mkdir(tmpDir, "app");
+    const info = detectProject(tmpDir);
+    info.hasCloudflarePlugin = true;
+    info.hasWrangler = true;
+    info.hasRscPlugin = true;
+    info.hasTailwindV4 = true;
+
+    const missing = getMissingDeps(info, (_root, pkg) => pkg !== "@tailwindcss/vite");
+
+    expect(missing).toContainEqual(expect.objectContaining({ name: "@tailwindcss/vite" }));
+  });
+
+  it("does not report @tailwindcss/vite when it is resolvable", () => {
+    mkdir(tmpDir, "app");
+    const info = detectProject(tmpDir);
+    info.hasCloudflarePlugin = true;
+    info.hasWrangler = true;
+    info.hasRscPlugin = true;
+    info.hasTailwindV4 = true;
+
+    const missing = getMissingDeps(info, () => true);
+
+    expect(missing).not.toContainEqual(expect.objectContaining({ name: "@tailwindcss/vite" }));
+  });
+});
+
 // ─── Integration: Full Detection of Real Fixtures ────────────────────────────
 
 describe("detectProject on real fixtures", () => {

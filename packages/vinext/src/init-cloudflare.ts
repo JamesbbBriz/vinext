@@ -1496,6 +1496,26 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
   );
   if (!defaultExport) {
     for (const statement of program.body) {
+      if (
+        statement.type !== "ExportNamedDeclaration" ||
+        statement.source ||
+        statement.exportKind === "type"
+      ) {
+        continue;
+      }
+      const defaultSpecifier = statement.specifiers.find(
+        (specifier) =>
+          specifier.type === "ExportSpecifier" &&
+          specifier.exportKind !== "type" &&
+          ((specifier.exported.type === "Identifier" && specifier.exported.name === "default") ||
+            (specifier.exported.type === "Literal" && specifier.exported.value === "default")),
+      );
+      if (defaultSpecifier?.local.type === "Identifier") {
+        const config = findVariableObject(program, defaultSpecifier.local.name);
+        if (config) return config;
+      }
+    }
+    for (const statement of program.body) {
       if (statement.type !== "ExpressionStatement") continue;
       const expression = statement.expression;
       if (
@@ -1532,7 +1552,7 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
 }
 
 function importInsertionOffset(program: ESTree.Program): number {
-  let offset = 0;
+  let offset = program.hashbang?.end ?? 0;
   for (const statement of program.body) {
     if (statement.type !== "ImportDeclaration") break;
     offset = (statement as AstNode).end;
@@ -1591,6 +1611,7 @@ function collectTopLevelBindings(program: ESTree.Program): Set<string> {
       bindings.add(declaration.id.name);
     }
   }
+  for (const statement of program.body) collectNestedFunctionVarBindings(statement, bindings);
   return bindings;
 }
 
@@ -1869,7 +1890,7 @@ function findRequiredBinding(
     return findDefaultRequiredBinding(program, source, excludedBindings)?.binding;
   }
   for (const statement of program.body) {
-    if (statement.type !== "VariableDeclaration") continue;
+    if (statement.type !== "VariableDeclaration" || statement.kind !== "const") continue;
     for (const declaration of statement.declarations) {
       const initializer = unwrapExpression(declaration.init);
       if (
@@ -2091,7 +2112,7 @@ function findPluginCall(
   return array
     ? findCallInPluginArray(
         array,
-        (call) => call.callee.type === "Identifier" && call.callee.name === binding,
+        (call) => calleeMatchesPluginAddition(call.callee, { binding }, program, array),
         program,
       )
     : undefined;
@@ -2108,6 +2129,22 @@ function findAstPath(root: ESTree.Node, target: ESTree.Node): ESTree.Node[] | un
   return path;
 }
 
+function collectNestedFunctionVarBindings(node: ESTree.Node, bindings: Set<string>): void {
+  if (
+    node.type === "FunctionDeclaration" ||
+    node.type === "FunctionExpression" ||
+    node.type === "ArrowFunctionExpression" ||
+    node.type === "ClassDeclaration" ||
+    node.type === "ClassExpression"
+  ) {
+    return;
+  }
+  if (node.type === "VariableDeclaration" && node.kind === "var") {
+    for (const declarator of node.declarations) collectPatternBindings(declarator.id, bindings);
+  }
+  forEachAstChild(node, (child) => collectNestedFunctionVarBindings(child, bindings));
+}
+
 function collectConfigShadowedBindings(program: ESTree.Program, config: AstObject): Set<string> {
   const bindings = new Set<string>();
   const path = findAstPath(program, config);
@@ -2120,6 +2157,11 @@ function collectConfigShadowedBindings(program: ESTree.Program, config: AstObjec
     ) {
       for (const parameter of node.params) collectPatternBindings(parameter, bindings);
       if (node.type === "FunctionExpression" && node.id) bindings.add(node.id.name);
+      if (node.body?.type === "BlockStatement") {
+        for (const statement of node.body.body) {
+          collectNestedFunctionVarBindings(statement, bindings);
+        }
+      }
     }
     if (node.type !== "BlockStatement") continue;
     for (const declaration of node.body) {
@@ -2945,7 +2987,16 @@ export function updateViteConfigForCloudflare(
   const bindings = collectTopLevelBindings(program);
   const shadowedBindings = collectConfigShadowedBindings(program, config);
   for (const binding of shadowedBindings) bindings.add(binding);
-  const existingVinextBinding = commonJs
+  const vinextPackageBinding = commonJs
+    ? findDefaultRequiredBinding(program, "vinext")?.binding
+    : findDefaultImportedBinding(program, "vinext")?.binding;
+  const vinextEquivalentBindings = vinextPackageBinding
+    ? findUnshadowedTopLevelAliases(program, { binding: vinextPackageBinding }, shadowedBindings)
+    : [];
+  const configuredVinextAlias = vinextEquivalentBindings.find(({ binding }) =>
+    findPluginCall(config, binding, program),
+  );
+  const directVinextBinding = commonJs
     ? findRequiredBinding(program, "vinext", "default", shadowedBindings)
     : program.body
         .filter(
@@ -2959,6 +3010,8 @@ export function updateViteConfigForCloudflare(
             specifier.type === "ImportDefaultSpecifier" &&
             !shadowedBindings.has(specifier.local.name),
         )?.local.name;
+  const existingVinextBinding =
+    directVinextBinding ?? configuredVinextAlias?.binding ?? vinextEquivalentBindings[0]?.binding;
   const vinextLocal = existingVinextBinding ?? allocateBinding(bindings, "vinext");
   const vinextBinding =
     existingVinextBinding ??
@@ -3160,9 +3213,26 @@ export function updateViteConfigForCloudflare(
       imageOptimizerExpression = `${imageBinding}(${bindingOption})`;
     }
   }
-  const existingCloudflareBinding = commonJs
+  const cloudflarePackageBinding = commonJs
+    ? findRequiredBinding(program, "@cloudflare/vite-plugin", "cloudflare")
+    : findImportedBinding(program, "@cloudflare/vite-plugin", "cloudflare");
+  const cloudflareEquivalentBindings = cloudflarePackageBinding
+    ? findUnshadowedTopLevelAliases(
+        program,
+        { binding: cloudflarePackageBinding },
+        shadowedBindings,
+      )
+    : [];
+  const configuredCloudflareAlias = cloudflareEquivalentBindings.find(({ binding }) =>
+    findPluginCall(config, binding, program),
+  );
+  const directCloudflareBinding = commonJs
     ? findRequiredBinding(program, "@cloudflare/vite-plugin", "cloudflare", shadowedBindings)
     : findImportedBinding(program, "@cloudflare/vite-plugin", "cloudflare", shadowedBindings);
+  const existingCloudflareBinding =
+    directCloudflareBinding ??
+    configuredCloudflareAlias?.binding ??
+    cloudflareEquivalentBindings[0]?.binding;
   const cloudflareLocal = existingCloudflareBinding ?? allocateBinding(bindings, "cloudflare");
   const cloudflareBinding =
     existingCloudflareBinding ??
@@ -3208,10 +3278,12 @@ export function updateViteConfigForCloudflare(
               )
             : `${vinextBinding}()`,
         binding: vinextBinding,
+        equivalentBindings: vinextEquivalentBindings,
       },
       {
         expression: cloudflarePluginExpression(options.isAppRouter, cloudflareBinding),
         binding: cloudflareBinding,
+        equivalentBindings: cloudflareEquivalentBindings,
       },
     ],
     code,

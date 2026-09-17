@@ -635,6 +635,9 @@ export function getMissingDeps(
   if (info.hasMDX && !_isResolvable(info.root, "@mdx-js/rollup")) {
     missing.push({ name: "@mdx-js/rollup", version: "latest" });
   }
+  if (info.hasTailwindV4 && !_isResolvable(info.root, "@tailwindcss/vite")) {
+    missing.push({ name: "@tailwindcss/vite", version: "latest" });
+  }
 
   return missing;
 }

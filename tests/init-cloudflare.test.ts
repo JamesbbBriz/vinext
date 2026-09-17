@@ -668,6 +668,19 @@ export default defineConfig(() => {
     expect(output).toBe(input);
   });
 
+  it("preserves an ESM hashbang when adding the Tailwind import", () => {
+    const input = `#!/usr/bin/env node
+export default { plugins: [] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output.startsWith("#!/usr/bin/env node")).toBe(true);
+    expect(output).toContain('import tailwindcss from "@tailwindcss/vite"');
+    expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
+  });
+
   it("loads Tailwind's ESM-only Vite plugin from a CommonJS config", async () => {
     const input = `const { defineConfig } = require("vite");
 const vinext = require("vinext");
@@ -1478,6 +1491,21 @@ module.exports = { plugins: [tw()] };
     expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
   });
 
+  it("avoids helpers shadowed by a nested program-scoped var declaration", () => {
+    const input = `if (false) {
+  var tailwindcss = customPlugin;
+}
+module.exports = { plugins: [] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.cjs", input);
+
+    expectValidConfig(output);
+    expect(output).toContain("const tailwindcss2 =");
+    expect(output).toContain("tailwindcss2()");
+    expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
+  });
+
   it("preserves a CommonJS directive prologue", () => {
     const input = `"use strict";
 const vinext = require("vinext");
@@ -1563,6 +1591,75 @@ export default defineConfig(() => {
     expect(output).toContain("tailwindcss2()");
     expect(output).toContain("cloudflare2({");
     expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
+  });
+
+  it("updates options through immutable vinext and Cloudflare aliases", () => {
+    const input = `import { defineConfig } from "vite";
+import vinext from "vinext";
+import { cloudflare } from "@cloudflare/vite-plugin";
+const vx = vinext;
+const cf = cloudflare;
+export default defineConfig(() => {
+  const vinext = customPlugin;
+  const cloudflare = customPlugin;
+  return { plugins: [vx(), cf()] };
+});
+`;
+    const options = {
+      isAppRouter: true,
+      nativeModulesToStub: [],
+      prerender: true,
+      cache: {
+        dataCache: "none" as const,
+        cdnCache: "none" as const,
+        imageOptimization: "none" as const,
+      },
+    };
+
+    const output = updateViteConfigForCloudflare("vite.config.ts", input, options);
+
+    expectValidConfig(output);
+    expect(output).toContain('prerender: { routes: "*" }');
+    expect(output).toContain(
+      'cf({ viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] } })',
+    );
+    expect(output.match(/\bvx\(/g)).toHaveLength(1);
+    expect(output.match(/\bcf\(/g)).toHaveLength(1);
+    expect(output).not.toContain("vinext2");
+    expect(output).not.toContain("cloudflare2");
+    expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
+  });
+
+  it("avoids plugin imports shadowed by nested function-scoped var declarations", () => {
+    const output = updateViteConfigForTailwind(
+      "vite.config.ts",
+      `import { defineConfig } from "vite";
+import tailwindcss from "@tailwindcss/vite";
+export default defineConfig(() => {
+  if (false) {
+    var tailwindcss = customPlugin;
+  }
+  return { plugins: [] };
+});
+`,
+    );
+
+    expectValidConfig(output);
+    expect(output).toContain('import tailwindcss2 from "@tailwindcss/vite"');
+    expect(output).toContain("plugins: [\n    tailwindcss2(),\n  ]");
+  });
+
+  it("updates a config exported through a named default specifier", () => {
+    const input = `import vinext from "vinext";
+const config = { plugins: [vinext()] };
+export { config as default };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
+    expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
   });
 
   it("does not reuse a plugin import shadowed by a named config callback", () => {
