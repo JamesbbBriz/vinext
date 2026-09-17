@@ -1270,7 +1270,7 @@ function findProperty(object: AstObject, name: string): AstProperty | undefined 
   );
 }
 
-function unwrapObject(expression: ESTree.Expression): AstObject | undefined {
+function unwrapObject(expression: ESTree.Node): AstObject | undefined {
   const unwrapped = unwrapExpression(expression);
   return unwrapped?.type === "ObjectExpression" ? (unwrapped as AstObject) : undefined;
 }
@@ -1311,10 +1311,11 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
       ) {
         continue;
       }
-      const direct = unwrapObject(expression.right);
+      const right = unwrapExpression(expression.right) ?? expression.right;
+      const direct = unwrapObject(right);
       if (direct) return direct;
-      if (expression.right.type === "CallExpression" && expression.right.arguments.length > 0) {
-        const firstArgument = expression.right.arguments[0];
+      if (right.type === "CallExpression" && right.arguments.length > 0) {
+        const firstArgument = right.arguments[0];
         if (firstArgument.type !== "SpreadElement") return unwrapObject(firstArgument);
       }
     }
@@ -1322,10 +1323,11 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
   }
   if (defaultExport.declaration.type === "FunctionDeclaration") return undefined;
 
-  const declaration = defaultExport.declaration;
-  if (declaration.type === "ClassDeclaration" || declaration.type === "TSInterfaceDeclaration") {
+  const exported = defaultExport.declaration;
+  if (exported.type === "ClassDeclaration" || exported.type === "TSInterfaceDeclaration") {
     return undefined;
   }
+  const declaration = unwrapExpression(exported) ?? exported;
   const direct = unwrapObject(declaration);
   if (direct) return direct;
   if (declaration.type === "Identifier") return findVariableObject(program, declaration.name);
@@ -1429,6 +1431,7 @@ function findImportedBinding(
   program: ESTree.Program,
   source: string,
   imported: string,
+  excludedBindings?: Set<string>,
 ): string | undefined {
   for (const statement of program.body) {
     if (statement.type !== "ImportDeclaration" || statement.source.value !== source) continue;
@@ -1436,7 +1439,8 @@ function findImportedBinding(
       if (
         specifier.type === "ImportSpecifier" &&
         specifier.imported.type === "Identifier" &&
-        specifier.imported.name === imported
+        specifier.imported.name === imported &&
+        !excludedBindings?.has(specifier.local.name)
       ) {
         return specifier.local.name;
       }
@@ -1451,9 +1455,10 @@ function ensureNamedImport(
   source: string,
   imported: string,
   binding: string,
+  reuseExisting = true,
 ): string {
   const existing = findImportedBinding(program, source, imported);
-  if (existing) return existing;
+  if (existing && reuseExisting) return existing;
 
   const declaration = program.body.find(
     (statement): statement is ESTree.ImportDeclaration =>
@@ -1482,6 +1487,7 @@ function ensureDefaultImport(
   output: MagicString,
   source: string,
   binding: string,
+  reuseExisting = true,
 ): string {
   const declaration = program.body.find(
     (statement): statement is ESTree.ImportDeclaration =>
@@ -1491,7 +1497,7 @@ function ensureDefaultImport(
     (specifier): specifier is ESTree.ImportDefaultSpecifier =>
       specifier.type === "ImportDefaultSpecifier",
   );
-  if (existing) return existing.local.name;
+  if (existing && reuseExisting) return existing.local.name;
 
   const offset = importInsertionOffset(program);
   const sourceText = `import ${binding} from ${JSON.stringify(source)};`;
@@ -1502,6 +1508,7 @@ function ensureDefaultImport(
 function findDefaultImportedBinding(
   program: ESTree.Program,
   source: string,
+  excludedBindings?: Set<string>,
 ): { binding: string; namespace: boolean } | undefined {
   for (const statement of program.body) {
     if (
@@ -1513,12 +1520,13 @@ function findDefaultImportedBinding(
     }
     const specifier = statement.specifiers.find(
       (candidate) =>
-        candidate.type === "ImportDefaultSpecifier" ||
-        candidate.type === "ImportNamespaceSpecifier" ||
-        (candidate.type === "ImportSpecifier" &&
-          candidate.importKind !== "type" &&
-          candidate.imported.type === "Identifier" &&
-          candidate.imported.name === "default"),
+        (candidate.type === "ImportDefaultSpecifier" ||
+          candidate.type === "ImportNamespaceSpecifier" ||
+          (candidate.type === "ImportSpecifier" &&
+            candidate.importKind !== "type" &&
+            candidate.imported.type === "Identifier" &&
+            candidate.imported.name === "default")) &&
+        !excludedBindings?.has(candidate.local.name),
     );
     if (specifier) {
       return {
@@ -1533,6 +1541,7 @@ function findDefaultImportedBinding(
 function findDefaultRequiredBinding(
   program: ESTree.Program,
   source: string,
+  excludedBindings?: Set<string>,
 ): { binding: string; namespace: boolean } | undefined {
   for (const statement of program.body) {
     if (statement.type !== "VariableDeclaration") continue;
@@ -1565,6 +1574,7 @@ function findDefaultRequiredBinding(
         continue;
       }
       if (declaration.id.type === "Identifier") {
+        if (excludedBindings?.has(declaration.id.name)) continue;
         return { binding: declaration.id.name, namespace };
       }
       if (declaration.id.type !== "ObjectPattern") continue;
@@ -1573,7 +1583,8 @@ function findDefaultRequiredBinding(
           property.type === "Property" &&
           property.key.type === "Identifier" &&
           property.key.name === "default" &&
-          property.value.type === "Identifier"
+          property.value.type === "Identifier" &&
+          !excludedBindings?.has(property.value.name)
         ) {
           return { binding: property.value.name, namespace: false };
         }
@@ -1586,12 +1597,17 @@ function findDefaultRequiredBinding(
 function findDynamicImportPluginBinding(
   program: ESTree.Program,
   source: string,
+  excludedBindings?: Set<string>,
 ): string | undefined {
   for (const statement of program.body) {
     if (statement.type !== "VariableDeclaration") continue;
     for (const declaration of statement.declarations) {
       const initializer = unwrapExpression(declaration.init);
-      if (declaration.id.type !== "Identifier" || initializer?.type !== "ArrowFunctionExpression") {
+      if (
+        declaration.id.type !== "Identifier" ||
+        excludedBindings?.has(declaration.id.name) ||
+        initializer?.type !== "ArrowFunctionExpression"
+      ) {
         continue;
       }
       const body = unwrapExpression(initializer.body);
@@ -1607,7 +1623,8 @@ function findDynamicImportPluginBinding(
         if (
           imported?.type === "ImportExpression" &&
           imported.source.type === "Literal" &&
-          imported.source.value === source
+          imported.source.value === source &&
+          dynamicImportCallbackCallsDefault(body.arguments[0])
         ) {
           return declaration.id.name;
         }
@@ -1617,12 +1634,62 @@ function findDynamicImportPluginBinding(
   return undefined;
 }
 
+function dynamicImportCallbackCallsDefault(
+  argument: ESTree.CallExpression["arguments"][number] | undefined,
+): boolean {
+  if (
+    !argument ||
+    argument.type === "SpreadElement" ||
+    (argument.type !== "ArrowFunctionExpression" && argument.type !== "FunctionExpression") ||
+    argument.params.length !== 1
+  ) {
+    return false;
+  }
+  if (!argument.body) return false;
+  const returned =
+    argument.body.type === "BlockStatement"
+      ? argument.body.body.find(
+          (statement): statement is ESTree.ReturnStatement => statement.type === "ReturnStatement",
+        )?.argument
+      : argument.body;
+  const call = unwrapExpression(returned);
+  if (call?.type !== "CallExpression") return false;
+  const parameter = argument.params[0];
+  if (parameter.type === "Identifier") {
+    const callbackCallee = unwrapExpression(call.callee);
+    return Boolean(
+      callbackCallee?.type === "MemberExpression" &&
+      callbackCallee.object.type === "Identifier" &&
+      callbackCallee.object.name === parameter.name &&
+      ((!callbackCallee.computed &&
+        callbackCallee.property.type === "Identifier" &&
+        callbackCallee.property.name === "default") ||
+        (callbackCallee.computed &&
+          callbackCallee.property.type === "Literal" &&
+          callbackCallee.property.value === "default")),
+    );
+  }
+  if (parameter.type !== "ObjectPattern" || call.callee.type !== "Identifier") return false;
+  const calleeName = call.callee.name;
+  return parameter.properties.some(
+    (property) =>
+      property.type === "Property" &&
+      ((property.key.type === "Identifier" && property.key.name === "default") ||
+        (property.key.type === "Literal" && property.key.value === "default")) &&
+      property.value.type === "Identifier" &&
+      property.value.name === calleeName,
+  );
+}
+
 function findRequiredBinding(
   program: ESTree.Program,
   source: string,
   imported: string,
+  excludedBindings?: Set<string>,
 ): string | undefined {
-  if (imported === "default") return findDefaultRequiredBinding(program, source)?.binding;
+  if (imported === "default") {
+    return findDefaultRequiredBinding(program, source, excludedBindings)?.binding;
+  }
   for (const statement of program.body) {
     if (statement.type !== "VariableDeclaration") continue;
     for (const declaration of statement.declarations) {
@@ -1642,7 +1709,8 @@ function findRequiredBinding(
           property.type === "Property" &&
           property.key.type === "Identifier" &&
           property.key.name === imported &&
-          property.value.type === "Identifier"
+          property.value.type === "Identifier" &&
+          !excludedBindings?.has(property.value.name)
         ) {
           return property.value.name;
         }
@@ -1667,9 +1735,10 @@ function ensureNamedRequire(
   source: string,
   imported: string,
   binding: string,
+  reuseExisting = true,
 ): string {
   const existing = findRequiredBinding(program, source, imported);
-  if (existing) return existing;
+  if (existing && reuseExisting) return existing;
   const offset = requireInsertionOffset(program);
   const property = binding === imported ? imported : `${imported}: ${binding}`;
   const sourceText = `const { ${property} } = require(${JSON.stringify(source)});`;
@@ -1682,9 +1751,10 @@ function ensureDefaultRequire(
   output: MagicString,
   source: string,
   binding: string,
+  reuseExisting = true,
 ): string {
   const existing = findRequiredBinding(program, source, "default");
-  if (existing) return existing;
+  if (existing && reuseExisting) return existing;
   const offset = requireInsertionOffset(program);
   const sourceText = `const ${binding} = require(${JSON.stringify(source)});`;
   output.appendLeft(offset, offset === 0 ? `${sourceText}\n` : `\n${sourceText}`);
@@ -1847,6 +1917,35 @@ function findAstPath(root: ESTree.Node, target: ESTree.Node): ESTree.Node[] | un
     if (childPath) path = [root, ...childPath];
   });
   return path;
+}
+
+function collectConfigShadowedBindings(program: ESTree.Program, config: AstObject): Set<string> {
+  const bindings = new Set<string>();
+  const path = findAstPath(program, config);
+  if (!path) return bindings;
+  for (const node of path.slice(1)) {
+    if (
+      node.type === "FunctionDeclaration" ||
+      node.type === "FunctionExpression" ||
+      node.type === "ArrowFunctionExpression"
+    ) {
+      for (const parameter of node.params) collectPatternBindings(parameter, bindings);
+    }
+    if (node.type !== "BlockStatement") continue;
+    for (const declaration of node.body) {
+      if (declaration?.type === "VariableDeclaration") {
+        for (const declarator of declaration.declarations) {
+          collectPatternBindings(declarator.id, bindings);
+        }
+      } else if (
+        (declaration?.type === "FunctionDeclaration" || declaration?.type === "ClassDeclaration") &&
+        declaration.id
+      ) {
+        bindings.add(declaration.id.name);
+      }
+    }
+  }
+  return bindings;
 }
 
 function findVisiblePluginArray(
@@ -2289,17 +2388,18 @@ function prepareTailwindPlugin(
   output: MagicString,
   bindings: Set<string>,
   commonJs: boolean,
+  shadowedBindings: Set<string>,
 ): PluginAddition {
   const tailwindLocal = allocateBinding(bindings, "tailwindcss");
   const existingRequire = commonJs
-    ? findDefaultRequiredBinding(program, "@tailwindcss/vite")
+    ? findDefaultRequiredBinding(program, "@tailwindcss/vite", shadowedBindings)
     : undefined;
   const existingDynamicImport = commonJs
-    ? findDynamicImportPluginBinding(program, "@tailwindcss/vite")
+    ? findDynamicImportPluginBinding(program, "@tailwindcss/vite", shadowedBindings)
     : undefined;
   const existingImport = commonJs
     ? undefined
-    : findDefaultImportedBinding(program, "@tailwindcss/vite");
+    : findDefaultImportedBinding(program, "@tailwindcss/vite", shadowedBindings);
   let tailwindBinding: string;
   if (commonJs && !existingRequire && !existingDynamicImport) {
     const offset = requireInsertionOffset(program);
@@ -2310,7 +2410,7 @@ function prepareTailwindPlugin(
     tailwindBinding = commonJs
       ? (existingRequire?.binding ?? existingDynamicImport ?? tailwindLocal)
       : (existingImport?.binding ??
-        ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal));
+        ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal, false));
   }
   const member = existingRequire?.namespace || existingImport?.namespace ? "default" : undefined;
   return {
@@ -2387,10 +2487,12 @@ export function updateViteConfigForTailwind(filePath: string, code: string): str
   const output = new MagicString(code);
   const commonJs = usesCommonJsViteConfig(filePath, code);
   const bindings = collectTopLevelBindings(program);
+  const shadowedBindings = collectConfigShadowedBindings(program, config);
+  for (const binding of shadowedBindings) bindings.add(binding);
   ensurePlugins(
     output,
     config,
-    [prepareTailwindPlugin(program, output, bindings, commonJs)],
+    [prepareTailwindPlugin(program, output, bindings, commonJs, shadowedBindings)],
     code,
     program,
   );
@@ -2422,22 +2524,28 @@ export function updateViteConfigForCloudflare(
   const output = new MagicString(code);
   const commonJs = usesCommonJsViteConfig(filePath, code);
   const bindings = collectTopLevelBindings(program);
+  const shadowedBindings = collectConfigShadowedBindings(program, config);
+  for (const binding of shadowedBindings) bindings.add(binding);
   const existingVinextBinding = commonJs
-    ? findRequiredBinding(program, "vinext", "default")
+    ? findRequiredBinding(program, "vinext", "default", shadowedBindings)
     : program.body
         .filter(
           (statement): statement is ESTree.ImportDeclaration =>
             statement.type === "ImportDeclaration",
         )
-        .find((statement) => statement.source.value === "vinext")
-        ?.specifiers.find(
+        .filter((statement) => statement.source.value === "vinext")
+        .flatMap((statement) => statement.specifiers)
+        .find(
           (specifier): specifier is ESTree.ImportDefaultSpecifier =>
-            specifier.type === "ImportDefaultSpecifier",
+            specifier.type === "ImportDefaultSpecifier" &&
+            !shadowedBindings.has(specifier.local.name),
         )?.local.name;
   const vinextLocal = existingVinextBinding ?? allocateBinding(bindings, "vinext");
-  const vinextBinding = commonJs
-    ? ensureDefaultRequire(program, output, "vinext", vinextLocal)
-    : ensureDefaultImport(program, output, "vinext", vinextLocal);
+  const vinextBinding =
+    existingVinextBinding ??
+    (commonJs
+      ? ensureDefaultRequire(program, output, "vinext", vinextLocal, false)
+      : ensureDefaultImport(program, output, "vinext", vinextLocal, false));
   const existingVinextCall = findPluginCall(config, vinextBinding, program);
   const existingImageOptimizer = getVinextImageOptimizer(existingVinextCall);
   const needsPrerender = Boolean(options.prerender && !hasVinextPrerender(existingVinextCall));
@@ -2467,8 +2575,8 @@ export function updateViteConfigForCloudflare(
     const source = "@vinext/cloudflare/cache/response-store-adapter";
     const imported = "responseStoreAdapter";
     const existing = commonJs
-      ? findRequiredBinding(program, source, imported)
-      : findImportedBinding(program, source, imported);
+      ? findRequiredBinding(program, source, imported, shadowedBindings)
+      : findImportedBinding(program, source, imported, shadowedBindings);
     const cache = getVinextCacheOption(existingVinextCall);
     const alreadyConfigured = Boolean(
       existing &&
@@ -2491,9 +2599,11 @@ export function updateViteConfigForCloudflare(
       (cache.value.type === "ObjectExpression" && cache.value.properties.length === 0)
     ) {
       const local = existing ?? allocateBinding(bindings, imported);
-      const binding = commonJs
-        ? ensureNamedRequire(program, output, source, imported, local)
-        : ensureNamedImport(program, output, source, imported, local);
+      const binding =
+        existing ??
+        (commonJs
+          ? ensureNamedRequire(program, output, source, imported, local, false)
+          : ensureNamedImport(program, output, source, imported, local, false));
       responseStoreBinding = binding;
       responseStoreExpression = `${binding}(${cacheOptions.responseStoreMode === "self-contained" ? '{ mode: "self-contained" }' : ""})`;
       if (alreadyConfigured && cache) {
@@ -2535,32 +2645,46 @@ export function updateViteConfigForCloudflare(
   }
   if (cacheOptions.dataCache === "kv" && !hasVinextCacheSlot(existingVinextCall, "data")) {
     const existing = commonJs
-      ? findRequiredBinding(program, "@vinext/cloudflare/cache/kv-data-adapter", "kvDataAdapter")
-      : findImportedBinding(program, "@vinext/cloudflare/cache/kv-data-adapter", "kvDataAdapter");
-    const local = existing ?? allocateBinding(bindings, "kvDataAdapter");
-    const binding = commonJs
-      ? ensureNamedRequire(
+      ? findRequiredBinding(
           program,
-          output,
           "@vinext/cloudflare/cache/kv-data-adapter",
           "kvDataAdapter",
-          local,
+          shadowedBindings,
         )
-      : ensureNamedImport(
+      : findImportedBinding(
           program,
-          output,
           "@vinext/cloudflare/cache/kv-data-adapter",
           "kvDataAdapter",
-          local,
+          shadowedBindings,
         );
+    const local = existing ?? allocateBinding(bindings, "kvDataAdapter");
+    const binding =
+      existing ??
+      (commonJs
+        ? ensureNamedRequire(
+            program,
+            output,
+            "@vinext/cloudflare/cache/kv-data-adapter",
+            "kvDataAdapter",
+            local,
+            false,
+          )
+        : ensureNamedImport(
+            program,
+            output,
+            "@vinext/cloudflare/cache/kv-data-adapter",
+            "kvDataAdapter",
+            local,
+            false,
+          ));
     cacheAdditions.push({ name: "data", expression: `${binding}()` });
   }
   if (configureCaches && cacheOptions.cdnCache === "workers-cache") {
     const imported = "cdnAdapter";
     const source = "@vinext/cloudflare/cache/cdn-adapter";
     const existing = commonJs
-      ? findRequiredBinding(program, source, imported)
-      : findImportedBinding(program, source, imported);
+      ? findRequiredBinding(program, source, imported, shadowedBindings)
+      : findImportedBinding(program, source, imported, shadowedBindings);
     const existingCdnSlot = getVinextCacheSlot(existingVinextCall, "cdn");
     const existingUsesCloudflareAdapter = Boolean(
       existing &&
@@ -2571,9 +2695,11 @@ export function updateViteConfigForCloudflare(
     // An existing custom CDN adapter is user-owned; init must not replace it.
     if (!existingCdnSlot || existingUsesCloudflareAdapter) {
       const local = existing ?? allocateBinding(bindings, imported);
-      const binding = commonJs
-        ? ensureNamedRequire(program, output, source, imported, local)
-        : ensureNamedImport(program, output, source, imported, local);
+      const binding =
+        existing ??
+        (commonJs
+          ? ensureNamedRequire(program, output, source, imported, local, false)
+          : ensureNamedImport(program, output, source, imported, local, false));
       const adapterOptions =
         options.versionMetadataBinding &&
         options.versionMetadataBinding !== DEFAULT_VERSION_METADATA_BINDING
@@ -2596,16 +2722,18 @@ export function updateViteConfigForCloudflare(
     const source = "@vinext/cloudflare/images/images-optimizer";
     const imported = "imagesOptimizer";
     const existing = commonJs
-      ? findRequiredBinding(program, source, imported)
-      : findImportedBinding(program, source, imported);
+      ? findRequiredBinding(program, source, imported, shadowedBindings)
+      : findImportedBinding(program, source, imported, shadowedBindings);
     if (
       !isUsableImageOptimizer(existingImageOptimizer) ||
       isImagesOptimizerCall(existingImageOptimizer, existing)
     ) {
       const local = existing ?? allocateBinding(bindings, imported);
-      const imageBinding = commonJs
-        ? ensureNamedRequire(program, output, source, imported, local)
-        : ensureNamedImport(program, output, source, imported, local);
+      const imageBinding =
+        existing ??
+        (commonJs
+          ? ensureNamedRequire(program, output, source, imported, local, false)
+          : ensureNamedImport(program, output, source, imported, local, false));
       const bindingOption =
         options.imagesBinding && options.imagesBinding !== "IMAGES"
           ? `{ binding: ${JSON.stringify(options.imagesBinding)} }`
@@ -2614,15 +2742,31 @@ export function updateViteConfigForCloudflare(
     }
   }
   const existingCloudflareBinding = commonJs
-    ? findRequiredBinding(program, "@cloudflare/vite-plugin", "cloudflare")
-    : findImportedBinding(program, "@cloudflare/vite-plugin", "cloudflare");
+    ? findRequiredBinding(program, "@cloudflare/vite-plugin", "cloudflare", shadowedBindings)
+    : findImportedBinding(program, "@cloudflare/vite-plugin", "cloudflare", shadowedBindings);
   const cloudflareLocal = existingCloudflareBinding ?? allocateBinding(bindings, "cloudflare");
-  const cloudflareBinding = commonJs
-    ? ensureNamedRequire(program, output, "@cloudflare/vite-plugin", "cloudflare", cloudflareLocal)
-    : ensureNamedImport(program, output, "@cloudflare/vite-plugin", "cloudflare", cloudflareLocal);
+  const cloudflareBinding =
+    existingCloudflareBinding ??
+    (commonJs
+      ? ensureNamedRequire(
+          program,
+          output,
+          "@cloudflare/vite-plugin",
+          "cloudflare",
+          cloudflareLocal,
+          false,
+        )
+      : ensureNamedImport(
+          program,
+          output,
+          "@cloudflare/vite-plugin",
+          "cloudflare",
+          cloudflareLocal,
+          false,
+        ));
   let tailwindPlugin: PluginAddition | undefined;
   if (options.hasTailwindV4) {
-    tailwindPlugin = prepareTailwindPlugin(program, output, bindings, commonJs);
+    tailwindPlugin = prepareTailwindPlugin(program, output, bindings, commonJs, shadowedBindings);
   }
   ensurePlugins(
     output,
@@ -2722,21 +2866,25 @@ export function updateViteConfigForCloudflare(
 
   if (options.nativeModulesToStub.length > 0) {
     const existingPathBinding = commonJs
-      ? findRequiredBinding(program, "node:path", "default")
+      ? findRequiredBinding(program, "node:path", "default", shadowedBindings)
       : program.body
           .filter(
             (statement): statement is ESTree.ImportDeclaration =>
               statement.type === "ImportDeclaration",
           )
-          .find((statement) => statement.source.value === "node:path")
-          ?.specifiers.find(
+          .filter((statement) => statement.source.value === "node:path")
+          .flatMap((statement) => statement.specifiers)
+          .find(
             (specifier): specifier is ESTree.ImportDefaultSpecifier =>
-              specifier.type === "ImportDefaultSpecifier",
+              specifier.type === "ImportDefaultSpecifier" &&
+              !shadowedBindings.has(specifier.local.name),
           )?.local.name;
     const pathLocal = existingPathBinding ?? allocateBinding(bindings, "path");
-    const pathBinding = commonJs
-      ? ensureDefaultRequire(program, output, "node:path", pathLocal)
-      : ensureDefaultImport(program, output, "node:path", pathLocal);
+    const pathBinding =
+      existingPathBinding ??
+      (commonJs
+        ? ensureDefaultRequire(program, output, "node:path", pathLocal, false)
+        : ensureDefaultImport(program, output, "node:path", pathLocal, false));
     ensureNativeAliases(output, config, options.nativeModulesToStub, pathBinding, code);
   }
 
