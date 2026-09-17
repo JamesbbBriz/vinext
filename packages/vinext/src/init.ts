@@ -179,7 +179,11 @@ export function addScripts(
   root: string,
   port: number | false,
   platform: InitPlatform = "node",
-  options: { warmCdnCache?: boolean; scriptNames?: "namespaced" | "standard" } = {},
+  options: {
+    deployResponseStore?: boolean;
+    warmCdnCache?: boolean;
+    scriptNames?: "namespaced" | "standard";
+  } = {},
 ): string[] {
   const pkgPath = path.join(root, "package.json");
   if (!fs.existsSync(pkgPath)) return [];
@@ -216,6 +220,11 @@ export function addScripts(
           ? "vinext-cloudflare deploy --config dist/server/wrangler.json --experimental-warm-cdn-cache"
           : "vinext-cloudflare deploy --config dist/server/wrangler.json",
       );
+      if (options.deployResponseStore && !pkg.scripts["deploy:response-store"]) {
+        pkg.scripts["deploy:response-store"] =
+          "wrangler deploy --config wrangler.response-store.jsonc";
+        added.push("deploy:response-store");
+      }
     }
 
     if (added.length > 0) {
@@ -238,6 +247,7 @@ export type InitDependencyGroups = {
 export function getInitDependencyGroups(
   isAppRouter: boolean,
   platform: InitPlatform,
+  cloudflare?: CloudflareInitOptions,
   project?: { hasMDX?: boolean; hasTailwind?: boolean },
 ): InitDependencyGroups {
   const dependencies = ["vinext"];
@@ -248,6 +258,12 @@ export function getInitDependencyGroups(
   }
   if (platform === "cloudflare") {
     dependencies.push("@vinext/cloudflare");
+    if (
+      cloudflare?.cdnCache === "response-store" &&
+      (cloudflare.responseStoreMode ?? "service-binding") === "service-binding"
+    ) {
+      dependencies.push("@cloudflare/workers-response-store");
+    }
     devDependencies.push("@cloudflare/vite-plugin", "wrangler");
   }
   // Framework onboarding: MDX rendering and Tailwind v4 both need a Vite
@@ -260,9 +276,10 @@ export function getInitDependencyGroups(
 export function getInitDeps(
   isAppRouter: boolean,
   platform: InitPlatform,
+  cloudflare?: CloudflareInitOptions,
   project?: { hasMDX?: boolean; hasTailwind?: boolean },
 ): string[] {
-  const groups = getInitDependencyGroups(isAppRouter, platform, project);
+  const groups = getInitDependencyGroups(isAppRouter, platform, cloudflare, project);
   return [...groups.dependencies, ...groups.devDependencies];
 }
 
@@ -442,6 +459,7 @@ type PlatformSetupContext = {
   root: string;
   isAppRouter: boolean;
   existingViteConfigPath?: string;
+  packageManager?: string;
   viteConfigExists: boolean;
   force: boolean;
   prerender?: boolean;
@@ -598,6 +616,9 @@ export async function init(options: InitOptions): Promise<InitResult> {
   // ── Step 3: Add scripts ────────────────────────────────────────────────
 
   const addedScripts = addScripts(root, port, platform, {
+    deployResponseStore:
+      options.cloudflare?.cdnCache === "response-store" &&
+      (options.cloudflare.responseStoreMode ?? "service-binding") === "service-binding",
     warmCdnCache: options.cloudflare?.warmCdnCache ?? false,
     scriptNames: options.scriptNames,
   });
@@ -608,6 +629,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
     root,
     isAppRouter: isApp,
     existingViteConfigPath,
+    packageManager: pmName,
     viteConfigExists,
     force: options.force ?? false,
     prerender: options.prerender,
@@ -626,7 +648,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
 
   // ── Step 6: Install dependencies last ──────────────────────────────────
 
-  const neededDeps = getInitDependencyGroups(isApp, platform, projectInfo);
+  const neededDeps = getInitDependencyGroups(isApp, platform, options.cloudflare, projectInfo);
   const missingDependencies = neededDeps.dependencies.filter((dep) => !isDepInstalled(root, dep));
   const missingDevDependencies = neededDeps.devDependencies.filter(
     (dep) => !isDepInstalled(root, dep),
