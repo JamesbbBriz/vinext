@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vite-plus/test";
-import { createBuilder, parseAst } from "vite";
+import { createBuilder, parseAst, resolveConfig } from "vite";
 import { augmentSsrManifestFromBundle as _augmentSsrManifestFromBundle } from "../packages/vinext/src/build/ssr-manifest.js";
 import {
   hasExportAllCandidate as _hasExportAllCandidate,
@@ -297,12 +297,23 @@ describe("optimizeDeps.exclude for vinext", () => {
       // No duplicates
       expect(new Set(result.optimizeDeps.exclude).size).toBe(result.optimizeDeps.exclude.length);
       expect(result.environments.ssr.resolve.external).toContain("typescript");
+      expect(result.environments.client.optimizeDeps.exclude).toContain("file-type");
+      expect(result.environments.client.optimizeDeps.exclude).toContain("jose");
       expect(result.environments.ssr.optimizeDeps.exclude).toContain("file-type");
       expect(result.environments.ssr.optimizeDeps.exclude).toContain("jose");
       expect(result.define?.["process.env.__VINEXT_HAS_PAGES_ROUTER"]).toBe('"true"');
       expect(
         aliasEntriesToRecord(result.resolve.alias)["vinext/server/pages-client-assets"],
       ).toMatch(/server\/pages-client-assets\.ts$/);
+
+      const resolved = await resolveConfig(
+        { root: tmpDir, logLevel: "silent", plugins: vinext() },
+        "serve",
+      );
+      for (const name of ["client", "ssr"] as const) {
+        expect(resolved.environments[name].optimizeDeps.exclude).toContain("file-type");
+        expect(resolved.environments[name].optimizeDeps.exclude).toContain("jose");
+      }
     } finally {
       await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
