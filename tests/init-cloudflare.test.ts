@@ -538,6 +538,24 @@ module.exports = defineConfig({ plugins: [vinext()] });
     ["named default import", 'import { default as tw } from "@tailwindcss/vite";', "tw()", 1],
     ["namespace import", 'import * as tw from "@tailwindcss/vite";', "tw.default()", 1],
     [
+      "call wrapped with satisfies",
+      'import tw from "@tailwindcss/vite";',
+      "tw({ optimize: false }) satisfies PluginOption",
+      1,
+    ],
+    [
+      "call wrapped with as",
+      'import tw from "@tailwindcss/vite";',
+      "tw({ optimize: false }) as PluginOption",
+      1,
+    ],
+    [
+      "call wrapped with non-null assertion",
+      'import tw from "@tailwindcss/vite";',
+      "tw({ optimize: false })!",
+      1,
+    ],
+    [
       "default import after a type-only import",
       `import type { PluginOptions } from "@tailwindcss/vite";
 import tw from "@tailwindcss/vite";`,

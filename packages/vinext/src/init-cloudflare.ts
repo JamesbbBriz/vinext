@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import MagicString from "magic-string";
 import type { ESTree } from "vite";
 import type { CloudflareInitOptions } from "./init-platform.js";
+import { unwrapExpression } from "./plugins/ast-utils.js";
 import { detectProject } from "./utils/project.js";
 import { isUnknownRecord } from "./utils/record.js";
 
@@ -1788,12 +1789,17 @@ function findPluginCall(
 ): (ESTree.CallExpression & AstNode) | undefined {
   const plugins = findProperty(config, "plugins");
   if (!plugins || plugins.value.type !== "ArrayExpression") return undefined;
-  return plugins.value.elements.find(
-    (element): element is ESTree.CallExpression & AstNode =>
-      element?.type === "CallExpression" &&
-      element.callee.type === "Identifier" &&
-      element.callee.name === binding,
-  );
+  for (const element of plugins.value.elements) {
+    const expression = unwrapExpression(element);
+    if (
+      expression?.type === "CallExpression" &&
+      expression.callee.type === "Identifier" &&
+      expression.callee.name === binding
+    ) {
+      return expression as ESTree.CallExpression & AstNode;
+    }
+  }
+  return undefined;
 }
 
 function getVinextCacheSlot(
@@ -2062,16 +2068,19 @@ function ensurePlugins(
   const missingExpressions: string[] = [];
   for (const addition of additions) {
     const alreadyConfigured = array.elements.some((element) => {
-      if (element?.type !== "CallExpression") return false;
-      if (element.callee.type === "Identifier") return element.callee.name === addition.binding;
+      const expression = unwrapExpression(element);
+      if (expression?.type !== "CallExpression") return false;
+      if (expression.callee.type === "Identifier") {
+        return expression.callee.name === addition.binding;
+      }
       return (
         addition.member !== undefined &&
-        element.callee.type === "MemberExpression" &&
-        !element.callee.computed &&
-        element.callee.object.type === "Identifier" &&
-        element.callee.object.name === addition.binding &&
-        element.callee.property.type === "Identifier" &&
-        element.callee.property.name === addition.member
+        expression.callee.type === "MemberExpression" &&
+        !expression.callee.computed &&
+        expression.callee.object.type === "Identifier" &&
+        expression.callee.object.name === addition.binding &&
+        expression.callee.property.type === "Identifier" &&
+        expression.callee.property.name === addition.member
       );
     });
     if (!alreadyConfigured) missingExpressions.push(addition.expression);
