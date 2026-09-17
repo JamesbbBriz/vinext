@@ -1720,6 +1720,31 @@ describe("init — guard rails", () => {
     expect(result.skippedViteConfig).toBe(true);
   });
 
+  it("adds Tailwind v4 to an existing Node Vite config", async () => {
+    setupProject(tmpDir, {
+      router: "app",
+      extraPkg: { devDependencies: { tailwindcss: "^4.2.0" } },
+    });
+    writeFile(
+      tmpDir,
+      "node_modules/tailwindcss/package.json",
+      JSON.stringify({ version: "4.2.0" }),
+    );
+    writeFile(
+      tmpDir,
+      "vite.config.ts",
+      'import vinext from "vinext";\nexport default { plugins: [vinext()] };',
+    );
+
+    const { result } = await runInit(tmpDir, { platform: "node", install: false });
+    await runInit(tmpDir, { platform: "node", install: false });
+
+    const config = readFile(tmpDir, "vite.config.ts");
+    expect(result.generatedViteConfig).toBe(true);
+    expect(config.match(/import tailwindcss from "@tailwindcss\/vite"/g)).toHaveLength(1);
+    expect(config.match(/tailwindcss\(\)/g)).toHaveLength(1);
+  });
+
   it("AST-updates a Cloudflare init when the existing Vite config lacks plugins", async () => {
     setupProject(tmpDir, { router: "app" });
     writeFile(tmpDir, "vite.config.ts", "export default {}");

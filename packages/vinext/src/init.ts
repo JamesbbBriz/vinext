@@ -30,6 +30,7 @@ import {
 } from "./utils/project.js";
 import {
   setupCloudflarePlatform,
+  updateViteConfigForTailwind,
   usesCommonJsViteConfig,
   validateCloudflarePlatformSetup,
 } from "./init-cloudflare.js";
@@ -465,9 +466,21 @@ type PlatformSetupResult = {
 
 function setupNodePlatform(context: PlatformSetupContext): PlatformSetupResult {
   if (context.viteConfigExists && !context.force) {
+    let generatedViteConfig = false;
+    if (context.hasTailwindV4 && context.existingViteConfigPath) {
+      const currentConfig = fs.readFileSync(context.existingViteConfigPath, "utf-8");
+      const updatedConfig = updateViteConfigForTailwind(
+        context.existingViteConfigPath,
+        currentConfig,
+      );
+      if (updatedConfig !== currentConfig) {
+        fs.writeFileSync(context.existingViteConfigPath, updatedConfig, "utf-8");
+        generatedViteConfig = true;
+      }
+    }
     return {
-      generatedViteConfig: false,
-      skippedViteConfig: true,
+      generatedViteConfig,
+      skippedViteConfig: !generatedViteConfig,
       generatedPlatformFiles: [],
       nextSteps: [],
     };

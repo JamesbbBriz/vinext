@@ -2203,6 +2203,42 @@ function ensurePlugins(
   );
 }
 
+function prepareTailwindPlugin(
+  program: ESTree.Program,
+  output: MagicString,
+  bindings: Set<string>,
+  commonJs: boolean,
+): { expression: string; binding: string; member?: string } {
+  const tailwindLocal = allocateBinding(bindings, "tailwindcss");
+  const existingRequire = commonJs
+    ? findDefaultRequiredBinding(program, "@tailwindcss/vite")
+    : undefined;
+  const existingDynamicImport = commonJs
+    ? findDynamicImportPluginBinding(program, "@tailwindcss/vite")
+    : undefined;
+  const existingImport = commonJs
+    ? undefined
+    : findDefaultImportedBinding(program, "@tailwindcss/vite");
+  let tailwindBinding: string;
+  if (commonJs && !existingRequire && !existingDynamicImport) {
+    const offset = requireInsertionOffset(program);
+    const sourceText = `const ${tailwindLocal} = () => import("@tailwindcss/vite").then(({ default: plugin }) => plugin());`;
+    output.appendLeft(offset, offset === 0 ? `${sourceText}\n` : `\n${sourceText}`);
+    tailwindBinding = tailwindLocal;
+  } else {
+    tailwindBinding = commonJs
+      ? (existingRequire?.binding ?? existingDynamicImport ?? tailwindLocal)
+      : (existingImport?.binding ??
+        ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal));
+  }
+  const member = existingRequire?.namespace || existingImport?.namespace ? "default" : undefined;
+  return {
+    expression: `${tailwindBinding}${member ? `.${member}` : ""}()`,
+    binding: tailwindBinding,
+    member,
+  };
+}
+
 function ensureNativeAliases(
   output: MagicString,
   config: AstObject,
@@ -2256,6 +2292,21 @@ function ensureNativeAliases(
   if (missingLines.length > 0) {
     insertObjectProperty(output, aliasObject, missingLines.join("\n"), code);
   }
+}
+
+export function updateViteConfigForTailwind(filePath: string, code: string): string {
+  const program = parseViteConfig(filePath, code);
+  const config = findConfigObject(program);
+  if (!config) {
+    throw new Error(
+      `Could not find a static Vite config object in ${path.basename(filePath)}. Use an object export or defineConfig({...}) so vinext init can update it.`,
+    );
+  }
+  const output = new MagicString(code);
+  const commonJs = usesCommonJsViteConfig(filePath, code);
+  const bindings = collectTopLevelBindings(program);
+  ensurePlugins(output, config, [prepareTailwindPlugin(program, output, bindings, commonJs)], code);
+  return output.toString();
 }
 
 export function updateViteConfigForCloudflare(
@@ -2483,34 +2534,7 @@ export function updateViteConfigForCloudflare(
     : ensureNamedImport(program, output, "@cloudflare/vite-plugin", "cloudflare", cloudflareLocal);
   let tailwindPlugin: { expression: string; binding: string; member?: string } | undefined;
   if (options.hasTailwindV4) {
-    const tailwindLocal = allocateBinding(bindings, "tailwindcss");
-    const existingRequire = commonJs
-      ? findDefaultRequiredBinding(program, "@tailwindcss/vite")
-      : undefined;
-    const existingDynamicImport = commonJs
-      ? findDynamicImportPluginBinding(program, "@tailwindcss/vite")
-      : undefined;
-    const existingImport = commonJs
-      ? undefined
-      : findDefaultImportedBinding(program, "@tailwindcss/vite");
-    let tailwindBinding: string;
-    if (commonJs && !existingRequire && !existingDynamicImport) {
-      const offset = requireInsertionOffset(program);
-      const sourceText = `const ${tailwindLocal} = () => import("@tailwindcss/vite").then(({ default: plugin }) => plugin());`;
-      output.appendLeft(offset, offset === 0 ? `${sourceText}\n` : `\n${sourceText}`);
-      tailwindBinding = tailwindLocal;
-    } else {
-      tailwindBinding = commonJs
-        ? (existingRequire?.binding ?? existingDynamicImport ?? tailwindLocal)
-        : (existingImport?.binding ??
-          ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal));
-    }
-    const member = existingRequire?.namespace || existingImport?.namespace ? "default" : undefined;
-    tailwindPlugin = {
-      expression: `${tailwindBinding}${member ? `.${member}` : ""}()`,
-      binding: tailwindBinding,
-      member,
-    };
+    tailwindPlugin = prepareTailwindPlugin(program, output, bindings, commonJs);
   }
   ensurePlugins(
     output,
