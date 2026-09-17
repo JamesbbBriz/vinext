@@ -1285,7 +1285,7 @@ function findPluginsProperty(config: AstObject): AstProperty | undefined {
     if (name === "plugins") {
       plugins = property;
       pluginsIndex = index;
-    } else if (property.computed) {
+    } else if (property.computed && name === undefined) {
       lastUnknownIndex = index;
     }
   }
@@ -1402,24 +1402,8 @@ function isViteDefineConfigCall(program: ESTree.Program, call: ESTree.CallExpres
   );
 }
 
-function findConfigObjectInCall(
-  program: ESTree.Program,
-  call: ESTree.CallExpression,
-): AstObject | undefined {
-  if (!isViteDefineConfigCall(program, call) || call.arguments.length === 0) return undefined;
-  const firstArgument = call.arguments[0];
-  if (firstArgument.type === "SpreadElement") return undefined;
-  const argumentObject = unwrapObject(firstArgument);
-  if (argumentObject) return argumentObject;
-  if (
-    firstArgument.type !== "ArrowFunctionExpression" &&
-    firstArgument.type !== "FunctionExpression"
-  ) {
-    return undefined;
-  }
-  if (!firstArgument.body) return undefined;
-  if (firstArgument.body.type !== "BlockStatement") return unwrapObject(firstArgument.body);
-  const directReturns = firstArgument.body.body.filter(
+function findSingleDirectReturn(body: ESTree.BlockStatement): ESTree.ReturnStatement | undefined {
+  const directReturns = body.body.filter(
     (statement): statement is ESTree.ReturnStatement => statement.type === "ReturnStatement",
   );
   const reachableReturns: ESTree.ReturnStatement[] = [];
@@ -1437,16 +1421,33 @@ function findConfigObjectInCall(
     }
     forEachAstChild(node, collectReturns);
   };
-  for (const statement of firstArgument.body.body) collectReturns(statement);
-  const returnStatement = directReturns[0];
+  for (const statement of body.body) collectReturns(statement);
+  return directReturns.length === 1 &&
+    reachableReturns.length === 1 &&
+    reachableReturns[0] === directReturns[0]
+    ? directReturns[0]
+    : undefined;
+}
+
+function findConfigObjectInCall(
+  program: ESTree.Program,
+  call: ESTree.CallExpression,
+): AstObject | undefined {
+  if (!isViteDefineConfigCall(program, call) || call.arguments.length === 0) return undefined;
+  const firstArgument = call.arguments[0];
+  if (firstArgument.type === "SpreadElement") return undefined;
+  const argumentObject = unwrapObject(firstArgument);
+  if (argumentObject) return argumentObject;
   if (
-    directReturns.length !== 1 ||
-    reachableReturns.length !== 1 ||
-    reachableReturns[0] !== returnStatement ||
-    !returnStatement.argument
+    firstArgument.type !== "ArrowFunctionExpression" &&
+    firstArgument.type !== "FunctionExpression"
   ) {
     return undefined;
   }
+  if (!firstArgument.body) return undefined;
+  if (firstArgument.body.type !== "BlockStatement") return unwrapObject(firstArgument.body);
+  const returnStatement = findSingleDirectReturn(firstArgument.body);
+  if (!returnStatement?.argument) return undefined;
   const returned = unwrapExpression(returnStatement.argument) ?? returnStatement.argument;
   const direct = unwrapObject(returned);
   if (direct) return direct;
@@ -1827,9 +1828,7 @@ function dynamicImportCallbackCallsDefault(
   if (!argument.body) return false;
   const returned =
     argument.body.type === "BlockStatement"
-      ? argument.body.body.find(
-          (statement): statement is ESTree.ReturnStatement => statement.type === "ReturnStatement",
-        )?.argument
+      ? findSingleDirectReturn(argument.body)?.argument
       : argument.body;
   const call = unwrapExpression(returned);
   if (call?.type !== "CallExpression") return false;
@@ -2134,6 +2133,13 @@ function collectConfigShadowedBindings(program: ESTree.Program, config: AstObjec
         declaration.id
       ) {
         bindings.add(declaration.id.name);
+      } else if (declaration?.type === "TSEnumDeclaration") {
+        bindings.add(declaration.id.name);
+      } else if (
+        declaration?.type === "TSModuleDeclaration" &&
+        declaration.id.type === "Identifier"
+      ) {
+        bindings.add(declaration.id.name);
       }
     }
   }
@@ -2165,13 +2171,26 @@ function findVisibleConstInitializer(
     for (const statement of statements) {
       const declaration =
         statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
-      if (declaration?.type !== "VariableDeclaration") continue;
-      const declarator = declaration.declarations.find(
-        (candidate) => candidate.id.type === "Identifier" && candidate.id.name === binding,
-      );
-      if (!declarator) continue;
-      initializer =
-        declaration.kind === "const" ? (unwrapExpression(declarator.init) ?? undefined) : undefined;
+      if (declaration?.type === "VariableDeclaration") {
+        const declarator = declaration.declarations.find(
+          (candidate) => candidate.id.type === "Identifier" && candidate.id.name === binding,
+        );
+        if (!declarator) continue;
+        initializer =
+          declaration.kind === "const"
+            ? (unwrapExpression(declarator.init) ?? undefined)
+            : undefined;
+      } else if (
+        ((declaration?.type === "FunctionDeclaration" ||
+          declaration?.type === "ClassDeclaration") &&
+          declaration.id?.name === binding) ||
+        (declaration?.type === "TSEnumDeclaration" && declaration.id.name === binding) ||
+        (declaration?.type === "TSModuleDeclaration" &&
+          declaration.id.type === "Identifier" &&
+          declaration.id.name === binding)
+      ) {
+        initializer = undefined;
+      }
     }
   }
   return initializer;

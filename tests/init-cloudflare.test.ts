@@ -1366,6 +1366,25 @@ module.exports = { plugins: [vinext()] };
     expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
   });
 
+  it("does not reuse a dynamic import helper with a nested alternate return", () => {
+    const input = `const vinext = require("vinext");
+const loadTailwind = () => import("@tailwindcss/vite").then((module) => {
+  if (process.env.CUSTOM_TAILWIND) return customPlugin();
+  return module.default();
+});
+module.exports = { plugins: [vinext()] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.cjs", input);
+
+    expect(output).toContain(
+      'const tailwindcss = () => import("@tailwindcss/vite").then(({ default: plugin }) => plugin());',
+    );
+    expect(output).toContain("tailwindcss()");
+    expect(output).not.toContain("loadTailwind()");
+    expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
+  });
+
   it("preserves a CommonJS directive prologue", () => {
     const input = `"use strict";
 const vinext = require("vinext");
@@ -1388,6 +1407,19 @@ export default { plugins: [], ...base };
 `,
       ),
     ).toThrow("later spread or computed property may override it");
+  });
+
+  it("allows a later computed property with a literal name", () => {
+    const output = updateViteConfigForTailwind(
+      "vite.config.ts",
+      `import vinext from "vinext";
+export default { plugins: [vinext()], ["resolve"]: {} };
+`,
+    );
+
+    expectValidConfig(output);
+    expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
+    expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
   });
 
   it("uses unshadowed plugin aliases inside callback configs", () => {
@@ -1432,6 +1464,23 @@ export default defineConfig(() => {
       `import { defineConfig } from "vite";
 import tailwindcss from "@tailwindcss/vite";
 export default defineConfig(function tailwindcss() {
+  return { plugins: [] };
+});
+`,
+    );
+
+    expectValidConfig(output);
+    expect(output).toContain('import tailwindcss2 from "@tailwindcss/vite"');
+    expect(output).toContain("plugins: [\n    tailwindcss2(),\n  ]");
+  });
+
+  it("does not reuse a plugin import shadowed by a callback-local enum", () => {
+    const output = updateViteConfigForTailwind(
+      "vite.config.ts",
+      `import { defineConfig } from "vite";
+import tailwindcss from "@tailwindcss/vite";
+export default defineConfig(() => {
+  enum tailwindcss { custom }
   return { plugins: [] };
 });
 `,
