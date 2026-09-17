@@ -2116,6 +2116,7 @@ function ensurePlugins(
   config: AstObject,
   additions: Array<{ expression: string; binding: string; member?: string }>,
   code: string,
+  program?: ESTree.Program,
 ): void {
   const plugins = findProperty(config, "plugins");
   if (!plugins) {
@@ -2123,12 +2124,29 @@ function ensurePlugins(
     insertObjectProperty(output, config, `  plugins: [\n${expressions.join(",\n")},\n  ],`, code);
     return;
   }
-  if (plugins.value.type !== "ArrayExpression") {
+  let array =
+    plugins.value.type === "ArrayExpression"
+      ? (plugins.value as ESTree.ArrayExpression & AstNode)
+      : undefined;
+  if (!array && plugins.value.type === "Identifier" && program) {
+    const pluginsBinding = plugins.value.name;
+    for (const statement of program.body) {
+      if (statement.type !== "VariableDeclaration") continue;
+      const declaration = statement.declarations.find(
+        (candidate) => candidate.id.type === "Identifier" && candidate.id.name === pluginsBinding,
+      );
+      const initializer = unwrapExpression(declaration?.init);
+      if (initializer?.type === "ArrayExpression") {
+        array = initializer as ESTree.ArrayExpression & AstNode;
+        break;
+      }
+    }
+  }
+  if (!array) {
     throw new Error(
       "The Vite config's plugins option must be an array for vinext init to update it.",
     );
   }
-  const array = plugins.value as ESTree.ArrayExpression & AstNode;
   const propertyIndent =
     code
       .slice(0, (plugins as AstNode).start)
@@ -2305,7 +2323,13 @@ export function updateViteConfigForTailwind(filePath: string, code: string): str
   const output = new MagicString(code);
   const commonJs = usesCommonJsViteConfig(filePath, code);
   const bindings = collectTopLevelBindings(program);
-  ensurePlugins(output, config, [prepareTailwindPlugin(program, output, bindings, commonJs)], code);
+  ensurePlugins(
+    output,
+    config,
+    [prepareTailwindPlugin(program, output, bindings, commonJs)],
+    code,
+    program,
+  );
   return output.toString();
 }
 
