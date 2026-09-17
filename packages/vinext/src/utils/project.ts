@@ -40,7 +40,7 @@ function isTailwindV4Range(specifier: string): boolean {
         if (major === "4") return minor !== undefined && (minor !== "0" || patch !== "0");
         return (
           major === "5" &&
-          prerelease === undefined &&
+          (prerelease === undefined || prerelease === "0") &&
           (minor === undefined || (minor === "0" && (patch === undefined || patch === "0")))
         );
       },

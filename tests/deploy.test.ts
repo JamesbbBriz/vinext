@@ -2928,7 +2928,7 @@ describe("detectProject — new detection features", () => {
     expect(info.hasCodeHike).toBe(false);
   });
 
-  it.each(["^4.2.0", ">=4 <5", ">=4.1.0 <5.0.0", "=4.2.0", "4.1.0 - 4.9.0"])(
+  it.each(["^4.2.0", ">=4 <5", ">=4.1.0 <5.0.0", ">=4.0.0-0 <5.0.0-0", "=4.2.0", "4.1.0 - 4.9.0"])(
     "detects Tailwind v4 from the declared range %s",
     (version) => {
       mkdir(tmpDir, "app");
