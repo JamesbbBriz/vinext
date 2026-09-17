@@ -537,6 +537,7 @@ module.exports = defineConfig({ plugins: [vinext()] });
     ["default import", 'import tw from "@tailwindcss/vite";', "tw()", 1],
     ["named default import", 'import { default as tw } from "@tailwindcss/vite";', "tw()", 1],
     ["namespace import", 'import * as tw from "@tailwindcss/vite";', "tw.default()", 1],
+    ["nested plugin array", 'import tw from "@tailwindcss/vite";', "[tw({ optimize: false })]", 1],
     [
       "call wrapped with satisfies",
       'import tw from "@tailwindcss/vite";',
@@ -599,6 +600,11 @@ export default { plugins: [vinext(), ${tailwindCall}] };
       "with an existing unwrapped require",
       'const tw = require("@tailwindcss/vite").default;\n',
       "tw()",
+    ],
+    [
+      "with computed default access",
+      'const tw = require("@tailwindcss/vite")["default"];\n',
+      "tw({ optimize: false })",
     ],
     [
       "with an existing destructured require",

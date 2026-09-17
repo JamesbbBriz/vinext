@@ -1546,9 +1546,12 @@ function findDefaultRequiredBinding(
         namespace = true;
       } else if (
         initializer?.type === "MemberExpression" &&
-        !initializer.computed &&
-        initializer.property.type === "Identifier" &&
-        initializer.property.name === "default"
+        ((!initializer.computed &&
+          initializer.property.type === "Identifier" &&
+          initializer.property.name === "default") ||
+          (initializer.computed &&
+            initializer.property.type === "Literal" &&
+            initializer.property.value === "default"))
       ) {
         const object = unwrapExpression(initializer.object);
         if (object?.type === "CallExpression") requireCall = object;
@@ -1793,13 +1796,22 @@ function findPluginCall(
 ): (ESTree.CallExpression & AstNode) | undefined {
   const plugins = findProperty(config, "plugins");
   if (!plugins || plugins.value.type !== "ArrayExpression") return undefined;
-  for (const element of plugins.value.elements) {
+  return findCallInPluginArray(
+    plugins.value,
+    (call) => call.callee.type === "Identifier" && call.callee.name === binding,
+  );
+}
+
+function findCallInPluginArray(
+  array: ESTree.ArrayExpression,
+  matches: (call: ESTree.CallExpression) => boolean,
+): (ESTree.CallExpression & AstNode) | undefined {
+  for (const element of array.elements) {
     const expression = unwrapExpression(element);
-    if (
-      expression?.type === "CallExpression" &&
-      expression.callee.type === "Identifier" &&
-      expression.callee.name === binding
-    ) {
+    if (expression?.type === "ArrayExpression") {
+      const nested = findCallInPluginArray(expression, matches);
+      if (nested) return nested;
+    } else if (expression?.type === "CallExpression" && matches(expression)) {
       return expression as ESTree.CallExpression & AstNode;
     }
   }
@@ -2071,9 +2083,7 @@ function ensurePlugins(
   const elementIndent = `${propertyIndent}  `;
   const missingExpressions: string[] = [];
   for (const addition of additions) {
-    const alreadyConfigured = array.elements.some((element) => {
-      const expression = unwrapExpression(element);
-      if (expression?.type !== "CallExpression") return false;
+    const alreadyConfigured = findCallInPluginArray(array, (expression) => {
       if (expression.callee.type === "Identifier") {
         return expression.callee.name === addition.binding;
       }
