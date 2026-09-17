@@ -1841,7 +1841,9 @@ function findCallInPluginArray(
   matches: (call: ESTree.CallExpression) => boolean,
 ): (ESTree.CallExpression & AstNode) | undefined {
   for (const element of array.elements) {
-    const expression = unwrapExpression(element);
+    const expression = unwrapExpression(
+      element?.type === "SpreadElement" ? element.argument : element,
+    );
     if (expression?.type === "ArrayExpression") {
       const nested = findCallInPluginArray(expression, matches);
       if (nested) return nested;

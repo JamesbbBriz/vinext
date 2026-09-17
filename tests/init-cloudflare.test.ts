@@ -547,6 +547,12 @@ module.exports = defineConfig({ plugins: [vinext()] });
     ],
     ["nested plugin array", 'import tw from "@tailwindcss/vite";', "[tw({ optimize: false })]", 1],
     [
+      "spread nested plugin array",
+      'import tw from "@tailwindcss/vite";',
+      "...[tw({ optimize: false })]",
+      1,
+    ],
+    [
       "call wrapped with satisfies",
       'import tw from "@tailwindcss/vite";',
       "tw({ optimize: false }) satisfies PluginOption",
