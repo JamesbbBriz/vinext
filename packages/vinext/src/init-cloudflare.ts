@@ -16,7 +16,7 @@ export type CloudflareProjectInfo = {
   isAppRouter: boolean;
   hasISR: boolean;
   hasMDX: boolean;
-  hasTailwind: boolean;
+  hasTailwindV4: boolean;
   nativeModulesToStub: string[];
 };
 
@@ -1110,7 +1110,7 @@ export function generateAppRouterViteConfig(
     imports.push(`import path from "node:path";`);
   }
 
-  if (info?.hasTailwind) {
+  if (info?.hasTailwindV4) {
     imports.push(`import tailwindcss from "@tailwindcss/vite";`);
   }
 
@@ -1120,7 +1120,7 @@ export function generateAppRouterViteConfig(
     plugins.push(`    // vinext auto-injects @mdx-js/rollup with plugins from next.config`);
   }
 
-  if (info?.hasTailwind) {
+  if (info?.hasTailwindV4) {
     plugins.push(`    tailwindcss(),`);
   }
   plugins.push(
@@ -1185,7 +1185,7 @@ export function generatePagesRouterViteConfig(
     imports.push(`import path from "node:path";`);
   }
 
-  if (info?.hasTailwind) {
+  if (info?.hasTailwindV4) {
     imports.push(`import tailwindcss from "@tailwindcss/vite";`);
   }
 
@@ -1208,7 +1208,7 @@ export function generatePagesRouterViteConfig(
 
 export default defineConfig({
   plugins: [
-${info?.hasTailwind ? "    tailwindcss(),\n" : ""}    ${vinextExpression(
+${info?.hasTailwindV4 ? "    tailwindcss(),\n" : ""}    ${vinextExpression(
     options,
     "vinext",
     "imagesOptimizer",

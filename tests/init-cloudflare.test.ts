@@ -32,6 +32,7 @@ describe("generateWranglerConfig", () => {
           isAppRouter: true,
           hasISR: true,
           hasMDX: false,
+          hasTailwindV4: false,
           nativeModulesToStub: [],
         },
         {

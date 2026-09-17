@@ -1118,22 +1118,36 @@ describe("init — generated project snapshots", () => {
   });
 
   it.each([
-    ["node", "^3.4.0"],
-    ["node", "^4.2.0"],
-    ["cloudflare", "^3.4.0"],
-    ["cloudflare", "^4.2.0"],
-  ] as const)("wires Tailwind %s %s without upgrading v3", async (platform, version) => {
-    setupProject(tmpDir, { extraPkg: { devDependencies: { tailwindcss: version } } });
+    ["node", "app", "^3.4.0"],
+    ["node", "app", "^4.2.0"],
+    ["node", "pages", "^3.4.0"],
+    ["node", "pages", "^4.2.0"],
+    ["cloudflare", "app", "^3.4.0"],
+    ["cloudflare", "app", "^4.2.0"],
+    ["cloudflare", "pages", "^3.4.0"],
+    ["cloudflare", "pages", "^4.2.0"],
+  ] as const)("wires Tailwind %s %s %s without upgrading v3", async (platform, router, version) => {
+    setupProject(tmpDir, { router, extraPkg: { devDependencies: { tailwindcss: version } } });
     await runInit(tmpDir, { platform, install: false });
     const enabled = version.startsWith("^4");
     expect(readFile(tmpDir, "vite.config.ts").includes("@tailwindcss/vite")).toBe(enabled);
     expect("@tailwindcss/vite" in (readPkg(tmpDir).devDependencies as object)).toBe(enabled);
   });
 
+  it.each(["app", "pages"] as const)(
+    "installs the MDX plugin for detected %s routes",
+    async (router) => {
+      setupProject(tmpDir, { router });
+      writeFile(tmpDir, `${router}/about.mdx`, "# About");
+      await runInit(tmpDir, { platform: "node", install: false });
+      expect(readPkg(tmpDir).devDependencies).toMatchObject({ "@mdx-js/rollup": "latest" });
+    },
+  );
+
   it("adds MDX and Tailwind devDependencies for detected frameworks", () => {
-    const groups = getInitDependencyGroups(true, "node", {
+    const groups = getInitDependencyGroups(true, "node", undefined, {
       hasMDX: true,
-      hasTailwind: true,
+      hasTailwindV4: true,
     });
     expect(groups.devDependencies).toContain("@mdx-js/rollup");
     expect(groups.devDependencies).toContain("@tailwindcss/vite");
@@ -1144,7 +1158,7 @@ describe("init — generated project snapshots", () => {
   });
 
   it("generates a vite config with the Tailwind plugin when detected", () => {
-    const withTailwind = generateViteConfig(false, false, { hasTailwind: true });
+    const withTailwind = generateViteConfig(false, false, { hasTailwindV4: true });
     expect(withTailwind).toContain('import tailwindcss from "@tailwindcss/vite"');
     expect(withTailwind).toContain("tailwindcss()");
 
