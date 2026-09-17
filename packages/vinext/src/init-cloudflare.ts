@@ -1750,9 +1750,10 @@ function ensureCloudflareViteEnvironment(
   binding: string,
   isAppRouter: boolean,
   code: string,
+  program: ESTree.Program,
 ): void {
   if (!isAppRouter) return;
-  const call = findPluginCall(config, binding);
+  const call = findPluginCall(config, binding, program);
   if (!call) return;
   const viteEnvironment = `viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] }`;
   const firstArgument = call.arguments[0];
@@ -1827,13 +1828,39 @@ function ensureCloudflareViteEnvironment(
 function findPluginCall(
   config: AstObject,
   binding: string,
+  program: ESTree.Program,
 ): (ESTree.CallExpression & AstNode) | undefined {
+  const array = findPluginArray(config, program);
+  return array
+    ? findCallInPluginArray(
+        array,
+        (call) => call.callee.type === "Identifier" && call.callee.name === binding,
+      )
+    : undefined;
+}
+
+function findPluginArray(
+  config: AstObject,
+  program: ESTree.Program,
+): (ESTree.ArrayExpression & AstNode) | undefined {
   const plugins = findProperty(config, "plugins");
-  if (!plugins || plugins.value.type !== "ArrayExpression") return undefined;
-  return findCallInPluginArray(
-    plugins.value,
-    (call) => call.callee.type === "Identifier" && call.callee.name === binding,
-  );
+  if (!plugins) return undefined;
+  if (plugins.value.type === "ArrayExpression") return plugins.value;
+  if (plugins.value.type !== "Identifier") return undefined;
+  const pluginsBinding = plugins.value.name;
+  for (const statement of program.body) {
+    const statementDeclaration =
+      statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+    if (statementDeclaration?.type !== "VariableDeclaration") continue;
+    const declaration = statementDeclaration.declarations.find(
+      (candidate) => candidate.id.type === "Identifier" && candidate.id.name === pluginsBinding,
+    );
+    const initializer = unwrapExpression(declaration?.init);
+    if (initializer?.type === "ArrayExpression") {
+      return initializer as ESTree.ArrayExpression & AstNode;
+    }
+  }
+  return undefined;
 }
 
 function findCallInPluginArray(
@@ -1967,9 +1994,10 @@ function ensureVinextCache(
   vinextBinding: string,
   additions: Array<{ name: "data" | "cdn"; expression: string }>,
   code: string,
+  program: ESTree.Program,
 ): void {
   if (additions.length === 0) return;
-  const call = findPluginCall(config, vinextBinding);
+  const call = findPluginCall(config, vinextBinding, program);
   if (!call) return;
   if (call.arguments.length === 0) {
     output.appendLeft(
@@ -2018,9 +2046,10 @@ function ensureVinextResponseStore(
   vinextBinding: string,
   expression: string | undefined,
   code: string,
+  program: ESTree.Program,
 ): void {
   if (!expression) return;
-  const call = findPluginCall(config, vinextBinding);
+  const call = findPluginCall(config, vinextBinding, program);
   const firstArgument = call?.arguments[0];
   if (!call || !firstArgument || firstArgument.type === "SpreadElement") return;
   if (firstArgument.type !== "ObjectExpression") {
@@ -2043,9 +2072,10 @@ function ensureVinextImageOptimizer(
   vinextBinding: string,
   expression: string | undefined,
   code: string,
+  program: ESTree.Program,
 ): void {
   if (!expression) return;
-  const call = findPluginCall(config, vinextBinding);
+  const call = findPluginCall(config, vinextBinding, program);
   if (!call) return;
   if (call.arguments.length === 0) {
     output.appendLeft(call.end - 1, `{ images: { optimizer: ${expression} } }`);
@@ -2087,9 +2117,10 @@ function ensureVinextPrerender(
   vinextBinding: string,
   prerender: boolean | undefined,
   code: string,
+  program: ESTree.Program,
 ): void {
   if (!prerender) return;
-  const call = findPluginCall(config, vinextBinding);
+  const call = findPluginCall(config, vinextBinding, program);
   if (!call || hasVinextPrerender(call)) return;
   if (call.arguments.length === 0) {
     output.appendLeft(call.end - 1, `{ prerender: { routes: "*" } }`);
@@ -2116,7 +2147,7 @@ function ensurePlugins(
   config: AstObject,
   additions: Array<{ expression: string; binding: string; member?: string }>,
   code: string,
-  program?: ESTree.Program,
+  program: ESTree.Program,
 ): void {
   const plugins = findProperty(config, "plugins");
   if (!plugins) {
@@ -2124,26 +2155,7 @@ function ensurePlugins(
     insertObjectProperty(output, config, `  plugins: [\n${expressions.join(",\n")},\n  ],`, code);
     return;
   }
-  let array =
-    plugins.value.type === "ArrayExpression"
-      ? (plugins.value as ESTree.ArrayExpression & AstNode)
-      : undefined;
-  if (!array && plugins.value.type === "Identifier" && program) {
-    const pluginsBinding = plugins.value.name;
-    for (const statement of program.body) {
-      const statementDeclaration =
-        statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
-      if (statementDeclaration?.type !== "VariableDeclaration") continue;
-      const declaration = statementDeclaration.declarations.find(
-        (candidate) => candidate.id.type === "Identifier" && candidate.id.name === pluginsBinding,
-      );
-      const initializer = unwrapExpression(declaration?.init);
-      if (initializer?.type === "ArrayExpression") {
-        array = initializer as ESTree.ArrayExpression & AstNode;
-        break;
-      }
-    }
-  }
+  const array = findPluginArray(config, program);
   if (!array) {
     throw new Error(
       "The Vite config's plugins option must be an array for vinext init to update it.",
@@ -2376,7 +2388,7 @@ export function updateViteConfigForCloudflare(
   const vinextBinding = commonJs
     ? ensureDefaultRequire(program, output, "vinext", vinextLocal)
     : ensureDefaultImport(program, output, "vinext", vinextLocal);
-  const existingVinextCall = findPluginCall(config, vinextBinding);
+  const existingVinextCall = findPluginCall(config, vinextBinding, program);
   const existingImageOptimizer = getVinextImageOptimizer(existingVinextCall);
   const needsPrerender = Boolean(options.prerender && !hasVinextPrerender(existingVinextCall));
   const configureCaches = options.cache !== undefined;
@@ -2590,8 +2602,16 @@ export function updateViteConfigForCloudflare(
       },
     ],
     code,
+    program,
   );
-  ensureCloudflareViteEnvironment(output, config, cloudflareBinding, options.isAppRouter, code);
+  ensureCloudflareViteEnvironment(
+    output,
+    config,
+    cloudflareBinding,
+    options.isAppRouter,
+    code,
+    program,
+  );
   if (existingVinextCall) {
     if (
       existingVinextCall.arguments.length === 0 &&
@@ -2629,10 +2649,24 @@ export function updateViteConfigForCloudflare(
         `{\n${propertyEntryIndent}${properties.join(`,\n${propertyEntryIndent}`)},\n${closingIndent}}`,
       );
     } else {
-      ensureVinextResponseStore(output, config, vinextBinding, responseStoreExpression, code);
-      ensureVinextCache(output, config, vinextBinding, cacheAdditions, code);
-      ensureVinextImageOptimizer(output, config, vinextBinding, imageOptimizerExpression, code);
-      ensureVinextPrerender(output, config, vinextBinding, options.prerender, code);
+      ensureVinextResponseStore(
+        output,
+        config,
+        vinextBinding,
+        responseStoreExpression,
+        code,
+        program,
+      );
+      ensureVinextCache(output, config, vinextBinding, cacheAdditions, code, program);
+      ensureVinextImageOptimizer(
+        output,
+        config,
+        vinextBinding,
+        imageOptimizerExpression,
+        code,
+        program,
+      );
+      ensureVinextPrerender(output, config, vinextBinding, options.prerender, code, program);
     }
   }
 

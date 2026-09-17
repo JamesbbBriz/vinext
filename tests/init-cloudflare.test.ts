@@ -1084,11 +1084,40 @@ export default { plugins: [vinext()], resolve: { alias: { existing: "/tmp/existi
     expect(output).toContain('existing: "/tmp/existing"');
   });
 
+  it("updates a static variable-backed plugin array", () => {
+    const input = `import vinext from "vinext";
+import { cloudflare } from "@cloudflare/vite-plugin";
+export const plugins = [vinext({ cache: {} }), cloudflare()];
+export default { plugins };
+`;
+    const options = {
+      isAppRouter: true,
+      hasTailwindV4: true,
+      nativeModulesToStub: [],
+      cache: {
+        dataCache: "none" as const,
+        cdnCache: "workers-cache" as const,
+        imageOptimization: "none" as const,
+      },
+    };
+
+    const output = updateViteConfigForCloudflare("vite.config.ts", input, options);
+
+    expectValidConfig(output);
+    expect(output).toContain('import tailwindcss from "@tailwindcss/vite"');
+    expect(output).toContain("tailwindcss()");
+    expect(output).toContain("cdn: cdnAdapter()");
+    expect(output).toContain(
+      'cloudflare({ viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] } })',
+    );
+    expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
+  });
+
   it("rejects dynamic plugin arrays", () => {
     expect(() =>
       updateViteConfigForCloudflare(
         "vite.config.ts",
-        `const plugins = []; export default { plugins };`,
+        `const plugins = getPlugins(); export default { plugins };`,
         { isAppRouter: false, nativeModulesToStub: [] },
       ),
     ).toThrow("plugins option must be an array");
