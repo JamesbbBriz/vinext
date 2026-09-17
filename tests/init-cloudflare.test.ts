@@ -1193,6 +1193,23 @@ export default (defineConfig({ plugins: [vinext()] }) satisfies UserConfig);
     expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
   });
 
+  it.each(["const", "export const"])(
+    "updates a config exported through an %s variable",
+    (declaration) => {
+      const output = updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import { defineConfig } from "vite";
+import vinext from "vinext";
+${declaration} config = defineConfig({ plugins: [vinext()] });
+export default config;
+`,
+      );
+
+      expectValidConfig(output);
+      expect(output).toContain("plugins: [\n  vinext(),\n  tailwindcss(),\n]");
+    },
+  );
+
   it("does not reuse a dynamic import helper that only returns the Tailwind factory", () => {
     const input = `const vinext = require("vinext");
 const tailwindcss = () => import("@tailwindcss/vite").then((module) => module.default);

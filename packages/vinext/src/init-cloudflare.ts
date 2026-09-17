@@ -1304,8 +1304,10 @@ function unwrapObject(expression: ESTree.Node): AstObject | undefined {
 
 function findVariableObject(program: ESTree.Program, name: string): AstObject | undefined {
   for (const statement of program.body) {
-    if (statement.type !== "VariableDeclaration") continue;
-    for (const declaration of statement.declarations) {
+    const variableDeclaration =
+      statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+    if (variableDeclaration?.type !== "VariableDeclaration") continue;
+    for (const declaration of variableDeclaration.declarations) {
       if (
         declaration.id.type !== "Identifier" ||
         declaration.id.name !== name ||
@@ -1313,7 +1315,14 @@ function findVariableObject(program: ESTree.Program, name: string): AstObject | 
       ) {
         continue;
       }
-      return unwrapObject(declaration.init);
+      const initializer = unwrapExpression(declaration.init) ?? declaration.init;
+      const direct = unwrapObject(initializer);
+      if (direct) return direct;
+      if (initializer.type === "CallExpression" && initializer.arguments.length > 0) {
+        const firstArgument = initializer.arguments[0];
+        if (firstArgument.type !== "SpreadElement") return unwrapObject(firstArgument);
+      }
+      return undefined;
     }
   }
   return undefined;
