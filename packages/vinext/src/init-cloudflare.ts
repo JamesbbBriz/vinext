@@ -1419,14 +1419,48 @@ function findConfigObjectInCall(
   }
   if (!firstArgument.body) return undefined;
   if (firstArgument.body.type !== "BlockStatement") return unwrapObject(firstArgument.body);
-  const returnStatement = firstArgument.body.body.find(
+  const directReturns = firstArgument.body.body.filter(
     (statement): statement is ESTree.ReturnStatement => statement.type === "ReturnStatement",
   );
-  return returnStatement?.argument ? unwrapObject(returnStatement.argument) : undefined;
+  const reachableReturns: ESTree.ReturnStatement[] = [];
+  const collectReturns = (node: ESTree.Node): void => {
+    if (node.type === "ReturnStatement") {
+      reachableReturns.push(node);
+      return;
+    }
+    if (
+      node.type === "FunctionDeclaration" ||
+      node.type === "FunctionExpression" ||
+      node.type === "ArrowFunctionExpression"
+    ) {
+      return;
+    }
+    forEachAstChild(node, collectReturns);
+  };
+  for (const statement of firstArgument.body.body) collectReturns(statement);
+  const returnStatement = directReturns[0];
+  if (
+    directReturns.length !== 1 ||
+    reachableReturns.length !== 1 ||
+    reachableReturns[0] !== returnStatement ||
+    !returnStatement.argument
+  ) {
+    return undefined;
+  }
+  const returned = unwrapExpression(returnStatement.argument) ?? returnStatement.argument;
+  const direct = unwrapObject(returned);
+  if (direct) return direct;
+  return returned.type === "Identifier"
+    ? findVariableObjectInStatements(program, firstArgument.body.body, returned.name)
+    : undefined;
 }
 
-function findVariableObject(program: ESTree.Program, name: string): AstObject | undefined {
-  for (const statement of program.body) {
+function findVariableObjectInStatements(
+  program: ESTree.Program,
+  statements: ESTree.Statement[],
+  name: string,
+): AstObject | undefined {
+  for (const statement of statements) {
     const variableDeclaration =
       statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
     if (variableDeclaration?.type !== "VariableDeclaration" || variableDeclaration.kind !== "const")
@@ -1448,6 +1482,10 @@ function findVariableObject(program: ESTree.Program, name: string): AstObject | 
     }
   }
   return undefined;
+}
+
+function findVariableObject(program: ESTree.Program, name: string): AstObject | undefined {
+  return findVariableObjectInStatements(program, program.body, name);
 }
 
 function findConfigObject(program: ESTree.Program): AstObject | undefined {
@@ -2081,6 +2119,7 @@ function collectConfigShadowedBindings(program: ESTree.Program, config: AstObjec
       node.type === "ArrowFunctionExpression"
     ) {
       for (const parameter of node.params) collectPatternBindings(parameter, bindings);
+      if (node.type === "FunctionExpression" && node.id) bindings.add(node.id.name);
     }
     if (node.type !== "BlockStatement") continue;
     for (const declaration of node.body) {
@@ -2117,6 +2156,7 @@ function findVisiblePluginArray(
       for (const parameter of node.params) collectPatternBindings(parameter, parameterBindings);
       if (parameterBindings.has(binding)) array = undefined;
     }
+    if (node.type === "FunctionExpression" && node.id?.name === binding) array = undefined;
     const statements =
       node.type === "Program" || node.type === "BlockStatement" ? node.body : undefined;
     if (!statements) continue;

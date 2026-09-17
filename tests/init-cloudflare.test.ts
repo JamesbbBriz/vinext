@@ -1226,6 +1226,36 @@ export default config;
     expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
   });
 
+  it("updates a callback-local returned config binding", () => {
+    const output = updateViteConfigForTailwind(
+      "vite.config.ts",
+      `import { defineConfig } from "vite";
+import vinext from "vinext";
+export default defineConfig(() => {
+  const config = { plugins: [vinext()] };
+  return config;
+});
+`,
+    );
+
+    expectValidConfig(output);
+    expect(output).toContain("plugins: [\n    vinext(),\n    tailwindcss(),\n  ]");
+  });
+
+  it("rejects callback configs with nested return branches", () => {
+    expect(() =>
+      updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import { defineConfig } from "vite";
+export default defineConfig(({ command }) => {
+  if (command === "serve") return { plugins: [] };
+  return { plugins: [] };
+});
+`,
+      ),
+    ).toThrow("Could not find a static Vite config object");
+  });
+
   it("recognizes the defineConfig alias used by the exported variable", () => {
     const output = updateViteConfigForTailwind(
       "vite.config.ts",
@@ -1354,6 +1384,37 @@ export default defineConfig(() => {
     expect(output).toContain("tailwindcss2()");
     expect(output).toContain("cloudflare2({");
     expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
+  });
+
+  it("does not reuse a plugin import shadowed by a named config callback", () => {
+    const output = updateViteConfigForTailwind(
+      "vite.config.ts",
+      `import { defineConfig } from "vite";
+import tailwindcss from "@tailwindcss/vite";
+export default defineConfig(function tailwindcss() {
+  return { plugins: [] };
+});
+`,
+    );
+
+    expectValidConfig(output);
+    expect(output).toContain('import tailwindcss2 from "@tailwindcss/vite"');
+    expect(output).toContain("plugins: [\n    tailwindcss2(),\n  ]");
+  });
+
+  it("rejects a plugin array shadowed by a named config callback", () => {
+    expect(() =>
+      updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import { defineConfig } from "vite";
+import vinext from "vinext";
+const plugins = [vinext()];
+export default defineConfig(function plugins() {
+  return { plugins };
+});
+`,
+      ),
+    ).toThrow("plugins option must be an array");
   });
 
   it("rejects dynamic plugin arrays", () => {
