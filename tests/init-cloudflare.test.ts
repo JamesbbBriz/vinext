@@ -1208,6 +1208,30 @@ module.exports = { plugins: [vinext()] };
     expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
   });
 
+  it("preserves a CommonJS directive prologue", () => {
+    const input = `"use strict";
+const vinext = require("vinext");
+module.exports = { plugins: [vinext()] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.cjs", input);
+
+    expect(output.startsWith('"use strict";')).toBe(true);
+    expect(output.indexOf("const tailwindcss")).toBeGreaterThan(output.indexOf('"use strict";'));
+  });
+
+  it("rejects a plugins property that a later spread may override", () => {
+    expect(() =>
+      updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import vinext from "vinext";
+const base = { plugins: [vinext()] };
+export default { plugins: [], ...base };
+`,
+      ),
+    ).toThrow("later spread or computed property may override it");
+  });
+
   it("uses unshadowed plugin aliases inside callback configs", () => {
     const input = `import { defineConfig } from "vite";
 import vinext from "vinext";

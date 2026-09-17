@@ -1270,6 +1270,33 @@ function findProperty(object: AstObject, name: string): AstProperty | undefined 
   );
 }
 
+function findPluginsProperty(config: AstObject): AstProperty | undefined {
+  let plugins: AstProperty | undefined;
+  let pluginsIndex = -1;
+  let lastUnknownIndex = -1;
+  for (const [index, property] of config.properties.entries()) {
+    if (property.type === "SpreadElement") {
+      lastUnknownIndex = index;
+      continue;
+    }
+    const name =
+      propertyName(property) ??
+      (property.computed && property.key.type === "Literal" ? property.key.value : undefined);
+    if (name === "plugins") {
+      plugins = property;
+      pluginsIndex = index;
+    } else if (property.computed) {
+      lastUnknownIndex = index;
+    }
+  }
+  if (lastUnknownIndex > pluginsIndex) {
+    throw new Error(
+      "The Vite config's plugins option cannot be updated because a later spread or computed property may override it.",
+    );
+  }
+  return plugins;
+}
+
 function unwrapObject(expression: ESTree.Node): AstObject | undefined {
   const unwrapped = unwrapExpression(expression);
   return unwrapped?.type === "ObjectExpression" ? (unwrapped as AstObject) : undefined;
@@ -1722,7 +1749,18 @@ function findRequiredBinding(
 
 function requireInsertionOffset(program: ESTree.Program): number {
   let offset = 0;
+  let inDirectivePrologue = true;
   for (const statement of program.body) {
+    if (
+      inDirectivePrologue &&
+      statement.type === "ExpressionStatement" &&
+      statement.expression.type === "Literal" &&
+      typeof statement.expression.value === "string"
+    ) {
+      offset = (statement as AstNode).end;
+      continue;
+    }
+    inDirectivePrologue = false;
     if (statement.type !== "VariableDeclaration") break;
     offset = (statement as AstNode).end;
   }
@@ -1991,7 +2029,7 @@ function findPluginArray(
   config: AstObject,
   program: ESTree.Program,
 ): (ESTree.ArrayExpression & AstNode) | undefined {
-  const plugins = findProperty(config, "plugins");
+  const plugins = findPluginsProperty(config);
   if (!plugins) return undefined;
   if (plugins.value.type === "ArrayExpression") return plugins.value;
   if (plugins.value.type !== "Identifier") return undefined;
@@ -2293,7 +2331,7 @@ function ensurePlugins(
   code: string,
   program: ESTree.Program,
 ): void {
-  const plugins = findProperty(config, "plugins");
+  const plugins = findPluginsProperty(config);
   if (!plugins) {
     const expressions = additions.map(({ expression }) => indentBlock(expression, "    "));
     insertObjectProperty(output, config, `  plugins: [\n${expressions.join(",\n")},\n  ],`, code);
@@ -2828,7 +2866,7 @@ export function updateViteConfigForCloudflare(
       if (needsPrerender) {
         properties.push(`prerender: { routes: "*" }`);
       }
-      const plugins = findProperty(config, "plugins");
+      const plugins = findPluginsProperty(config);
       const propertyIndent = plugins
         ? (code
             .slice(0, (plugins as AstNode).start)
