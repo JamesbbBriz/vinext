@@ -1733,7 +1733,7 @@ describe("init — guard rails", () => {
     writeFile(
       tmpDir,
       "vite.config.ts",
-      'import vinext from "vinext";\nconst plugins = [vinext()];\nexport default { plugins };',
+      'import vinext from "vinext";\nexport const plugins = [vinext()];\nexport default { plugins };',
     );
 
     const { result } = await runInit(tmpDir, { platform: "node", install: false });

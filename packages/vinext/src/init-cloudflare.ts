@@ -2131,8 +2131,10 @@ function ensurePlugins(
   if (!array && plugins.value.type === "Identifier" && program) {
     const pluginsBinding = plugins.value.name;
     for (const statement of program.body) {
-      if (statement.type !== "VariableDeclaration") continue;
-      const declaration = statement.declarations.find(
+      const statementDeclaration =
+        statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+      if (statementDeclaration?.type !== "VariableDeclaration") continue;
+      const declaration = statementDeclaration.declarations.find(
         (candidate) => candidate.id.type === "Identifier" && candidate.id.name === pluginsBinding,
       );
       const initializer = unwrapExpression(declaration?.init);
