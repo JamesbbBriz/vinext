@@ -49,6 +49,7 @@ const bundledDependencies = [
   "image-size",
   "process-ancestry",
   "pathslash",
+  "ua-parser-js",
 ];
 
 const isBundledDependency = (id: string) =>
@@ -87,9 +88,10 @@ export default defineConfig({
     clean: true,
     deps: {
       resolveDepSubpath: true,
-      // Build-time implementation details are inlined rather than installed by
-      // vinext consumers. Same for pathslash: it is our own ~90-line node:path
-      // wrapper (zero deps), so bundling it keeps it out of consumer installs.
+      // Build-time implementation details, including user-agent parsing, are
+      // inlined rather than installed by vinext consumers. Same for pathslash:
+      // it is our own ~90-line node:path wrapper (zero deps), so bundling it
+      // keeps it out of consumer installs.
       alwaysBundle: bundledDependencies,
       neverBundle: (id) => id.includes("node_modules") && !isBundledDependency(id),
     },

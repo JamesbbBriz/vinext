@@ -64,7 +64,7 @@ export type CacheMetadataStub = DurableObjectStub & {
     objectKeyRoot: string,
     createdAt: number,
   ): Promise<RefreshCandidate[]>;
-  purgeMatching(options: ResponseStorePurgeOptions): Promise<PurgedEntry[]>;
+  purgeMatching(options: ResponseStorePurgeOptions, invalidatedAt?: number): Promise<PurgedEntry[]>;
   inspect(): Promise<StoredEntry[]>;
 };
 
@@ -180,6 +180,8 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
           tombstoned INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS entries_cache_key ON entries(cache_key);
+        CREATE INDEX IF NOT EXISTS entries_active_object_key
+          ON entries(object_key) WHERE tombstoned = 0;
         CREATE TABLE IF NOT EXISTS revalidation_claims (
           key_hash TEXT PRIMARY KEY,
           active_revision INTEGER NOT NULL,
@@ -673,13 +675,14 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
         };
       }
 
-      const update = this.ctx.storage.sql.exec(
+      const update = this.ctx.storage.sql.exec<{ key_hash: string }>(
         `UPDATE entries SET
           active_revision = ?, object_key = ?, status_text = ?, response_headers = ?,
           fresh_until = ?, swr_until = ?,
           revalidator_id = ?, revalidator_args = ?, cache_tags = ?, tombstoned = 0
         WHERE key_hash = ? AND latest_revision >= ?
-          AND (active_revision IS NULL OR active_revision < ?)`,
+          AND (active_revision IS NULL OR active_revision < ?)
+        RETURNING key_hash`,
         revision,
         metadata.objectKey,
         metadata.statusText,
@@ -694,7 +697,7 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
         revision,
       );
 
-      const published = update.rowsWritten === 1;
+      const published = update.toArray().length === 1;
       if (published) {
         this.ctx.storage.sql.exec(
           "DELETE FROM pending_objects WHERE object_key = ?",
@@ -852,8 +855,10 @@ export class CacheMetadata extends DurableObject<CacheMetadataEnv> {
     return candidates;
   }
 
-  async purgeMatching(options: ResponseStorePurgeOptions): Promise<PurgedEntry[]> {
-    const invalidatedAt = Date.now();
+  async purgeMatching(
+    options: ResponseStorePurgeOptions,
+    invalidatedAt = Date.now(),
+  ): Promise<PurgedEntry[]> {
     const matches = this.ctx.storage.transactionSync(() => {
       const matches = this.findMatchingEntryRows(options, true);
 
