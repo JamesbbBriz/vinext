@@ -2322,7 +2322,7 @@ export function updateViteConfigForCloudflare(
   if (options.hasTailwindV4) {
     const tailwindLocal = allocateBinding(bindings, "tailwindcss");
     const tailwindBinding = commonJs
-      ? ensureDefaultRequire(program, output, "@tailwindcss/vite", tailwindLocal)
+      ? ensureNamedRequire(program, output, "@tailwindcss/vite", "default", tailwindLocal)
       : ensureDefaultImport(program, output, "@tailwindcss/vite", tailwindLocal);
     tailwindPlugin = { expression: `${tailwindBinding}()`, binding: tailwindBinding };
   }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import { parseSync } from "vite";
+import vm from "node:vm";
 import {
   generateAppRouterViteConfig,
   generatePagesRouterViteConfig,
@@ -530,6 +531,34 @@ module.exports = defineConfig({ plugins: [vinext()] });
 
     expect(output).toContain('const { cloudflare } = require("@cloudflare/vite-plugin");');
     expect(output).toContain("cloudflare()");
+  });
+
+  it("loads Tailwind v4 from an existing CommonJS config", () => {
+    const input = `const { defineConfig } = require("vite");
+const vinext = require("vinext");
+
+module.exports = defineConfig({ plugins: [vinext()] });
+`;
+    const output = updateViteConfigForCloudflare("vite.config.cjs", input, {
+      isAppRouter: false,
+      hasTailwindV4: true,
+      nativeModulesToStub: [],
+      cache: { dataCache: "none", cdnCache: "none", imageOptimization: "none" },
+    });
+    expect(output).toContain('const { default: tailwindcss } = require("@tailwindcss/vite");');
+
+    const configModule: { exports: unknown } = { exports: {} };
+    vm.runInNewContext(output, {
+      module: configModule,
+      require(id: string): unknown {
+        if (id === "vite") return { defineConfig: (config: unknown) => config };
+        if (id === "vinext") return () => "vinext";
+        if (id === "@tailwindcss/vite") return { default: () => "tailwind" };
+        if (id === "@cloudflare/vite-plugin") return { cloudflare: () => "cloudflare" };
+        throw new Error(`Unexpected require: ${id}`);
+      },
+    });
+    expect(configModule.exports).toMatchObject({ plugins: ["vinext", "tailwind", "cloudflare"] });
   });
 
   it("adds both plugins to an empty config with one plugins property", () => {
