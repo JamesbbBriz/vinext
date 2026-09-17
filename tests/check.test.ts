@@ -1072,6 +1072,15 @@ describe("checkConventions", () => {
     expect(items.find((item) => item.name === "1 page(s)")).toBeDefined();
   });
 
+  it("does not re-include routes below an ignored parent directory", () => {
+    writeFile(".gitignore", "app/\n");
+    writeFile("app/.gitignore", "!page.tsx\n");
+    writeFile("app/page.tsx", `export default function Page() { return null; }`);
+
+    const items = checkConventions(tmpDir);
+    expect(items.find((item) => item.name === "0 page(s)")).toBeDefined();
+  });
+
   it("prefers root-level app/ over src/app/", () => {
     writeFile("app/page.tsx", `export default function Home() { return <div/>; }`);
     writeFile("src/app/page.tsx", `export default function Home() { return <div/>; }`);

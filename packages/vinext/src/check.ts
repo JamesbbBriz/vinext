@@ -1031,9 +1031,8 @@ export function checkConventions(root: string): CheckItem[] {
   const sourceFiles = findSourceFiles(root);
   const routeFiles = (dir: string) => {
     const files = sourceFiles.filter((file) => file.startsWith(`${dir}/`));
-    return files.length
-      ? files
-      : findSourceFiles(dir, SOURCE_EXTENSIONS, ancestorGitignoreRules(root, dir));
+    if (files.length || !fs.lstatSync(dir).isSymbolicLink()) return files;
+    return findSourceFiles(dir, SOURCE_EXTENSIONS, ancestorGitignoreRules(root, dir));
   };
 
   // Check for pages/ and app/ at root level, then fall back to src/
