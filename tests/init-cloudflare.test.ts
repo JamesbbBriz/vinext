@@ -634,6 +634,42 @@ module.exports = defineConfig({ plugins: [vinext()${tailwindRequire ? `, ${tailw
     expect(configModule.exports).toMatchObject({ plugins: ["vinext", "tailwind", "cloudflare"] });
   });
 
+  it.each([
+    [
+      "typed namespace require",
+      'const tw = require("@tailwindcss/vite") as typeof import("@tailwindcss/vite");',
+      "tw.default()",
+    ],
+    [
+      "typed default require",
+      'const tw = require("@tailwindcss/vite").default as typeof import("@tailwindcss/vite").default;',
+      "tw()",
+    ],
+    [
+      "typed require before default access",
+      'const tw = (require("@tailwindcss/vite") as typeof import("@tailwindcss/vite")).default;',
+      "tw()",
+    ],
+  ])("reuses a %s", (_, tailwindRequire, tailwindCall) => {
+    const input = `const { defineConfig } = require("vite");
+const vinext = require("vinext");
+${tailwindRequire}
+
+module.exports = defineConfig({ plugins: [vinext(), ${tailwindCall}] });
+`;
+    const options = {
+      isAppRouter: false,
+      hasTailwindV4: true,
+      nativeModulesToStub: [],
+    };
+    const output = updateViteConfigForCloudflare("vite.config.cts", input, options);
+
+    expectValidConfig(output);
+    expect(output.split("@tailwindcss/vite").length - 1).toBe(2);
+    expect(output.split(tailwindCall)).toHaveLength(2);
+    expect(updateViteConfigForCloudflare("vite.config.cts", output, options)).toBe(output);
+  });
+
   it("adds both plugins to an empty config with one plugins property", () => {
     const output = updateViteConfigForCloudflare("vite.config.ts", "export default {};\n", {
       isAppRouter: false,

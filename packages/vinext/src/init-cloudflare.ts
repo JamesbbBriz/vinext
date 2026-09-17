@@ -1538,17 +1538,21 @@ function findDefaultRequiredBinding(
   for (const statement of program.body) {
     if (statement.type !== "VariableDeclaration") continue;
     for (const declaration of statement.declarations) {
-      const requireCall: ESTree.CallExpression | undefined =
-        declaration.init?.type === "CallExpression"
-          ? declaration.init
-          : declaration.init?.type === "MemberExpression" &&
-              !declaration.init.computed &&
-              declaration.init.property.type === "Identifier" &&
-              declaration.init.property.name === "default" &&
-              declaration.init.object.type === "CallExpression"
-            ? declaration.init.object
-            : undefined;
-      const namespace = declaration.init?.type === "CallExpression";
+      const initializer = unwrapExpression(declaration.init);
+      let requireCall: ESTree.CallExpression | undefined;
+      let namespace = false;
+      if (initializer?.type === "CallExpression") {
+        requireCall = initializer;
+        namespace = true;
+      } else if (
+        initializer?.type === "MemberExpression" &&
+        !initializer.computed &&
+        initializer.property.type === "Identifier" &&
+        initializer.property.name === "default"
+      ) {
+        const object = unwrapExpression(initializer.object);
+        if (object?.type === "CallExpression") requireCall = object;
+      }
       if (
         !requireCall ||
         requireCall.callee.type !== "Identifier" ||
@@ -1586,13 +1590,13 @@ function findRequiredBinding(
   for (const statement of program.body) {
     if (statement.type !== "VariableDeclaration") continue;
     for (const declaration of statement.declarations) {
+      const initializer = unwrapExpression(declaration.init);
       if (
-        !declaration.init ||
-        declaration.init.type !== "CallExpression" ||
-        declaration.init.callee.type !== "Identifier" ||
-        declaration.init.callee.name !== "require" ||
-        declaration.init.arguments[0]?.type !== "Literal" ||
-        declaration.init.arguments[0].value !== source
+        initializer?.type !== "CallExpression" ||
+        initializer.callee.type !== "Identifier" ||
+        initializer.callee.name !== "require" ||
+        initializer.arguments[0]?.type !== "Literal" ||
+        initializer.arguments[0].value !== source
       ) {
         continue;
       }
