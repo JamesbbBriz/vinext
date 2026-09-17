@@ -1350,6 +1350,22 @@ module.exports = { plugins: [vinext()] };
     expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
   });
 
+  it("does not invoke a parameterized dynamic import helper without arguments", () => {
+    const input = `const vinext = require("vinext");
+const loadTailwind = (options) => import("@tailwindcss/vite").then((module) => module.default(options.tailwind));
+module.exports = { plugins: [vinext()] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.cjs", input);
+
+    expect(output).toContain(
+      'const tailwindcss = () => import("@tailwindcss/vite").then(({ default: plugin }) => plugin());',
+    );
+    expect(output).toContain("tailwindcss()");
+    expect(output).not.toContain("loadTailwind()");
+    expect(updateViteConfigForTailwind("vite.config.cjs", output)).toBe(output);
+  });
+
   it("preserves a CommonJS directive prologue", () => {
     const input = `"use strict";
 const vinext = require("vinext");

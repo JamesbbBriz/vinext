@@ -1784,7 +1784,8 @@ function findDynamicImportPluginBinding(
       if (
         declaration.id.type !== "Identifier" ||
         excludedBindings?.has(declaration.id.name) ||
-        initializer?.type !== "ArrowFunctionExpression"
+        initializer?.type !== "ArrowFunctionExpression" ||
+        initializer.params.length !== 0
       ) {
         continue;
       }
