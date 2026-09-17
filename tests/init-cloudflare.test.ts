@@ -534,10 +534,24 @@ module.exports = defineConfig({ plugins: [vinext()] });
   });
 
   it.each([
-    ["default import", 'import tw from "@tailwindcss/vite";', "tw()"],
-    ["named default import", 'import { default as tw } from "@tailwindcss/vite";', "tw()"],
-    ["namespace import", 'import * as tw from "@tailwindcss/vite";', "tw.default()"],
-  ])("reuses an existing Tailwind v4 %s", (_, tailwindImport, tailwindCall) => {
+    ["default import", 'import tw from "@tailwindcss/vite";', "tw()", 1],
+    ["named default import", 'import { default as tw } from "@tailwindcss/vite";', "tw()", 1],
+    ["namespace import", 'import * as tw from "@tailwindcss/vite";', "tw.default()", 1],
+    [
+      "default import after a type-only import",
+      `import type { PluginOptions } from "@tailwindcss/vite";
+import tw from "@tailwindcss/vite";`,
+      "tw()",
+      2,
+    ],
+    [
+      "namespace import after a type-only import",
+      `import type { PluginOptions } from "@tailwindcss/vite";
+import * as tw from "@tailwindcss/vite";`,
+      "tw.default()",
+      2,
+    ],
+  ])("reuses an existing Tailwind v4 %s", (_, tailwindImport, tailwindCall, importCount) => {
     const input = `${tailwindImport}
 import vinext from "vinext";
 
@@ -551,7 +565,7 @@ export default { plugins: [vinext(), ${tailwindCall}] };
     const output = updateViteConfigForCloudflare("vite.config.ts", input, options);
 
     expectValidConfig(output);
-    expect(output.split("@tailwindcss/vite")).toHaveLength(2);
+    expect(output.split("@tailwindcss/vite").length - 1).toBe(importCount);
     expect(output.split(tailwindCall)).toHaveLength(2);
     expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
   });

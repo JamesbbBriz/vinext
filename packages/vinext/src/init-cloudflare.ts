@@ -1503,21 +1503,31 @@ function findDefaultImportedBinding(
   program: ESTree.Program,
   source: string,
 ): { binding: string; namespace: boolean } | undefined {
-  const declaration = program.body.find(
-    (statement): statement is ESTree.ImportDeclaration =>
-      statement.type === "ImportDeclaration" && statement.source.value === source,
-  );
-  const specifier = declaration?.specifiers.find(
-    (candidate) =>
-      candidate.type === "ImportDefaultSpecifier" ||
-      candidate.type === "ImportNamespaceSpecifier" ||
-      (candidate.type === "ImportSpecifier" &&
-        candidate.imported.type === "Identifier" &&
-        candidate.imported.name === "default"),
-  );
-  return specifier
-    ? { binding: specifier.local.name, namespace: specifier.type === "ImportNamespaceSpecifier" }
-    : undefined;
+  for (const statement of program.body) {
+    if (
+      statement.type !== "ImportDeclaration" ||
+      statement.source.value !== source ||
+      statement.importKind === "type"
+    ) {
+      continue;
+    }
+    const specifier = statement.specifiers.find(
+      (candidate) =>
+        candidate.type === "ImportDefaultSpecifier" ||
+        candidate.type === "ImportNamespaceSpecifier" ||
+        (candidate.type === "ImportSpecifier" &&
+          candidate.importKind !== "type" &&
+          candidate.imported.type === "Identifier" &&
+          candidate.imported.name === "default"),
+    );
+    if (specifier) {
+      return {
+        binding: specifier.local.name,
+        namespace: specifier.type === "ImportNamespaceSpecifier",
+      };
+    }
+  }
+  return undefined;
 }
 
 function findDefaultRequiredBinding(
