@@ -1103,6 +1103,20 @@ describe("checkConventions", () => {
     expect(items.find((item) => item.name === "0 page(s)")).toBeDefined();
   });
 
+  it("does not load gitignore rules below an ignored symlink ancestor", () => {
+    writeFile(".gitignore", "src/\n");
+    writeFile("src/.gitignore", "!app/\n");
+    writeFile("routes/page.tsx", `export default function Page() { return null; }`);
+    fs.symlinkSync(
+      path.join(tmpDir, "routes"),
+      path.join(tmpDir, "src/app"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const items = checkConventions(tmpDir);
+    expect(items.find((item) => item.name === "0 page(s)")).toBeDefined();
+  });
+
   it("prefers root-level app/ over src/app/", () => {
     writeFile("app/page.tsx", `export default function Home() { return <div/>; }`);
     writeFile("src/app/page.tsx", `export default function Home() { return <div/>; }`);

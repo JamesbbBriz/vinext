@@ -381,6 +381,7 @@ function ancestorGitignoreRules(root: string, dir: string): GitignoreRule[] {
     const rule = readGitignoreRule(current);
     if (rule) rules.push(rule);
     current = path.join(current, segment);
+    if (isGitignored(current, true, rules)) break;
   }
   return rules;
 }
