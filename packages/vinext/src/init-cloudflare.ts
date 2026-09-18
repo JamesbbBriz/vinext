@@ -1438,21 +1438,19 @@ function findConfigObjectInCall(
   if (firstArgument.type === "SpreadElement") return undefined;
   const argumentObject = unwrapObject(firstArgument);
   if (argumentObject) return argumentObject;
-  if (
-    firstArgument.type !== "ArrowFunctionExpression" &&
-    firstArgument.type !== "FunctionExpression"
-  ) {
+  const callback = unwrapExpression(firstArgument) ?? firstArgument;
+  if (callback.type !== "ArrowFunctionExpression" && callback.type !== "FunctionExpression") {
     return undefined;
   }
-  if (!firstArgument.body) return undefined;
-  if (firstArgument.body.type !== "BlockStatement") return unwrapObject(firstArgument.body);
-  const returnStatement = findSingleDirectReturn(firstArgument.body);
+  if (!callback.body) return undefined;
+  if (callback.body.type !== "BlockStatement") return unwrapObject(callback.body);
+  const returnStatement = findSingleDirectReturn(callback.body);
   if (!returnStatement?.argument) return undefined;
   const returned = unwrapExpression(returnStatement.argument) ?? returnStatement.argument;
   const direct = unwrapObject(returned);
   if (direct) return direct;
   return returned.type === "Identifier"
-    ? findVariableObjectInStatements(program, firstArgument.body.body, returned.name)
+    ? findVariableObjectInStatements(program, callback.body.body, returned.name)
     : undefined;
 }
 
@@ -1515,25 +1513,26 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
         if (config) return config;
       }
     }
-    for (const statement of program.body) {
-      if (statement.type !== "ExpressionStatement") continue;
+    const commonJsExports = program.body.flatMap((statement) => {
+      if (statement.type !== "ExpressionStatement") return [];
       const expression = statement.expression;
-      if (
-        expression.type !== "AssignmentExpression" ||
-        expression.left.type !== "MemberExpression" ||
-        expression.left.object.type !== "Identifier" ||
-        expression.left.object.name !== "module" ||
-        expression.left.property.type !== "Identifier" ||
-        expression.left.property.name !== "exports"
-      ) {
-        continue;
-      }
-      const right = unwrapExpression(expression.right) ?? expression.right;
-      const direct = unwrapObject(right);
-      if (direct) return direct;
-      if (right.type === "Identifier") return findVariableObject(program, right.name);
-      if (right.type === "CallExpression") return findConfigObjectInCall(program, right);
-    }
+      return expression.type === "AssignmentExpression" &&
+        expression.operator === "=" &&
+        expression.left.type === "MemberExpression" &&
+        !expression.left.computed &&
+        expression.left.object.type === "Identifier" &&
+        expression.left.object.name === "module" &&
+        expression.left.property.type === "Identifier" &&
+        expression.left.property.name === "exports"
+        ? [expression.right]
+        : [];
+    });
+    if (commonJsExports.length !== 1) return undefined;
+    const right = unwrapExpression(commonJsExports[0]) ?? commonJsExports[0];
+    const direct = unwrapObject(right);
+    if (direct) return direct;
+    if (right.type === "Identifier") return findVariableObject(program, right.name);
+    if (right.type === "CallExpression") return findConfigObjectInCall(program, right);
     return undefined;
   }
   if (defaultExport.declaration.type === "FunctionDeclaration") return undefined;
@@ -1549,6 +1548,99 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
   return declaration.type === "CallExpression"
     ? findConfigObjectInCall(program, declaration)
     : undefined;
+}
+
+function findOwningConstInitializer(
+  program: ESTree.Program,
+  target: ESTree.Node,
+): ESTree.Node | undefined {
+  const path = findAstPath(program, target);
+  if (!path) return undefined;
+  for (let index = path.length - 1; index > 0; index--) {
+    const node = path[index];
+    const parent = path[index - 1];
+    if (
+      node.type === "VariableDeclarator" &&
+      node.id.type === "Identifier" &&
+      node.init &&
+      parent.type === "VariableDeclaration" &&
+      parent.kind === "const"
+    ) {
+      return unwrapExpression(node.init) ?? node.init;
+    }
+  }
+  return undefined;
+}
+
+function expressionResolvesToInitializer(
+  program: ESTree.Program,
+  target: ESTree.Node,
+  expression: ESTree.Node,
+  expected: ESTree.Node,
+  seen = new Set<string>(),
+): boolean {
+  const reference = unwrapExpression(expression);
+  if (reference?.type !== "Identifier" || seen.has(reference.name)) return false;
+  const initializer = findVisibleConstInitializer(program, target, reference.name);
+  return (
+    initializer === expected ||
+    Boolean(
+      initializer &&
+      expressionResolvesToInitializer(
+        program,
+        target,
+        initializer,
+        expected,
+        new Set(seen).add(reference.name),
+      ),
+    )
+  );
+}
+
+function rootMemberObject(node: ESTree.MemberExpression): ESTree.Node {
+  let object = unwrapExpression(node.object) ?? node.object;
+  while (object.type === "MemberExpression") {
+    object = unwrapExpression(object.object) ?? object.object;
+  }
+  return object;
+}
+
+function assertConfigPropertiesAreStatic(program: ESTree.Program, config: AstObject): void {
+  const initializer = findOwningConstInitializer(program, config);
+  if (!initializer) return;
+  let reassigned = false;
+  const visit = (node: ESTree.Node): void => {
+    if (reassigned) return;
+    let member: ESTree.MemberExpression | undefined;
+    if (node.type === "AssignmentExpression" && node.left.type === "MemberExpression") {
+      member = node.left;
+    } else if (node.type === "UpdateExpression" && node.argument.type === "MemberExpression") {
+      member = node.argument;
+    } else if (
+      node.type === "UnaryExpression" &&
+      node.operator === "delete" &&
+      node.argument.type === "MemberExpression"
+    ) {
+      member = node.argument;
+    }
+    if (
+      member &&
+      (node as Partial<AstNode>).start !== undefined &&
+      (initializer as Partial<AstNode>).end !== undefined &&
+      (node as AstNode).start > (initializer as AstNode).end &&
+      expressionResolvesToInitializer(program, node, rootMemberObject(member), initializer)
+    ) {
+      reassigned = true;
+      return;
+    }
+    forEachAstChild(node, visit);
+  };
+  visit(program);
+  if (reassigned) {
+    throw new Error(
+      "The Vite config cannot be updated because properties are reassigned after its static initializer.",
+    );
+  }
 }
 
 function importInsertionOffset(program: ESTree.Program): number {
@@ -2011,6 +2103,22 @@ function endsWithCommaIgnoringWhitespaceAndComments(code: string): boolean {
   return lastToken === ",";
 }
 
+function findCommaIgnoringComments(code: string): number {
+  for (let index = 0; index < code.length; index++) {
+    if (code[index] === "/" && code[index + 1] === "/") {
+      index = code.indexOf("\n", index + 2);
+      if (index === -1) return -1;
+    } else if (code[index] === "/" && code[index + 1] === "*") {
+      index = code.indexOf("*/", index + 2);
+      if (index === -1) return -1;
+      index++;
+    } else if (code[index] === ",") {
+      return index;
+    }
+  }
+  return -1;
+}
+
 function cloudflarePluginExpression(isAppRouter: boolean, binding: string): string {
   return isAppRouter
     ? `${binding}({\n  viteEnvironment: {\n    name: "rsc",\n    childEnvironments: ["ssr"],\n  },\n})`
@@ -2107,12 +2215,13 @@ function findPluginCall(
   config: AstObject,
   binding: string,
   program: ESTree.Program,
+  member?: string,
 ): (ESTree.CallExpression & AstNode) | undefined {
   const array = findPluginArray(config, program);
   return array
     ? findCallInPluginArray(
         array,
-        (call) => calleeMatchesPluginAddition(call.callee, { binding }, program, array),
+        (call) => calleeMatchesPluginAddition(call.callee, { binding, member }, program, array),
         program,
       )
     : undefined;
@@ -2145,9 +2254,9 @@ function collectNestedFunctionVarBindings(node: ESTree.Node, bindings: Set<strin
   forEachAstChild(node, (child) => collectNestedFunctionVarBindings(child, bindings));
 }
 
-function collectConfigShadowedBindings(program: ESTree.Program, config: AstObject): Set<string> {
+function collectShadowedBindings(program: ESTree.Program, target: ESTree.Node): Set<string> {
   const bindings = new Set<string>();
-  const path = findAstPath(program, config);
+  const path = findAstPath(program, target);
   if (!path) return bindings;
   for (const node of path.slice(1)) {
     if (
@@ -2464,9 +2573,10 @@ function ensureVinextCache(
   additions: Array<{ name: "data" | "cdn"; expression: string }>,
   code: string,
   program: ESTree.Program,
+  vinextMember?: string,
 ): void {
   if (additions.length === 0) return;
-  const call = findPluginCall(config, vinextBinding, program);
+  const call = findPluginCall(config, vinextBinding, program, vinextMember);
   if (!call) return;
   if (call.arguments.length === 0) {
     output.appendLeft(
@@ -2516,9 +2626,10 @@ function ensureVinextResponseStore(
   expression: string | undefined,
   code: string,
   program: ESTree.Program,
+  vinextMember?: string,
 ): void {
   if (!expression) return;
-  const call = findPluginCall(config, vinextBinding, program);
+  const call = findPluginCall(config, vinextBinding, program, vinextMember);
   const firstArgument = call?.arguments[0];
   if (!call || !firstArgument || firstArgument.type === "SpreadElement") return;
   if (firstArgument.type !== "ObjectExpression") {
@@ -2542,9 +2653,10 @@ function ensureVinextImageOptimizer(
   expression: string | undefined,
   code: string,
   program: ESTree.Program,
+  vinextMember?: string,
 ): void {
   if (!expression) return;
-  const call = findPluginCall(config, vinextBinding, program);
+  const call = findPluginCall(config, vinextBinding, program, vinextMember);
   if (!call) return;
   if (call.arguments.length === 0) {
     output.appendLeft(call.end - 1, `{ images: { optimizer: ${expression} } }`);
@@ -2587,9 +2699,10 @@ function ensureVinextPrerender(
   prerender: boolean | undefined,
   code: string,
   program: ESTree.Program,
+  vinextMember?: string,
 ): void {
   if (!prerender) return;
-  const call = findPluginCall(config, vinextBinding, program);
+  const call = findPluginCall(config, vinextBinding, program, vinextMember);
   if (!call || hasVinextPrerender(call)) return;
   if (call.arguments.length === 0) {
     output.appendLeft(call.end - 1, `{ prerender: { routes: "*" } }`);
@@ -2796,13 +2909,17 @@ function ensurePlugins(
       if (!element) continue;
       if (previousElement) {
         const gap = code.slice((previousElement as AstNode).end, (element as AstNode).start);
-        const commaIndex = gap.indexOf(",");
+        const commaIndex = findCommaIgnoringComments(gap);
         if (commaIndex >= 0) {
-          const trivia = gap.slice(commaIndex + 1).trim();
+          const trivia = [gap.slice(0, commaIndex), gap.slice(commaIndex + 1)]
+            .map((part) => part.trim())
+            .filter(Boolean);
           output.overwrite(
             (previousElement as AstNode).end,
             (element as AstNode).start,
-            trivia ? `,\n${elementIndent}${trivia}\n${elementIndent}` : `,\n${elementIndent}`,
+            trivia.length > 0
+              ? `,\n${elementIndent}${trivia.join(`\n${elementIndent}`)}\n${elementIndent}`
+              : `,\n${elementIndent}`,
           );
         }
       }
@@ -2945,10 +3062,14 @@ export function updateViteConfigForTailwind(filePath: string, code: string): str
       `Could not find a static Vite config object in ${path.basename(filePath)}. Use an object export or defineConfig({...}) so vinext init can update it.`,
     );
   }
+  assertConfigPropertiesAreStatic(program, config);
   const output = new MagicString(code);
   const commonJs = usesCommonJsViteConfig(filePath, code);
   const bindings = collectTopLevelBindings(program);
-  const shadowedBindings = collectConfigShadowedBindings(program, config);
+  const shadowedBindings = collectShadowedBindings(
+    program,
+    findPluginArray(config, program) ?? config,
+  );
   for (const binding of shadowedBindings) bindings.add(binding);
   ensurePlugins(
     output,
@@ -2981,44 +3102,65 @@ export function updateViteConfigForCloudflare(
       `Could not find a static Vite config object in ${path.basename(filePath)}. Use an object export or defineConfig({...}) so vinext init can update it.`,
     );
   }
+  assertConfigPropertiesAreStatic(program, config);
 
   const output = new MagicString(code);
   const commonJs = usesCommonJsViteConfig(filePath, code);
   const bindings = collectTopLevelBindings(program);
-  const shadowedBindings = collectConfigShadowedBindings(program, config);
-  for (const binding of shadowedBindings) bindings.add(binding);
-  const vinextPackageBinding = commonJs
-    ? findDefaultRequiredBinding(program, "vinext")?.binding
-    : findDefaultImportedBinding(program, "vinext")?.binding;
-  const vinextEquivalentBindings = vinextPackageBinding
-    ? findUnshadowedTopLevelAliases(program, { binding: vinextPackageBinding }, shadowedBindings)
-    : [];
-  const configuredVinextAlias = vinextEquivalentBindings.find(({ binding }) =>
-    findPluginCall(config, binding, program),
+  const shadowedBindings = collectShadowedBindings(
+    program,
+    findPluginArray(config, program) ?? config,
   );
-  const directVinextBinding = commonJs
+  for (const binding of shadowedBindings) bindings.add(binding);
+  const importedVinext = commonJs
+    ? findDefaultRequiredBinding(program, "vinext")
+    : findDefaultImportedBinding(program, "vinext");
+  const vinextPackageReferences: PluginBindingReference[] = importedVinext
+    ? [
+        {
+          binding: importedVinext.binding,
+          member: !commonJs && importedVinext.namespace ? "default" : undefined,
+        },
+        ...(commonJs && importedVinext.namespace
+          ? [{ binding: importedVinext.binding, member: "default" }]
+          : []),
+      ]
+    : [];
+  const vinextEquivalentBindings = vinextPackageReferences
+    .flatMap((reference) => findUnshadowedTopLevelAliases(program, reference, shadowedBindings))
+    .filter(
+      (reference, index, references) =>
+        references.findIndex(
+          (candidate) =>
+            candidate.binding === reference.binding && candidate.member === reference.member,
+        ) === index,
+    );
+  const configuredVinextAlias = vinextEquivalentBindings.find(({ binding, member }) =>
+    findPluginCall(config, binding, program, member),
+  );
+  const directVinext = commonJs
     ? findRequiredBinding(program, "vinext", "default", shadowedBindings)
-    : program.body
-        .filter(
-          (statement): statement is ESTree.ImportDeclaration =>
-            statement.type === "ImportDeclaration",
-        )
-        .filter((statement) => statement.source.value === "vinext")
-        .flatMap((statement) => statement.specifiers)
-        .find(
-          (specifier): specifier is ESTree.ImportDefaultSpecifier =>
-            specifier.type === "ImportDefaultSpecifier" &&
-            !shadowedBindings.has(specifier.local.name),
-        )?.local.name;
-  const existingVinextBinding =
-    directVinextBinding ?? configuredVinextAlias?.binding ?? vinextEquivalentBindings[0]?.binding;
-  const vinextLocal = existingVinextBinding ?? allocateBinding(bindings, "vinext");
+    : findDefaultImportedBinding(program, "vinext", shadowedBindings);
+  const directVinextReference =
+    typeof directVinext === "string"
+      ? { binding: directVinext }
+      : directVinext
+        ? {
+            binding: directVinext.binding,
+            member: directVinext.namespace ? "default" : undefined,
+          }
+        : undefined;
+  const existingVinextReference =
+    configuredVinextAlias ?? directVinextReference ?? vinextEquivalentBindings[0];
+  const vinextLocal = existingVinextReference?.binding ?? allocateBinding(bindings, "vinext");
   const vinextBinding =
-    existingVinextBinding ??
+    existingVinextReference?.binding ??
     (commonJs
       ? ensureDefaultRequire(program, output, "vinext", vinextLocal, false)
       : ensureDefaultImport(program, output, "vinext", vinextLocal, false));
-  const existingVinextCall = findPluginCall(config, vinextBinding, program);
+  const vinextMember = existingVinextReference?.member;
+  const vinextCallee = `${vinextBinding}${vinextMember ? `.${vinextMember}` : ""}`;
+  const existingVinextCall = findPluginCall(config, vinextBinding, program, vinextMember);
   const existingImageOptimizer = getVinextImageOptimizer(existingVinextCall);
   const needsPrerender = Boolean(options.prerender && !hasVinextPrerender(existingVinextCall));
   const configureCaches = options.cache !== undefined;
@@ -3264,11 +3406,11 @@ export function updateViteConfigForCloudflare(
       ...(tailwindPlugin ? [tailwindPlugin] : []),
       {
         expression: existingVinextCall
-          ? `${vinextBinding}()`
+          ? `${vinextCallee}()`
           : options.cache || options.prerender
             ? vinextExpression(
                 cacheOptions,
-                vinextBinding,
+                vinextCallee,
                 imageOptimizerExpression?.slice(0, imageOptimizerExpression.indexOf("(")) ||
                   "imagesOptimizer",
                 options.imagesBinding,
@@ -3276,8 +3418,9 @@ export function updateViteConfigForCloudflare(
                 options.versionMetadataBinding,
                 responseStoreBinding,
               )
-            : `${vinextBinding}()`,
+            : `${vinextCallee}()`,
         binding: vinextBinding,
+        member: vinextMember,
         equivalentBindings: vinextEquivalentBindings,
       },
       {
@@ -3341,8 +3484,9 @@ export function updateViteConfigForCloudflare(
         responseStoreExpression,
         code,
         program,
+        vinextMember,
       );
-      ensureVinextCache(output, config, vinextBinding, cacheAdditions, code, program);
+      ensureVinextCache(output, config, vinextBinding, cacheAdditions, code, program, vinextMember);
       ensureVinextImageOptimizer(
         output,
         config,
@@ -3350,8 +3494,17 @@ export function updateViteConfigForCloudflare(
         imageOptimizerExpression,
         code,
         program,
+        vinextMember,
       );
-      ensureVinextPrerender(output, config, vinextBinding, options.prerender, code, program);
+      ensureVinextPrerender(
+        output,
+        config,
+        vinextBinding,
+        options.prerender,
+        code,
+        program,
+        vinextMember,
+      );
     }
   }
 

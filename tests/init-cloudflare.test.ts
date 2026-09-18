@@ -536,6 +536,49 @@ module.exports = defineConfig({ plugins: [vinext()] });
     expect(output).toContain("cloudflare()");
   });
 
+  it("reuses a namespace vinext import through its default export", () => {
+    const input = `import * as vx from "vinext";
+export default { plugins: [vx.default()] };
+`;
+
+    const output = updateViteConfigForCloudflare("vite.config.ts", input, {
+      isAppRouter: false,
+      nativeModulesToStub: [],
+      prerender: true,
+    });
+
+    expectValidConfig(output);
+    expect(output.match(/vx\.default\(/g)).toHaveLength(1);
+    expect(output).toContain('prerender: { routes: "*" }');
+    expect(output).not.toContain('import vinext from "vinext"');
+    expect(
+      updateViteConfigForCloudflare("vite.config.ts", output, {
+        isAppRouter: false,
+        nativeModulesToStub: [],
+        prerender: true,
+      }),
+    ).toBe(output);
+  });
+
+  it("reuses a namespace vinext require through its default export", () => {
+    const input = `const vx = require("vinext");
+module.exports = { plugins: [vx.default()] };
+`;
+
+    const options = {
+      isAppRouter: false,
+      nativeModulesToStub: [],
+      prerender: true,
+    };
+    const output = updateViteConfigForCloudflare("vite.config.cjs", input, options);
+
+    expectValidConfig(output);
+    expect(output.match(/vx\.default\(/g)).toHaveLength(1);
+    expect(output).toContain('prerender: { routes: "*" }');
+    expect(output).not.toContain("vx()");
+    expect(updateViteConfigForCloudflare("vite.config.cjs", output, options)).toBe(output);
+  });
+
   it.each([
     ["default import", 'import tw from "@tailwindcss/vite";', "tw()", 1],
     ["named default import", 'import { default as tw } from "@tailwindcss/vite";', "tw()", 1],
@@ -1291,6 +1334,22 @@ export default config;
     expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
   });
 
+  it.each(["satisfies UserConfigFn", "as UserConfigFn"])(
+    "updates a defineConfig callback wrapped with %s",
+    (wrapper) => {
+      const output = updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import { defineConfig, type UserConfigFn } from "vite";
+export default defineConfig((() => ({ plugins: [] })) ${wrapper});
+`,
+      );
+
+      expectValidConfig(output);
+      expect(output).toContain("plugins: [\n  tailwindcss(),\n]");
+      expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
+    },
+  );
+
   it("updates a callback-local returned config binding", () => {
     const output = updateViteConfigForTailwind(
       "vite.config.ts",
@@ -1392,6 +1451,17 @@ module.exports = config;
       expect.arrayContaining([
         expect.objectContaining({ name: expect.stringContaining("tailwindcss") }),
       ]),
+    );
+  });
+
+  it("rejects multiple CommonJS export assignments", () => {
+    const input = `const vinext = require("vinext");
+module.exports = { plugins: [] };
+module.exports = { plugins: [vinext()] };
+`;
+
+    expect(() => updateViteConfigForTailwind("vite.config.cjs", input)).toThrow(
+      "Could not find a static Vite config object",
     );
   });
 
@@ -1591,6 +1661,50 @@ export default defineConfig(() => {
     expect(output).toContain("tailwindcss2()");
     expect(output).toContain("cloudflare2({");
     expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
+  });
+
+  it("resolves plugin bindings in an external plugin array's scope", () => {
+    const input = `import { defineConfig } from "vite";
+import tw from "@tailwindcss/vite";
+const plugins = [tw()];
+export default defineConfig(() => {
+  const tw = customPlugin;
+  return { plugins };
+});
+`;
+
+    expect(updateViteConfigForTailwind("vite.config.ts", input)).toBe(input);
+  });
+
+  it.each([
+    "config.plugins = [vinext()];",
+    'config["plugins"] = [vinext()];',
+    "const alias = config; alias.plugins = [vinext()];",
+  ])("rejects a variable-backed config property write: %s", (write) => {
+    expect(() =>
+      updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import vinext from "vinext";
+const config = { plugins: [] };
+${write}
+export default config;
+`,
+      ),
+    ).toThrow("properties are reassigned");
+  });
+
+  it("preserves commas inside comments when expanding an inline plugin array", () => {
+    const input = `const first = () => ({ name: "first" });
+const second = () => ({ name: "second" });
+export default { plugins: [first() /* keep, comma */, second()] };
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output).toContain("first(),\n  /* keep, comma */\n  second(),");
+    expect(output).toContain("tailwindcss(),");
+    expect(updateViteConfigForTailwind("vite.config.ts", output)).toBe(output);
   });
 
   it("updates options through immutable vinext and Cloudflare aliases", () => {
