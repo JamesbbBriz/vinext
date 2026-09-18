@@ -1580,8 +1580,19 @@ function expressionResolvesToInitializer(
   seen = new Set<string>(),
 ): boolean {
   const reference = unwrapExpression(expression);
+  if (reference?.type === "MemberExpression") {
+    return expressionResolvesToInitializer(
+      program,
+      target,
+      rootReference(reference),
+      expected,
+      seen,
+    );
+  }
   if (reference?.type !== "Identifier" || seen.has(reference.name)) return false;
-  const initializer = findVisibleConstInitializer(program, target, reference.name);
+  const initializer =
+    findVisibleConstInitializer(program, target, reference.name) ??
+    findVisibleDestructuredSource(program, target, reference.name);
   return (
     initializer === expected ||
     Boolean(
@@ -1597,20 +1608,56 @@ function expressionResolvesToInitializer(
   );
 }
 
-function rootMemberObject(node: ESTree.MemberExpression): ESTree.Node {
-  let object = unwrapExpression(node.object) ?? node.object;
-  while (object.type === "MemberExpression") {
-    object = unwrapExpression(object.object) ?? object.object;
+function rootReference(node: ESTree.Node): ESTree.Node {
+  let root = unwrapExpression(node) ?? node;
+  while (root.type === "MemberExpression") {
+    root = unwrapExpression(root.object) ?? root.object;
   }
-  return object;
+  return root;
 }
 
-function assertConfigPropertiesAreStatic(program: ESTree.Program, config: AstObject): void {
-  const initializer = findOwningConstInitializer(program, config);
-  if (!initializer) return;
-  let reassigned = false;
+function memberName(member: ESTree.MemberExpression): string | undefined {
+  if (member.computed) {
+    return member.property.type === "Literal" && typeof member.property.value === "string"
+      ? member.property.value
+      : undefined;
+  }
+  return member.property.type === "Identifier" ? member.property.name : undefined;
+}
+
+const MUTATING_METHODS = new Set([
+  "copyWithin",
+  "fill",
+  "pop",
+  "push",
+  "reverse",
+  "shift",
+  "sort",
+  "splice",
+  "unshift",
+]);
+const OBJECT_MUTATORS = new Set(["assign", "defineProperties", "defineProperty", "setPrototypeOf"]);
+const REFLECT_MUTATORS = new Set(["defineProperty", "deleteProperty", "set", "setPrototypeOf"]);
+
+function isUnshadowedGlobal(
+  program: ESTree.Program,
+  target: ESTree.Node,
+  binding: string,
+): boolean {
+  return (
+    !collectTopLevelBindings(program).has(binding) &&
+    !collectShadowedBindings(program, target).has(binding)
+  );
+}
+
+function hasLaterInitializerMutation(program: ESTree.Program, initializer: ESTree.Node): boolean {
+  let mutated = false;
   const visit = (node: ESTree.Node): void => {
-    if (reassigned) return;
+    if (mutated) return;
+    const afterInitializer =
+      (node as Partial<AstNode>).start !== undefined &&
+      (initializer as Partial<AstNode>).end !== undefined &&
+      (node as AstNode).start > (initializer as AstNode).end;
     let member: ESTree.MemberExpression | undefined;
     if (node.type === "AssignmentExpression" && node.left.type === "MemberExpression") {
       member = node.left;
@@ -1625,20 +1672,60 @@ function assertConfigPropertiesAreStatic(program: ESTree.Program, config: AstObj
     }
     if (
       member &&
-      (node as Partial<AstNode>).start !== undefined &&
-      (initializer as Partial<AstNode>).end !== undefined &&
-      (node as AstNode).start > (initializer as AstNode).end &&
-      expressionResolvesToInitializer(program, node, rootMemberObject(member), initializer)
+      afterInitializer &&
+      expressionResolvesToInitializer(program, node, rootReference(member), initializer)
     ) {
-      reassigned = true;
+      mutated = true;
       return;
+    }
+    const callee = node.type === "CallExpression" ? unwrapExpression(node.callee) : undefined;
+    if (afterInitializer && callee?.type === "MemberExpression") {
+      const method = memberName(callee);
+      const object = unwrapExpression(callee.object) ?? callee.object;
+      const firstArgument = node.type === "CallExpression" ? node.arguments[0] : undefined;
+      const staticMutatorTarget =
+        object.type === "Identifier" &&
+        isUnshadowedGlobal(program, node, object.name) &&
+        ((object.name === "Object" && method && OBJECT_MUTATORS.has(method)) ||
+          (object.name === "Reflect" && method && REFLECT_MUTATORS.has(method))) &&
+        firstArgument &&
+        firstArgument.type !== "SpreadElement"
+          ? firstArgument
+          : undefined;
+      const methodTarget = method && MUTATING_METHODS.has(method) ? callee.object : undefined;
+      const target = staticMutatorTarget ?? methodTarget;
+      if (
+        target &&
+        expressionResolvesToInitializer(program, node, rootReference(target), initializer)
+      ) {
+        mutated = true;
+        return;
+      }
     }
     forEachAstChild(node, visit);
   };
   visit(program);
-  if (reassigned) {
+  return mutated;
+}
+
+function assertConfigPropertiesAreStatic(program: ESTree.Program, config: AstObject): void {
+  const initializer = findOwningConstInitializer(program, config);
+  if (initializer && hasLaterInitializerMutation(program, initializer)) {
     throw new Error(
-      "The Vite config cannot be updated because properties are reassigned after its static initializer.",
+      "The Vite config cannot be updated because properties are mutated after its static initializer.",
+    );
+  }
+}
+
+function assertPluginArrayIsStatic(
+  program: ESTree.Program,
+  array: (ESTree.ArrayExpression & AstNode) | undefined,
+): void {
+  if (!array) return;
+  const initializer = findOwningConstInitializer(program, array);
+  if (initializer === array && hasLaterInitializerMutation(program, initializer)) {
+    throw new Error(
+      "The Vite config's plugins option cannot be updated because its array is mutated after initialization.",
     );
   }
 }
@@ -2296,6 +2383,12 @@ function collectShadowedBindings(program: ESTree.Program, target: ESTree.Node): 
   return bindings;
 }
 
+function patternBinds(pattern: ESTree.Node, binding: string): boolean {
+  const bindings = new Set<string>();
+  collectPatternBindings(pattern, bindings);
+  return bindings.has(binding);
+}
+
 function findVisibleConstInitializer(
   program: ESTree.Program,
   target: ESTree.Node,
@@ -2322,12 +2415,12 @@ function findVisibleConstInitializer(
       const declaration =
         statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
       if (declaration?.type === "VariableDeclaration") {
-        const declarator = declaration.declarations.find(
-          (candidate) => candidate.id.type === "Identifier" && candidate.id.name === binding,
+        const declarator = declaration.declarations.find((candidate) =>
+          patternBinds(candidate.id, binding),
         );
         if (!declarator) continue;
         initializer =
-          declaration.kind === "const"
+          declaration.kind === "const" && declarator.id.type === "Identifier"
             ? (unwrapExpression(declarator.init) ?? undefined)
             : undefined;
       } else if (
@@ -2344,6 +2437,54 @@ function findVisibleConstInitializer(
     }
   }
   return initializer;
+}
+
+function findVisibleDestructuredSource(
+  program: ESTree.Program,
+  target: ESTree.Node,
+  binding: string,
+): ESTree.Node | undefined {
+  const path = findAstPath(program, target);
+  if (!path) return undefined;
+  let source: ESTree.Node | undefined;
+  for (const node of path) {
+    if (
+      node.type === "FunctionDeclaration" ||
+      node.type === "FunctionExpression" ||
+      node.type === "ArrowFunctionExpression"
+    ) {
+      if (node.params.some((parameter) => patternBinds(parameter, binding))) source = undefined;
+    }
+    if (node.type === "FunctionExpression" && node.id?.name === binding) source = undefined;
+    const statements =
+      node.type === "Program" || node.type === "BlockStatement" ? node.body : undefined;
+    if (!statements) continue;
+    for (const statement of statements) {
+      const declaration =
+        statement.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+      if (declaration?.type === "VariableDeclaration") {
+        const declarator = declaration.declarations.find((candidate) =>
+          patternBinds(candidate.id, binding),
+        );
+        if (!declarator) continue;
+        source =
+          declaration.kind === "const" && declarator.id.type === "ObjectPattern"
+            ? (unwrapExpression(declarator.init) ?? undefined)
+            : undefined;
+      } else if (
+        ((declaration?.type === "FunctionDeclaration" ||
+          declaration?.type === "ClassDeclaration") &&
+          declaration.id?.name === binding) ||
+        (declaration?.type === "TSEnumDeclaration" && declaration.id.name === binding) ||
+        (declaration?.type === "TSModuleDeclaration" &&
+          declaration.id.type === "Identifier" &&
+          declaration.id.name === binding)
+      ) {
+        source = undefined;
+      }
+    }
+  }
+  return source;
 }
 
 function findVisiblePluginArray(
@@ -3063,13 +3204,12 @@ export function updateViteConfigForTailwind(filePath: string, code: string): str
     );
   }
   assertConfigPropertiesAreStatic(program, config);
+  const pluginArray = findPluginArray(config, program);
+  assertPluginArrayIsStatic(program, pluginArray);
   const output = new MagicString(code);
   const commonJs = usesCommonJsViteConfig(filePath, code);
   const bindings = collectTopLevelBindings(program);
-  const shadowedBindings = collectShadowedBindings(
-    program,
-    findPluginArray(config, program) ?? config,
-  );
+  const shadowedBindings = collectShadowedBindings(program, pluginArray ?? config);
   for (const binding of shadowedBindings) bindings.add(binding);
   ensurePlugins(
     output,
@@ -3103,14 +3243,13 @@ export function updateViteConfigForCloudflare(
     );
   }
   assertConfigPropertiesAreStatic(program, config);
+  const pluginArray = findPluginArray(config, program);
+  assertPluginArrayIsStatic(program, pluginArray);
 
   const output = new MagicString(code);
   const commonJs = usesCommonJsViteConfig(filePath, code);
   const bindings = collectTopLevelBindings(program);
-  const shadowedBindings = collectShadowedBindings(
-    program,
-    findPluginArray(config, program) ?? config,
-  );
+  const shadowedBindings = collectShadowedBindings(program, pluginArray ?? config);
   for (const binding of shadowedBindings) bindings.add(binding);
   const importedVinext = commonJs
     ? findDefaultRequiredBinding(program, "vinext")

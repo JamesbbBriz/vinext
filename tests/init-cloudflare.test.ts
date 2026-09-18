@@ -1690,8 +1690,57 @@ ${write}
 export default config;
 `,
       ),
-    ).toThrow("properties are reassigned");
+    ).toThrow("properties are mutated");
   });
+
+  it.each([
+    "Object.assign(config, { plugins: [vinext()] });",
+    'Object.defineProperty(config, "plugins", { value: [vinext()] });',
+    "const alias = config; Object.assign(alias, { plugins: [vinext()] });",
+    "const plugins = config.plugins; plugins.push(vinext());",
+    "const { plugins } = config; plugins.push(vinext());",
+    "const { plugins: list } = config; list.push(vinext());",
+  ])("rejects a variable-backed config mutator call: %s", (mutation) => {
+    expect(() =>
+      updateViteConfigForTailwind(
+        "vite.config.ts",
+        `import vinext from "vinext";
+const config = { plugins: [] };
+${mutation}
+export default config;
+`,
+      ),
+    ).toThrow("properties are mutated");
+  });
+
+  it("allows a shadowed Object.assign helper that does not mutate the config", () => {
+    const input = `const Object = { assign() {} };
+const config = { plugins: [] };
+Object.assign(config, {});
+export default config;
+`;
+
+    const output = updateViteConfigForTailwind("vite.config.ts", input);
+
+    expectValidConfig(output);
+    expect(output).toContain("tailwindcss()");
+  });
+
+  it.each(["plugins.length = 0;", "plugins.splice(0);", "const alias = plugins; alias.splice(0);"])(
+    "rejects a variable-backed plugin array mutation: %s",
+    (mutation) => {
+      expect(() =>
+        updateViteConfigForTailwind(
+          "vite.config.ts",
+          `import vinext from "vinext";
+const plugins = [vinext()];
+${mutation}
+export default { plugins };
+`,
+        ),
+      ).toThrow("array is mutated");
+    },
+  );
 
   it("preserves commas inside comments when expanding an inline plugin array", () => {
     const input = `const first = () => ({ name: "first" });
