@@ -1060,18 +1060,22 @@ function vinextExpression(
   prerender = false,
   versionMetadataBinding = DEFAULT_VERSION_METADATA_BINDING,
   responseStoreBinding = "responseStoreAdapter",
+  resolvedCacheEntries?: Array<{ name: "data" | "cdn"; expression: string }>,
 ): string {
   const responseStore = options.cdnCache === "response-store";
-  const cacheEntries: string[] = [];
-  if (options.dataCache === "kv") {
-    cacheEntries.push("data: kvDataAdapter()");
-  }
-  if (options.cdnCache === "workers-cache") {
-    const adapterOptions =
-      versionMetadataBinding === DEFAULT_VERSION_METADATA_BINDING
-        ? ""
-        : `{ versionMetadataBinding: ${JSON.stringify(versionMetadataBinding)} }`;
-    cacheEntries.push(`cdn: cdnAdapter(${adapterOptions})`);
+  const cacheEntries =
+    resolvedCacheEntries?.map(({ name, expression }) => `${name}: ${expression}`) ?? [];
+  if (!resolvedCacheEntries) {
+    if (options.dataCache === "kv") {
+      cacheEntries.push("data: kvDataAdapter()");
+    }
+    if (options.cdnCache === "workers-cache") {
+      const adapterOptions =
+        versionMetadataBinding === DEFAULT_VERSION_METADATA_BINDING
+          ? ""
+          : `{ versionMetadataBinding: ${JSON.stringify(versionMetadataBinding)} }`;
+      cacheEntries.push(`cdn: cdnAdapter(${adapterOptions})`);
+    }
   }
   const optionEntries: string[] = [];
   if (responseStore) {
@@ -3556,6 +3560,7 @@ export function updateViteConfigForCloudflare(
                 options.prerender,
                 options.versionMetadataBinding,
                 responseStoreBinding,
+                cacheAdditions,
               )
             : `${vinextCallee}()`,
         binding: vinextBinding,

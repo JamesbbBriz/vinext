@@ -1883,6 +1883,30 @@ export default defineConfig(function plugins() {
     ).toThrow("plugins option must be an array");
   });
 
+  it("uses aliased cache adapter imports in a newly added vinext plugin", () => {
+    const input = `import { kvDataAdapter as kv } from "@vinext/cloudflare/cache/kv-data-adapter";
+import { cdnAdapter as cdn } from "@vinext/cloudflare/cache/cdn-adapter";
+export default { plugins: [] };
+`;
+    const options = {
+      isAppRouter: false,
+      nativeModulesToStub: [],
+      cache: {
+        dataCache: "kv" as const,
+        cdnCache: "workers-cache" as const,
+        imageOptimization: "none" as const,
+      },
+    };
+
+    const output = updateViteConfigForCloudflare("vite.config.ts", input, options);
+
+    expectValidConfig(output);
+    expect(output).toContain("cache: { data: kv(), cdn: cdn() }");
+    expect(output).not.toContain("data: kvDataAdapter()");
+    expect(output).not.toContain("cdn: cdnAdapter()");
+    expect(updateViteConfigForCloudflare("vite.config.ts", output, options)).toBe(output);
+  });
+
   it("adds only missing cache slots to an existing vinext config", () => {
     const input = `import vinext from "vinext";
 import { existingData } from "./cache.js";
