@@ -361,8 +361,9 @@ function localFont(options: LocalFontOptions): FontResult {
       })
     : { fontFamily };
 
-  // Collect font URLs for preload <link> tags (SSR only)
-  collectFontPreloads(sources);
+  // Collect font URLs for preload <link> tags (SSR only). Next.js defaults
+  // `preload` to true and skips the tags when it is explicitly false.
+  if (options.preload !== false) collectFontPreloads(sources);
 
   // Inject @font-face declarations
   const css = generateFontFaceCSS(family, options, sources);

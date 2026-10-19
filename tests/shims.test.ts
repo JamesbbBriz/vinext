@@ -15192,6 +15192,16 @@ describe("next/font/local shim", () => {
     expect(match!.type).toBe("font/woff2");
   });
 
+  it("skips preload data when preload is false", async () => {
+    const fontLocal = await import("../packages/vinext/src/shims/font-local.js");
+    const localFont = fontLocal.default;
+
+    localFont({ src: "/assets/no-preload-abc123.woff2", preload: false });
+
+    const preloads = fontLocal.getSSRFontPreloads();
+    expect(preloads.some((p: any) => p.href === "/assets/no-preload-abc123.woff2")).toBe(false);
+  });
+
   it("collects preload data for array font sources with absolute URLs", async () => {
     const fontLocal = await import("../packages/vinext/src/shims/font-local.js");
     const localFont = fontLocal.default;
