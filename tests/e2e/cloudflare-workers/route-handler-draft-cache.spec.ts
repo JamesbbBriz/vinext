@@ -446,6 +446,19 @@ test.describe("Cloudflare route-handler draft-mode cache isolation", () => {
     });
   }
 
+  // The same Next.js test expects an RSC request to carry the redirect in a 200
+  // payload. With only `RSC: 1`, the validated `_rsc` value is empty.
+  test("returns App RSC redirects from the cache-facing response stage", async ({ request }) => {
+    const response = await request.get(`${BASE_URL}/cdn-stage-app/redirect?_rsc`, {
+      headers: { RSC: "1" },
+      maxRedirects: 0,
+    });
+
+    expect(response.status()).toBe(200);
+    expect(response.headers()["content-type"]).toContain("text/x-component");
+    expect(response.headers()["location"]).toBe("/about");
+  });
+
   test("routes revalidatePath through the cache-bearing response entrypoint", async ({
     request,
   }) => {
