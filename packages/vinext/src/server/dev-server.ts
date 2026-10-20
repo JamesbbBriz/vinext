@@ -31,9 +31,20 @@ import {
   stripDocumentAssetPropsProtectionMarkers,
   type DocumentAssetProps,
 } from "./pages-document-asset-props.js";
+import {
+  spliceDocumentHeadClose,
+  spliceDocumentHeadOpen,
+  spliceDocumentScripts,
+  splitDocumentAtMain,
+} from "./pages-document-splice.js";
+import {
+  createDocumentPlaceholderToken,
+  getDocumentHeadOpenMarker,
+} from "vinext/shims/document-placeholders";
 import { getClientTraceMetadataHTML } from "./client-trace-metadata.js";
 import { getScriptNonceFromNodeHeaderSources } from "./csp.js";
 import { mergeRouteParamsIntoQuery, parseQueryString as parseQuery } from "../utils/query.js";
+import { stripViteModuleQuery } from "../utils/path.js";
 import React from "react";
 import { renderToReadableStream } from "react-dom/server.edge";
 import { logRequest, now } from "./request-log.js";
@@ -58,13 +69,17 @@ import {
   resolvePagesRedirect,
   resolvePagesRedirectLocation,
   resolvePagesRevalidateSeconds,
+  resolvePagesStatusPageRenderPath,
   type PagesRedirectResult,
   type PagesStaticPathsEntry,
 } from "./pages-page-data.js";
 import { sanitizeDestination } from "../config/config-matchers.js";
 import { collectPagesDevInitialStylesheetHeadHTML } from "./pages-dev-stylesheets.js";
 import { createPagesDevModuleUrl } from "./pages-dev-module-url.js";
-import { createPagesDevHydrationScript } from "./pages-dev-hydration.js";
+import {
+  createPagesDevHydrationScript,
+  type PagesDevHydrationOptions,
+} from "./pages-dev-hydration.js";
 import { isSerializableProps } from "./pages-serializable-props.js";
 import { isDangerousScheme } from "vinext/shims/url-safety";
 import {
@@ -86,6 +101,12 @@ import {
   type PagesPreviewState,
 } from "./pages-preview.js";
 import { isBotUserAgent } from "../utils/html-limited-bots.js";
+import {
+  tracePagesData,
+  tracePagesDocument,
+  tracePagesDocumentStream,
+  traceFindPageComponents,
+} from "./pages-execution-tracing.js";
 
 /**
  * Render a React element to a string using renderToReadableStream.
@@ -243,12 +264,19 @@ function writeGsspRedirect(
   res.end(location);
 }
 
-/** Body placeholder used to split the document shell for streaming. */
-const STREAM_BODY_MARKER = "<!--VINEXT_STREAM_BODY-->";
-
 function stripDevPagesNotFoundFramingHeaders(res: ServerResponse): void {
   res.removeHeader("Content-Length");
   res.removeHeader("Transfer-Encoding");
+}
+
+/**
+ * Vite's `transformIndexHtml` treats its URL as the HTML document's path, so
+ * the request query carries no meaning there. Since Vite 8.3.3 it also maps
+ * `/?q` onto the project root directory and then watches the filesystem root
+ * for each inline `<style>` proxy module, so pass the bare path.
+ */
+function toHtmlTransformPath(url: string): string {
+  return stripViteModuleQuery(url);
 }
 
 /**
@@ -264,12 +292,14 @@ function stripDevPagesNotFoundFramingHeaders(res: ServerResponse): void {
  * deferring them reduces TTFB and lets the browser start parsing the
  * shell sooner).
  */
-async function streamPageToResponse(
+async function streamPageToResponseImpl(
+  routePattern: string,
   res: ServerResponse,
   element: React.ReactElement,
   options: {
     url: string;
     server: ViteDevServer;
+    runner: ModuleImporter;
     fontHeadHTML: string;
     assetHeadHTML?: string;
     scripts: string;
@@ -310,11 +340,13 @@ async function streamPageToResponse(
     bufferBodyBeforeHeaders?: boolean;
     /** Keep a response Content-Type set before rendering a notFound page. */
     preserveExistingContentType?: boolean;
+    onDocumentBody?: (stream: ReadableStream<Uint8Array>) => void;
   },
 ): Promise<void> {
   const {
     url,
     server,
+    runner,
     fontHeadHTML,
     assetHeadHTML = "",
     scripts,
@@ -330,6 +362,7 @@ async function streamPageToResponse(
     crossOrigin,
     bufferBodyBeforeHeaders = false,
     preserveExistingContentType = false,
+    onDocumentBody,
   } = options;
 
   // Custom `_document.getInitialProps()` may opt in to wrapping the page tree
@@ -339,47 +372,50 @@ async function streamPageToResponse(
   // streaming path stays as the default for the common case. The contract
   // (including `withScriptNonce` and `styles` rendering) lives in the shared
   // helper so dev and prod stay in lockstep.
-  const documentRenderPage = await runDocumentRenderPage({
-    DocumentComponent,
-    enhancePageElement,
-    renderToReadableStream,
-    renderStylesToString: renderToStringAsync,
-    scriptNonce,
-    context: documentContext,
-  });
-  if (res.headersSent || res.writableEnded) return;
-
-  let bodyStream: ReadableStream<Uint8Array>;
-  if (documentRenderPage.status === "rendered") {
-    const synthesised = documentRenderPage.bodyHtml;
-    bodyStream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode(synthesised));
-        controller.close();
-      },
+  const renderDocument = async () => {
+    const documentRenderPage = await runDocumentRenderPage({
+      DocumentComponent,
+      enhancePageElement,
+      renderToReadableStream,
+      renderStylesToString: renderToStringAsync,
+      scriptNonce,
+      context: documentContext,
     });
-  } else {
-    // Start the React body stream FIRST — the promise resolves when the
-    // shell is ready (synchronous content outside Suspense boundaries).
-    // This triggers the render which populates <Head> tags.
-    bodyStream = await renderToReadableStream(element);
-  }
+    if (res.headersSent || res.writableEnded) return { documentRenderPage, responseSent: true };
 
-  // Fold any head tags returned by `_document.getInitialProps()` into the same
-  // dedupe pipeline as user `next/head` tags. Matches Next.js's `_document`
-  // contract. `runDocumentRenderPage` already invokes `getInitialProps` for the
-  // renderPage contract, so reuse the head it surfaced
-  // rather than calling it a second time. Only the `skipped` path (no override,
-  // or no `enhancePageElement` wired) falls back to the standalone helper, which
-  // itself skips the unmodified default from vinext's `next/document` shim —
-  // extending Document without overriding the method inherits the base
-  // implementation, and the default returns no head tags, so dispatching it on
-  // every render is wasted work.
-  if (documentRenderPage.status === "skipped") {
-    await callDocumentGetInitialProps(DocumentComponent, setDocumentInitialHead);
-  } else {
-    setDocumentInitialHead?.(documentRenderPage.head);
-  }
+    let bodyStream: ReadableStream<Uint8Array>;
+    if (documentRenderPage.status === "rendered") {
+      const synthesised = documentRenderPage.bodyHtml;
+      bodyStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(synthesised));
+          controller.close();
+        },
+      });
+    } else {
+      // Start the body render before collecting its head state, then let the
+      // tracing adapter keep the span alive without delaying the response.
+      bodyStream = await renderToReadableStream(element);
+    }
+
+    if (documentRenderPage.status === "skipped") {
+      await callDocumentGetInitialProps(DocumentComponent, setDocumentInitialHead);
+    } else {
+      setDocumentInitialHead?.(documentRenderPage.head);
+    }
+
+    return {
+      bodyStream,
+      documentRenderPage,
+      responseSent: false,
+      waitForBody: documentRenderPage.status === "skipped",
+    };
+  };
+  const documentResult = await tracePagesDocumentStream(routePattern, renderDocument);
+  if (documentResult.responseSent) return;
+  const { bodyStream, documentRenderPage } = documentResult;
+  if (!bodyStream) throw new Error("Pages document render did not produce a body stream");
+  onDocumentBody?.(bodyStream);
 
   // Now that the shell has rendered (and any _document.getInitialProps
   // has injected its tags), collect head HTML.
@@ -390,6 +426,9 @@ async function streamPageToResponse(
   const ssrHeadMarkerId = randomUUID();
   const ssrHeadStartMarker = `<!--VINEXT_SSR_HEAD_START:${ssrHeadMarkerId}-->`;
   const ssrHeadEndMarker = `<!--VINEXT_SSR_HEAD_END:${ssrHeadMarkerId}-->`;
+  // Body placeholder used to split the transformed shell for streaming.
+  const streamBodyMarker = `<!--VINEXT_STREAM_BODY:${ssrHeadMarkerId}-->`;
+  const documentToken = createDocumentPlaceholderToken();
   let tailHeadHTML = getTailHeadHTML?.() ?? "";
   if (documentRenderPage.status === "rendered" && documentRenderPage.stylesHTML) {
     if (tailHeadHTML) tailHeadHTML += "\n  ";
@@ -424,7 +463,15 @@ async function streamPageToResponse(
     const docElement = docProps
       ? React.createElement(DocumentComponent, docProps)
       : React.createElement(DocumentComponent);
-    const renderedDocument = extractDocumentAssetProps(await renderToStringAsync(docElement));
+    // The Document and its `next/document` shims load through the module
+    // runner, so its placeholder context must come from the runner too.
+    const { withDocumentPlaceholders } = (await runner.import(
+      "vinext/document-placeholders",
+    )) as typeof import("vinext/shims/document-placeholders");
+    const renderedDocument = extractDocumentAssetProps(
+      await renderToStringAsync(withDocumentPlaceholders(docElement, documentToken)),
+      documentToken,
+    );
     documentAssetProps = renderedDocument.props;
     let docHtml = protectAssetTags(renderedDocument.html);
     const generatedScripts = applyGeneratedAssetProps(
@@ -437,22 +484,18 @@ async function streamPageToResponse(
       renderedDocument.props,
       "next-script",
     );
-    // Replace __NEXT_MAIN__ with our stream marker
-    docHtml = docHtml.replace("__NEXT_MAIN__", STREAM_BODY_MARKER);
-    if (headHTML || fontHeadHTML || generatedAssetHeadHTML || tailHeadHTML) {
-      docHtml = docHtml.replace(
-        "</head>",
-        `${ssrHeadStartMarker}${protectAssetTags(headHTML)}${ssrHeadEndMarker}` +
-          `  ${protectAssetTags(fontHeadHTML)}\n  ${generatedAssetHeadHTML}\n` +
-          `  ${protectAssetTags(tailHeadHTML)}\n</head>`,
-      );
-    }
-    // Inject scripts: replace placeholder or append before </body>
-    docHtml = docHtml.replace("<!-- __NEXT_SCRIPTS__ -->", generatedScripts);
-    if (!docHtml.includes("__NEXT_DATA__")) {
-      docHtml = docHtml.replace("</body>", `  ${generatedScripts}\n</body>`);
-    }
-    shellTemplate = docHtml;
+    docHtml = spliceDocumentHeadClose(
+      docHtml,
+      documentToken,
+      headHTML || fontHeadHTML || generatedAssetHeadHTML || tailHeadHTML
+        ? `${ssrHeadStartMarker}${protectAssetTags(headHTML)}${ssrHeadEndMarker}` +
+            `  ${protectAssetTags(fontHeadHTML)}\n  ${generatedAssetHeadHTML}\n` +
+            `  ${protectAssetTags(tailHeadHTML)}\n`
+        : "",
+    );
+    docHtml = spliceDocumentScripts(docHtml, documentToken, generatedScripts);
+    const main = splitDocumentAtMain(docHtml, documentToken);
+    shellTemplate = main.prefix + streamBodyMarker + main.suffix;
   } else {
     // charset + viewport are emitted via getSSRHeadHTML() (next/head's
     // defaultHead seeds them with data-next-head=""), matching Next.js's
@@ -461,14 +504,14 @@ async function streamPageToResponse(
     const generatedAssetHeadHTML = applyGeneratedAssetProps(assetHeadHTML, {}, "next-script");
     shellTemplate = `<!DOCTYPE html>
 <html>
-<head>
+<head${getDocumentHeadOpenMarker(documentToken)}>
   ${ssrHeadStartMarker}${protectAssetTags(headHTML)}${ssrHeadEndMarker}
   ${protectAssetTags(fontHeadHTML)}
   ${generatedAssetHeadHTML}
   ${protectAssetTags(tailHeadHTML)}
 </head>
 <body>
-  <div id="__next">${STREAM_BODY_MARKER}</div>
+  <div id="__next">${streamBodyMarker}</div>
   ${generatedScripts}
 </body>
 </html>`;
@@ -476,7 +519,7 @@ async function streamPageToResponse(
 
   // Apply Vite's HTML transforms (injects HMR client, etc.) on the full
   // shell template, then split at the body marker.
-  let transformedShell = await server.transformIndexHtml(url, shellTemplate);
+  let transformedShell = await server.transformIndexHtml(toHtmlTransformPath(url), shellTemplate);
   transformedShell = stripDocumentAssetPropsProtectionMarkers(
     applyDocumentAssetProps(transformedShell, documentAssetProps, {
       configuredCrossOrigin: crossOrigin,
@@ -493,22 +536,24 @@ async function streamPageToResponse(
   // Next.js's canonical charset, viewport, and user-tag ordering.
   const ssrHeadStart = transformedShell.indexOf(ssrHeadStartMarker);
   const ssrHeadEnd = transformedShell.indexOf(ssrHeadEndMarker);
+  let transformedHeadHTML = "";
   if (ssrHeadStart !== -1 && ssrHeadEnd > ssrHeadStart) {
-    const transformedHeadHTML = transformedShell.slice(
+    const ssrHeadHTML = transformedShell.slice(
       ssrHeadStart + ssrHeadStartMarker.length,
       ssrHeadEnd,
     );
+    // If a transform dropped <Head>'s marker, keep the block where it is.
+    const moveToHeadOpen = transformedShell.includes(getDocumentHeadOpenMarker(documentToken));
+    if (moveToHeadOpen) transformedHeadHTML = ssrHeadHTML;
     transformedShell =
       transformedShell.slice(0, ssrHeadStart) +
+      (moveToHeadOpen ? "" : ssrHeadHTML) +
       transformedShell.slice(ssrHeadEnd + ssrHeadEndMarker.length);
-    transformedShell = transformedShell.replace(
-      /<head(?:\s[^>]*)?>/i,
-      (openingHead) => `${openingHead}${transformedHeadHTML}`,
-    );
   }
-  const markerIdx = transformedShell.indexOf(STREAM_BODY_MARKER);
+  transformedShell = spliceDocumentHeadOpen(transformedShell, documentToken, transformedHeadHTML);
+  const markerIdx = transformedShell.indexOf(streamBodyMarker);
   const prefix = transformedShell.slice(0, markerIdx);
-  const suffix = transformedShell.slice(markerIdx + STREAM_BODY_MARKER.length);
+  const suffix = transformedShell.slice(markerIdx + streamBodyMarker.length);
   const bufferedBody = bufferBodyBeforeHeaders ? await new Response(bodyStream).text() : null;
 
   // Send headers and start streaming.
@@ -552,6 +597,23 @@ async function streamPageToResponse(
 
   // Write the document suffix (closing tags, scripts)
   res.end(suffix);
+}
+
+async function streamPageToResponse(
+  ...args: Parameters<typeof streamPageToResponseImpl>
+): Promise<void> {
+  let bodyStream: ReadableStream<Uint8Array> | undefined;
+  try {
+    await streamPageToResponseImpl(args[0], args[1], args[2], {
+      ...args[3],
+      onDocumentBody(stream) {
+        bodyStream = stream;
+      },
+    });
+  } catch (error) {
+    if (bodyStream && !bodyStream.locked) await bodyStream.cancel(error).catch(() => {});
+    throw error;
+  }
 }
 
 /**
@@ -608,6 +670,8 @@ export function createSSRHandler(
   crossOrigin?: string,
   /** Resolved Pages Router build ID shared with the dev data-route parser. */
   buildId = process.env.__VINEXT_BUILD_ID ?? "development",
+  clientMiddlewareMatcher?: unknown,
+  classifyPageRoute?: (route: Route) => "static" | "server" | "none",
 ) {
   const matcher = fileMatcher ?? createValidFileMatcher();
 
@@ -619,6 +683,19 @@ export function createSSRHandler(
   // dev exactly as they do in production. Without this, dev would fall back
   // to `__NEXT_DATA__.page` only — a dev/prod parity gap.
   const pagePatterns = routes.map((r) => patternToNextFormat(r.pattern));
+  const pageLoaders = routes.map((route) => ({
+    pattern: patternToNextFormat(route.pattern),
+    moduleSource: createPagesDevModuleUrl(server.config.root, route.filePath, "/"),
+    dataKind: classifyPageRoute?.(route) ?? "none",
+  }));
+  const errorFile = findFileWithExts(pagesDir, "_error", matcher);
+  pageLoaders.push({
+    pattern: "/_error",
+    moduleSource: errorFile
+      ? createPagesDevModuleUrl(server.config.root, errorFile, "/")
+      : "next/error",
+    dataKind: "none",
+  });
 
   // Register ALS-backed accessors in the SSR module graph so head and
   // router state are per-request isolated under concurrent load.
@@ -701,10 +778,15 @@ export function createSSRHandler(
       basePath,
       buildId,
       clientTraceMetadata,
+      pageLoaders,
+      hasMiddleware,
+      clientMiddlewareMatcher,
       locale: locale ?? currentDefaultLocale,
       locales: i18nConfig?.locales,
       defaultLocale: currentDefaultLocale,
       crossOrigin,
+      trailingSlash,
+      requestPathname: new URL(originalUrl, "http://vinext.local").pathname,
     };
 
     const match = matchRoute(localeStrippedUrl, routes);
@@ -775,6 +857,7 @@ export function createSSRHandler(
     let query = mergeRouteParamsIntoQuery(parseQuery(url), params);
     // Wrap the entire request in a single unified AsyncLocalStorage scope.
     const requestContext = createRequestContext();
+    let isStaticPropsRender = false;
     const closeRequest = () => void closeAfterResponse(requestContext);
     res.on("finish", closeRequest);
     res.on("close", closeRequest);
@@ -812,17 +895,42 @@ export function createSSRHandler(
           }
         }
 
-        // Load the page module through Vite's SSR pipeline
-        // This gives us HMR and transform support for free
-        const pageModule = await importModule(runner, route.filePath);
-        const isStaticPropsRender =
+        // Match Next.js loadComponents: resolve the page, _app, and _document
+        // beneath one findPageComponents span before data methods run.
+        const { pageModule, AppComponent, appFilePath, DocumentComponent } =
+          await traceFindPageComponents(route.pattern, async () => {
+            const pageModule = await importModule(runner, route.filePath);
+            const appFilePath = findFileWithExts(pagesDir, "_app", matcher);
+            const appModule = appFilePath ? await importModule(runner, appFilePath) : null;
+            const docFilePath = findFileWithExts(pagesDir, "_document", matcher);
+            const docModule = docFilePath
+              ? ((await runner.import(docFilePath)) as Record<string, unknown>)
+              : null;
+            return {
+              pageModule,
+              // oxlint-disable-next-line typescript/no-explicit-any
+              AppComponent: (appModule?.default ?? null) as any,
+              appFilePath,
+              // oxlint-disable-next-line typescript/no-explicit-any
+              DocumentComponent: (docModule?.default ?? null) as any,
+            };
+          });
+        isStaticPropsRender =
           typeof pageModule.getStaticProps === "function" &&
           typeof pageModule.getServerSideProps !== "function";
         if (isStaticPropsRender) {
           // Match Next.js's Pages handler: getStaticProps renders receive only
           // route params and a resolved asPath without request search state.
           query = mergeRouteParamsIntoQuery({}, params);
-          requestAsPath = localeStrippedUrl.split("?")[0];
+          const routePattern = patternToNextFormat(route.pattern);
+          requestAsPath =
+            routePattern === "/404" || routePattern === "/500"
+              ? resolvePagesStatusPageRenderPath(
+                  routePattern,
+                  trailingSlash,
+                  errorPageContext.requestPathname,
+                )
+              : localeStrippedUrl.split("?")[0];
         }
         const supportsPreview =
           typeof pageModule.getStaticProps === "function" ||
@@ -835,19 +943,6 @@ export function createSSRHandler(
             })
           : ({ data: false, shouldClear: false } satisfies PagesPreviewState);
         const requestPreviewData = requestPreview.data;
-        // Try to load _app.tsx if it exists. This happens before the readiness
-        // predicate so app-level getInitialProps participates in the same
-        // initial Pages Router state as the client __NEXT_DATA__ payload.
-        // oxlint-disable-next-line typescript/no-explicit-any
-        let AppComponent: any = null;
-        // Import the resolved file (extension included): the module runner
-        // does not apply custom resolve.extensions (e.g. ".page.tsx" from
-        // pageExtensions) to extensionless ids.
-        const appFilePath = findFileWithExts(pagesDir, "_app", matcher);
-        if (appFilePath) {
-          const appModule = await importModule(runner, appFilePath);
-          AppComponent = appModule.default ?? null;
-        }
         const pagesNextData = {
           ...buildPagesReadinessNextData({
             pageModule,
@@ -943,7 +1038,7 @@ export function createSSRHandler(
         if (typeof pageModule.getStaticPaths === "function" && route.isDynamic) {
           const pathsResult = await pageModule.getStaticPaths({
             locales: i18nConfig?.locales ?? [],
-            defaultLocale: currentDefaultLocale ?? "",
+            defaultLocale: i18nConfig?.defaultLocale ?? "",
           });
           const fallback = pathsResult?.fallback ?? false;
 
@@ -951,7 +1046,11 @@ export function createSSRHandler(
           const routePattern = patternToNextFormat(route.pattern);
           const routeParams = getPagesRouteParams(routePattern);
           const isValidPath = paths.some((pathEntry) =>
-            matchesPagesStaticPath(pathEntry, params, routeParams, url),
+            matchesPagesStaticPath(pathEntry, params, routeParams, localeStrippedUrl, {
+              locale,
+              locales: i18nConfig?.locales,
+              defaultLocale: i18nConfig?.defaultLocale,
+            }),
           );
 
           if (fallback === false && !isValidPath && requestPreviewData === false) {
@@ -1099,7 +1198,9 @@ export function createSSRHandler(
             defaultLocale: currentDefaultLocale,
             ...previewContext,
           };
-          const result = await pageModule.getServerSideProps(context);
+          const result = await tracePagesData("getServerSideProps", route.pattern, () =>
+            pageModule.getServerSideProps!(context),
+          );
           // If gSSP called res.end() directly (short-circuit pattern),
           // the response is already sent. Do not continue rendering.
           // Note: middleware headers are already on `res` (middleware runs
@@ -1257,7 +1358,9 @@ export function createSSRHandler(
             return;
           }
 
-          const result = await pageModule.getStaticProps(context);
+          const result = await tracePagesData("getStaticProps", route.pattern, () =>
+            pageModule.getStaticProps!(context),
+          );
           const routePattern = patternToNextFormat(route.pattern);
           assertPages404DoesNotReturnNotFound(routePattern, result);
           if (result) {
@@ -1399,6 +1502,7 @@ export function createSSRHandler(
               dataHeaders[k] = v;
             }
           }
+          dataHeaders["Cache-Control"] = DEV_PAGES_CACHE_CONTROL;
           applyDevPagesPreviewHeaders(dataHeaders, requestPreview);
           // Mirror Next.js pages-handler.ts: set x-nextjs-deployment-id on
           // every _next/data response so the client router can detect a new
@@ -1535,12 +1639,14 @@ export function createSSRHandler(
             appModuleUrl,
             hasMiddleware,
             routeUrl: requestAsPath,
+            clientMiddlewareMatcher,
           },
         };
 
         const hydrationScript = createPagesDevHydrationScript({
           appModuleSource,
           pageModuleSource,
+          pageLoaders,
           reactStrictMode: reactStrictMode === true,
           replaceFallbackRoute: true,
           scriptNonce,
@@ -1561,17 +1667,6 @@ export function createSSRHandler(
           },
         )}</script>`;
 
-        // Try to load custom _document.tsx (import the resolved file — the
-        // module runner does not apply custom resolve.extensions to
-        // extensionless ids)
-        const docFilePath = findFileWithExts(pagesDir, "_document", matcher);
-        // oxlint-disable-next-line typescript/no-explicit-any
-        let DocumentComponent: any = null;
-        if (docFilePath) {
-          const docModule = (await runner.import(docFilePath)) as Record<string, unknown>;
-          DocumentComponent = docModule.default ?? null;
-        }
-
         // Expose page route patterns on window before hydration so the
         // next/navigation compat hooks can resolve a dynamic pattern from a
         // resolved path, matching the production client entry. Kept in its own
@@ -1587,6 +1682,7 @@ export function createSSRHandler(
         // Pages development cache boundary and font preload headers.
         const extraHeaders: Record<string, string | string[]> = {
           ...gsspExtraHeaders,
+          "Cache-Control": DEV_PAGES_CACHE_CONTROL,
         };
         if (typeof pageModule.getStaticProps === "function") {
           // Next's Pages handler never persists route responses in dev. It may
@@ -1613,9 +1709,10 @@ export function createSSRHandler(
         // Stream the page using progressive SSR.
         // The shell (layouts, non-suspended content) arrives immediately.
         // Suspense content streams in as it resolves.
-        await streamPageToResponse(res, withScriptNonce(element, scriptNonce), {
+        await streamPageToResponse(route.pattern, res, withScriptNonce(element, scriptNonce), {
           url,
           server,
+          runner,
           fontHeadHTML,
           assetHeadHTML,
           scripts: allScripts,
@@ -1693,8 +1790,8 @@ export function createSSRHandler(
         // when using ModuleRunner — no stack trace fixup is needed here.
         console.error(e);
         // Report error via instrumentation hook if registered
-        reportRequestError(
-          e instanceof Error ? e : new Error(String(e)),
+        await reportRequestError(
+          e,
           {
             path: url,
             method: req.method ?? "GET",
@@ -1702,18 +1799,24 @@ export function createSSRHandler(
               Object.entries(req.headers)
                 // Exclude HTTP/2 pseudo-headers (RFC 7540 §8.1.2.1) — they are
                 // not real request headers. See: cloudflare/vinext#2013
-                .filter(([k]) => !k.startsWith(":"))
-                .map(([k, v]) => [k, Array.isArray(v) ? v.join(", ") : String(v ?? "")]),
+                .filter(([k]) => !k.startsWith(":")),
             ),
           },
           {
             routerKind: "Pages Router",
             routePath: route.pattern,
             routeType: "render",
+            revalidateReason: isOnDemandRevalidateRequest(
+              Array.isArray(req.headers[PRERENDER_REVALIDATE_HEADER])
+                ? req.headers[PRERENDER_REVALIDATE_HEADER]?.[0]
+                : req.headers[PRERENDER_REVALIDATE_HEADER],
+            )
+              ? "on-demand"
+              : isStaticPropsRender
+                ? "stale"
+                : undefined,
           },
-        ).catch(() => {
-          /* ignore reporting errors */
-        });
+        );
         // Try to render custom 500 error page
         try {
           await renderErrorPage(
@@ -1768,10 +1871,16 @@ async function renderErrorPage(
     basePath: string;
     buildId?: string;
     clientTraceMetadata?: readonly string[];
+    pageLoaders?: PagesDevHydrationOptions["pageLoaders"];
+    hasMiddleware?: boolean;
+    clientMiddlewareMatcher?: unknown;
     locale?: string;
     locales?: string[];
     defaultLocale?: string;
     crossOrigin?: string;
+    trailingSlash?: boolean;
+    /** Pathname of the request before rewrites and locale stripping. */
+    requestPathname?: string;
     /** Original Pages route that produced this development-only notFound render. */
     notFoundSrcPage?: string;
   } = { basePath: "" },
@@ -1779,8 +1888,7 @@ async function renderErrorPage(
   attachPagesRequestCookies(req);
   const matcher = fileMatcher ?? createValidFileMatcher();
   // Try specific status page first, then _error, then fallback
-  const candidates =
-    statusCode === 404 ? ["404", "_error"] : statusCode === 500 ? ["500", "_error"] : ["_error"];
+  const candidates = statusCode === 404 ? ["404", "_error"] : ["_error"];
 
   for (const candidate of candidates) {
     // oxlint-disable-next-line typescript/no-explicit-any
@@ -1791,27 +1899,41 @@ async function renderErrorPage(
       errorAssetPath = findFileWithExts(pagesDir, candidate, matcher);
       if (!errorAssetPath && candidate !== "_error") continue;
 
-      const errorModule = await importModule(runner, errorAssetPath ?? "next/error");
+      const errorPage = candidate === "_error" ? "/_error" : `/${candidate}`;
+      const { errorModule, AppComponent, appAssetPath, DocumentComponent } =
+        await traceFindPageComponents(errorPage, async () => {
+          const errorModule = await importModule(runner, errorAssetPath ?? "next/error");
+          const appAssetPath = findFileWithExts(pagesDir, "_app", matcher);
+          const appModule = appAssetPath ? await importModule(runner, appAssetPath) : null;
+          const docFilePath = findFileWithExts(pagesDir, "_document", matcher);
+          const docModule = docFilePath ? await importModule(runner, docFilePath) : null;
+          return {
+            errorModule,
+            // oxlint-disable-next-line typescript/no-explicit-any
+            AppComponent: (appModule?.default ?? null) as any,
+            appAssetPath,
+            // oxlint-disable-next-line typescript/no-explicit-any
+            DocumentComponent: (docModule?.default ?? null) as any,
+          };
+        });
       candidateLoaded = true;
       const ErrorComponent = errorModule.default;
       if (!ErrorComponent) continue;
 
-      // Try to load _app.tsx to wrap the error page
-      // oxlint-disable-next-line typescript/no-explicit-any
-      let AppComponent: any = null;
-      const appAssetPath = findFileWithExts(pagesDir, "_app", matcher);
-      if (appAssetPath) {
-        const appModule = await importModule(runner, appAssetPath);
-        AppComponent = appModule.default ?? null;
-      }
-
       const createElement = React.createElement;
       res.statusCode = statusCode;
-      const errorPage = candidate === "_error" ? "/_error" : `/${candidate}`;
+      const renderUrl =
+        errorPage !== "/_error" && typeof errorModule.getStaticProps === "function"
+          ? resolvePagesStatusPageRenderPath(
+              errorPage,
+              context.trailingSlash === true,
+              context.requestPathname ?? url.split("?")[0],
+            )
+          : url;
       const errorRouter = {
         pathname: errorPage,
-        query: parseQuery(url),
-        asPath: url,
+        query: parseQuery(renderUrl),
+        asPath: renderUrl,
       };
       try {
         errorRouterShim = await importModule(runner, "next/router");
@@ -1832,7 +1954,7 @@ async function renderErrorPage(
         err,
         pathname: errorPage,
         query: errorRouter.query,
-        asPath: url,
+        asPath: renderUrl,
       });
       if (res.headersSent || res.writableEnded) return;
       let errorProps: Record<string, unknown> = { ...initialErrorProps, statusCode };
@@ -1840,12 +1962,14 @@ async function renderErrorPage(
         const isOnDemandRevalidate = isOnDemandRevalidateRequest(
           req.headers[PRERENDER_REVALIDATE_HEADER],
         );
-        const staticResult = await errorModule.getStaticProps({
-          locale: context.locale,
-          locales: context.locales,
-          defaultLocale: context.defaultLocale,
-          revalidateReason: isOnDemandRevalidate ? "on-demand" : "stale",
-        });
+        const staticResult = await tracePagesData("getStaticProps", errorPage, () =>
+          errorModule.getStaticProps({
+            locale: context.locale,
+            locales: context.locales,
+            defaultLocale: context.defaultLocale,
+            revalidateReason: isOnDemandRevalidate ? "on-demand" : "stale",
+          }),
+        );
         assertPages404DoesNotReturnNotFound(errorPage, staticResult);
         if (staticResult?.redirect) {
           applyDevPagesCacheHeaders(
@@ -1861,7 +1985,7 @@ async function renderErrorPage(
             {
               basePath: context.basePath,
               method: "getStaticProps",
-              routeUrl: url,
+              routeUrl: renderUrl,
             },
           );
           return;
@@ -1893,7 +2017,7 @@ async function renderErrorPage(
             err,
             pathname: errorPage,
             query: errorRouter.query,
-            asPath: url,
+            asPath: renderUrl,
           },
         });
         if (res.headersSent || res.writableEnded) return;
@@ -1909,16 +2033,6 @@ async function renderErrorPage(
           : appRenderProps;
       } else {
         renderProps = { pageProps: errorProps };
-      }
-
-      // Try custom _document (import the resolved file — the module runner
-      // does not apply custom resolve.extensions to extensionless ids)
-      // oxlint-disable-next-line typescript/no-explicit-any
-      let DocumentComponent: any = null;
-      const docFilePathErr = findFileWithExts(pagesDir, "_document", matcher);
-      if (docFilePathErr) {
-        const docModule = await importModule(runner, docFilePathErr);
-        DocumentComponent = docModule.default ?? null;
       }
 
       const createErrorElement = (
@@ -1966,13 +2080,18 @@ async function renderErrorPage(
         {
           props: renderProps,
           page: errorPage,
-          query: parseQuery(url),
+          query: parseQuery(renderUrl),
           buildId: context.buildId ?? process.env.__VINEXT_BUILD_ID ?? "development",
           isFallback: false,
+          locale: context.locale,
+          locales: context.locales,
+          defaultLocale: context.defaultLocale,
           notFoundSrcPage: context.notFoundSrcPage,
           __vinext: {
             pageModuleUrl: errorModuleUrl ?? undefined,
             appModuleUrl: appModuleUrl ?? undefined,
+            hasMiddleware: context.hasMiddleware,
+            clientMiddlewareMatcher: context.clientMiddlewareMatcher,
           },
         },
       )}</script>`;
@@ -1981,6 +2100,7 @@ async function renderErrorPage(
         forceRouterReady: true,
         normalizePageProps: false,
         pageModuleSource: errorModuleSource,
+        pageLoaders: context.pageLoaders,
         reactStrictMode: reactStrictMode === true,
         scriptNonce,
         setPagePatternsFromNextData: true,
@@ -1988,9 +2108,10 @@ async function renderErrorPage(
       const errorScripts = `${errorNextDataScript}\n${errorHydrationScript}`;
       if (statusCode === 404) stripDevPagesNotFoundFramingHeaders(res);
       if (DocumentComponent) {
-        await streamPageToResponse(res, element, {
+        await streamPageToResponse(errorPage, res, element, {
           url,
           server,
+          runner,
           fontHeadHTML: "",
           assetHeadHTML,
           scripts: errorScripts,
@@ -1999,8 +2120,8 @@ async function renderErrorPage(
           documentContext: {
             err,
             pathname: errorPage,
-            query: parseQuery(url),
-            asPath: url,
+            query: parseQuery(renderUrl),
+            asPath: renderUrl,
             req,
             res,
           },
@@ -2026,7 +2147,7 @@ async function renderErrorPage(
           preserveExistingContentType: statusCode === 404,
         });
       } else {
-        const bodyHtml = await renderToStringAsync(element);
+        const bodyHtml = await tracePagesDocument(errorPage, () => renderToStringAsync(element));
         const traceMetaHTML = getClientTraceMetadataHTML(context.clientTraceMetadata);
         const protectedAssetMarker = `data-vinext-document-asset-props-protected-${randomUUID()}`;
         const protectAssetTags = (assetHtml: string): string =>
@@ -2055,7 +2176,7 @@ async function renderErrorPage(
 </html>`;
         const transformedHtml = stripDocumentAssetPropsProtectionMarkers(
           applyDocumentAssetProps(
-            await server.transformIndexHtml(url, html),
+            await server.transformIndexHtml(toHtmlTransformPath(url), html),
             {},
             {
               configuredCrossOrigin: context.crossOrigin,

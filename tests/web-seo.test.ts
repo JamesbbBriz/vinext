@@ -1,8 +1,32 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createBenchmarkMetadata } from "../apps/web/app/benchmarks/metadata";
 import robots from "../apps/web/app/robots";
 import sitemap from "../apps/web/app/sitemap";
 import { addPreviewRobotsHeader, getCanonicalRedirect } from "../apps/web/worker/seo";
+
+vi.mock("../apps/web/app/blog/_source", () => ({
+  posts: [
+    { slug: "draft-post", date: "2026-10-10", draft: true },
+    { slug: "vinext-1-1", date: "2026-10-08", draft: false },
+    { slug: "vinext-1-0", date: "2026-09-28", updated: "2026-10-12", draft: false },
+  ],
+  // vinext-1-0 was edited after vinext-1-1 was published.
+  blogLastModified: "2026-10-12",
+  postPath: (post: { slug: string }) => `/blog/${post.slug}`,
+}));
+
+vi.mock("../apps/web/app/docs/_source", () => ({
+  docs: [
+    { slug: "" },
+    { slug: "getting-started" },
+    { slug: "getting-started/migrating" },
+    { slug: "deploying/cloudflare" },
+    { slug: "deploying/other-platforms" },
+    { slug: "guides/caching" },
+    { slug: "reference/differences" },
+    { slug: "reference/nextjs", external: "https://nextjs.org/docs/app" },
+  ],
+}));
 
 describe("vinext.dev SEO metadata", () => {
   it("builds canonical and social metadata for benchmark detail pages", () => {
@@ -37,7 +61,23 @@ describe("vinext.dev SEO metadata", () => {
       "https://vinext.dev",
       "https://vinext.dev/compatibility",
       "https://vinext.dev/benchmarks",
+      "https://vinext.dev/blog",
+      "https://vinext.dev/blog/vinext-1-1",
+      "https://vinext.dev/blog/vinext-1-0",
+      "https://vinext.dev/docs",
+      "https://vinext.dev/docs/getting-started",
+      "https://vinext.dev/docs/getting-started/migrating",
+      "https://vinext.dev/docs/deploying/cloudflare",
+      "https://vinext.dev/docs/deploying/other-platforms",
+      "https://vinext.dev/docs/guides/caching",
+      "https://vinext.dev/docs/reference/differences",
     ]);
+  });
+
+  it("dates the blog by its latest publish or edit, not its newest post", () => {
+    expect(sitemap().find(({ url }) => url === "https://vinext.dev/blog")?.lastModified).toBe(
+      "2026-10-12",
+    );
   });
 });
 

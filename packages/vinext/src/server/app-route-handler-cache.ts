@@ -1,6 +1,6 @@
 import type { NextI18nConfig } from "../config/next-config.js";
 import type { HeadersAccessPhase } from "vinext/shims/headers";
-import { isrCacheControl, type ISRCacheEntry } from "./isr-cache.js";
+import { isrCacheControl, resolveRouteExpireSeconds, type ISRCacheEntry } from "./isr-cache.js";
 import type { RouteHandlerMiddlewareContext } from "./app-route-handler-response.js";
 import {
   applyRouteHandlerMiddlewareContext,
@@ -9,9 +9,12 @@ import {
   buildRouteHandlerCachedResponse,
 } from "./app-route-handler-response.js";
 import { markKnownDynamicAppRoute } from "./app-route-handler-runtime.js";
+import { resolveAppRouteHandlerSpecialError } from "./app-route-handler-policy.js";
 import { makeThenableParams } from "vinext/shims/thenable-params";
 import {
+  completeAppRouteHandlerResponse,
   runAppRouteHandler,
+  traceAppRouteHandlerExecution,
   type AppRouteDebugLogger,
   type AppRouteDynamicUsageFn,
   type AppRouteHandlerFunction,
@@ -35,6 +38,7 @@ type ReadAppRouteHandlerCacheOptions = {
   handlerFn: AppRouteHandlerFunction;
   i18n?: NextI18nConfig | null;
   trailingSlash?: boolean;
+  skipTrailingSlashRedirect?: boolean;
   isAutoHead: boolean;
   appendResponseLink?: boolean;
   isrDebug?: AppRouteDebugLogger;
@@ -106,33 +110,59 @@ export async function readAppRouteHandlerCacheResponse(
       const staleValue = cachedValue;
       const revalidateSearchParams = new URLSearchParams(options.revalidateSearchParams);
 
-      options.scheduleBackgroundRegeneration(routeKey, async () => {
-        await options.runInRevalidationContext(async () => {
+      options.scheduleBackgroundRegeneration(routeKey, () =>
+        options.runInRevalidationContext(async () => {
           options.setNavigationContext({
             pathname: options.cleanPathname,
             searchParams: revalidateSearchParams,
             params: options.params ?? EMPTY_PARAMS,
           });
 
-          const { dynamicUsedInHandler, response } = await runAppRouteHandler({
-            basePath: options.basePath,
-            consumeDynamicUsage: options.consumeDynamicUsage,
-            dynamicConfig: options.dynamicConfig,
-            handlerFn: options.handlerFn,
-            i18n: options.i18n,
-            trailingSlash: options.trailingSlash,
-            markDynamicUsage: options.markDynamicUsage,
-            params: options.params === null ? null : makeThenableParams(options.params),
-            request: new Request(options.requestUrl, { method: "GET" }),
-            routePattern: options.routePattern,
-            setHeadersAccessPhase: options.setHeadersAccessPhase,
-          });
+          let tracedResult:
+            | { handlerResult: Awaited<ReturnType<typeof runAppRouteHandler>> }
+            | { specialError: unknown };
+          try {
+            tracedResult = await traceAppRouteHandlerExecution(options.routePattern, async () => {
+              try {
+                return {
+                  handlerResult: await runAppRouteHandler({
+                    basePath: options.basePath,
+                    consumeDynamicUsage: options.consumeDynamicUsage,
+                    dynamicConfig: options.dynamicConfig,
+                    handlerFn: options.handlerFn,
+                    i18n: options.i18n,
+                    trailingSlash: options.trailingSlash,
+                    skipTrailingSlashRedirect: options.skipTrailingSlashRedirect,
+                    markDynamicUsage: options.markDynamicUsage,
+                    params: options.params === null ? null : makeThenableParams(options.params),
+                    request: new Request(options.requestUrl, { method: "GET" }),
+                    routePattern: options.routePattern,
+                    setHeadersAccessPhase: options.setHeadersAccessPhase,
+                  }),
+                };
+              } catch (error) {
+                if (resolveAppRouteHandlerSpecialError(error, options.requestUrl)) {
+                  return { specialError: error };
+                }
+                throw error;
+              }
+            });
+          } finally {
+            options.setNavigationContext(null);
+          }
+          if ("specialError" in tracedResult) return;
 
-          options.setNavigationContext(null);
+          const { dynamicUsedInHandler, response, didAccessDynamicRequest } =
+            tracedResult.handlerResult;
           assertSupportedAppRouteHandlerResponse(response);
 
-          if (dynamicUsedInHandler) {
-            markKnownDynamicAppRoute(options.routePattern);
+          const completed = await completeAppRouteHandlerResponse(response);
+          const lateDynamicUsage = options.consumeDynamicUsage();
+          const becameDynamic =
+            dynamicUsedInHandler || lateDynamicUsage || didAccessDynamicRequest();
+          if (!completed.completed || becameDynamic || response.headers.has("set-cookie")) {
+            void completed.response.body?.cancel().catch(() => {});
+            if (becameDynamic) markKnownDynamicAppRoute(options.routePattern);
             options.isrDebug?.("route regen skipped (dynamic usage)", options.cleanPathname);
             return;
           }
@@ -141,16 +171,25 @@ export async function readAppRouteHandlerCacheResponse(
             options.cleanPathname,
             options.getCollectedFetchTags(),
           );
-          const routeCacheValue = await buildAppRouteCacheValue(response);
+          const routeCacheValue = await buildAppRouteCacheValue(
+            completed.response,
+            response.headers.get("Cache-Control") ?? undefined,
+          );
           await options.isrSet(routeKey, routeCacheValue, {
-            cacheControl: isrCacheControl(options.revalidateSeconds, {
-              expireSeconds: options.expireSeconds,
-            }),
+            cacheControl: isrCacheControl(
+              options.revalidateSeconds === Infinity ? false : options.revalidateSeconds,
+              {
+                expireSeconds: resolveRouteExpireSeconds(
+                  options.revalidateSeconds,
+                  options.expireSeconds,
+                ),
+              },
+            ),
             tags: routeTags,
           });
           options.isrDebug?.("route regen complete", routeKey);
-        });
-      });
+        }),
+      );
 
       options.isrDebug?.("STALE (route)", options.cleanPathname);
       options.clearRequestContext();

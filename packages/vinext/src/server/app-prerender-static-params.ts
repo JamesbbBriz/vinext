@@ -1,15 +1,29 @@
 import { pickRootParams, runWithRootParamsScope, type RootParams } from "vinext/shims/root-params";
 import { isUnknownRecord } from "../utils/record.js";
+import { shareIsolatePromise } from "./isolate-shared-promise.js";
 
 type GenerateStaticParamsFunction = (input: { params: RootParams }) => unknown;
 
-const PRERENDER_PATH_DISCOVERY_ENV = "__VINEXT_PRERENDER_PATH_DISCOVERY";
+/**
+ * A prerender resolver's input. `rejectEmptyResults` is set where Next.js
+ * fails the build on any generateStaticParams that returns no params
+ * (`output: "export"`, Cache Components), so the resolver hands the empty
+ * result back for the caller to reject instead of passing parents through.
+ */
+type AppPrerenderStaticParamsResolverInput = {
+  params: RootParams;
+  rejectEmptyResults?: boolean;
+};
 
-function invalidGenerateStaticParamsResult(message: string): [] {
-  if (process.env[PRERENDER_PATH_DISCOVERY_ENV] === "1") {
-    throw new Error(message);
-  }
-  return [];
+type AppPrerenderStaticParamsResolver = (input: AppPrerenderStaticParamsResolverInput) => unknown;
+
+/**
+ * Next.js rejects malformed generateStaticParams output in every mode
+ * (build/static-paths/app.ts callGenerateStaticParams), so it must never read
+ * as an empty result that later providers continue from.
+ */
+function invalidGenerateStaticParamsResult(message: string): never {
+  throw new Error(message);
 }
 
 /**
@@ -57,7 +71,7 @@ function isRootParams(value: unknown): value is RootParams {
 export function createAppPrerenderStaticParamsResolver(
   sources: readonly unknown[],
   rootParamNames?: readonly string[],
-): GenerateStaticParamsFunction | null {
+): AppPrerenderStaticParamsResolver | null {
   // A source is usable if it is an eager generateStaticParams function or a
   // lazy `{ load }` page source. Keep them in their original order so the
   // composition order does not depend on the emitter happening to append
@@ -73,27 +87,30 @@ export function createAppPrerenderStaticParamsResolver(
   // Resolve lazy page modules once, on first invocation (prerender time), and
   // memoize the combined function list. Dedup concurrent callers. Resolution
   // preserves `sources` order: each source maps to its eager function or its
-  // awaited lazy function, then non-functions are dropped.
+  // awaited lazy function, then non-functions are dropped. The request that
+  // starts the shared resolution stays alive until it settles.
   let resolvedFns: GenerateStaticParamsFunction[] | null = null;
   let resolvePromise: Promise<GenerateStaticParamsFunction[]> | null = null;
   const resolveFns = (): Promise<GenerateStaticParamsFunction[]> => {
     if (resolvedFns) return Promise.resolve(resolvedFns);
     if (!resolvePromise) {
-      resolvePromise = (async () => {
-        const maybeFns = await Promise.all(
-          usableSources.map(async (source) => {
-            if (isGenerateStaticParamsFunction(source)) return source;
-            const mod = await source.load();
-            const fn =
-              mod && typeof mod === "object"
-                ? (mod as { generateStaticParams?: unknown }).generateStaticParams
-                : undefined;
-            return isGenerateStaticParamsFunction(fn) ? fn : null;
-          }),
-        );
-        resolvedFns = maybeFns.filter((fn): fn is GenerateStaticParamsFunction => fn !== null);
-        return resolvedFns;
-      })();
+      resolvePromise = shareIsolatePromise(
+        (async () => {
+          const maybeFns = await Promise.all(
+            usableSources.map(async (source) => {
+              if (isGenerateStaticParamsFunction(source)) return source;
+              const mod = await source.load();
+              const fn =
+                mod && typeof mod === "object"
+                  ? (mod as { generateStaticParams?: unknown }).generateStaticParams
+                  : undefined;
+              return isGenerateStaticParamsFunction(fn) ? fn : null;
+            }),
+          );
+          resolvedFns = maybeFns.filter((fn): fn is GenerateStaticParamsFunction => fn !== null);
+          return resolvedFns;
+        })(),
+      );
     }
     return resolvePromise;
   };
@@ -113,7 +130,7 @@ export function createAppPrerenderStaticParamsResolver(
       // how many sources were composed.
       const picked = filterRootParams(input.params);
       return runWithRootParamsScope(picked, async () => {
-        const result = await single(input);
+        const result = await single({ params: input.params });
         if (!Array.isArray(result)) {
           return invalidGenerateStaticParamsResult("generateStaticParams must return an array");
         }
@@ -128,12 +145,16 @@ export function createAppPrerenderStaticParamsResolver(
       });
     }
 
-    let paramSets: RootParams[] = [input.params];
+    // As in Next.js (build/static-paths/app.ts generateRouteStaticParams), a
+    // source that returns no params passes each parent set through unchanged,
+    // and while no parent sets exist the next source is called once with `{}`.
+    let paramSets: RootParams[] = Object.keys(input.params).length > 0 ? [input.params] : [];
 
     for (const generateStaticParams of fns) {
       const nextParamSets: RootParams[] = [];
+      const hasParentSets = paramSets.length > 0;
 
-      for (const parentParams of paramSets) {
+      for (const parentParams of hasParentSets ? paramSets : [{}]) {
         const rootScope = filterRootParams(parentParams);
 
         const result = await runWithRootParamsScope(rootScope, async () =>
@@ -142,6 +163,11 @@ export function createAppPrerenderStaticParamsResolver(
 
         if (!Array.isArray(result)) {
           return invalidGenerateStaticParamsResult("generateStaticParams must return an array");
+        }
+        if (result.length === 0) {
+          if (input.rejectEmptyResults) return [];
+          if (hasParentSets) nextParamSets.push(parentParams);
+          continue;
         }
 
         for (const item of result) {
@@ -162,9 +188,10 @@ export function createAppPrerenderStaticParamsResolver(
 }
 
 type CallAppPrerenderStaticParamsOptions = {
-  fn: GenerateStaticParamsFunction;
+  fn: AppPrerenderStaticParamsResolver;
   params: RootParams;
   pattern: string;
+  rejectEmptyResults?: boolean;
   rootParamNamesByPattern: Record<string, readonly string[] | undefined>;
 };
 
@@ -172,5 +199,11 @@ export async function callAppPrerenderStaticParams(
   options: CallAppPrerenderStaticParamsOptions,
 ): Promise<unknown> {
   const picked = pickRootParams(options.params, options.rootParamNamesByPattern[options.pattern]);
-  return runWithRootParamsScope(picked, () => options.fn({ params: options.params }));
+  return runWithRootParamsScope(picked, () =>
+    options.fn(
+      options.rejectEmptyResults
+        ? { params: options.params, rejectEmptyResults: true }
+        : { params: options.params },
+    ),
+  );
 }

@@ -139,6 +139,12 @@
       "p75Ms": 308,
       "samples": 5
     },
+    "tests/app-search-params-gate-production.test.ts": {
+      "estimateMs": 19610,
+      "medianMs": 19610,
+      "p75Ms": 19610,
+      "samples": 1
+    },
     "tests/cjs.test.ts": {
       "estimateMs": 6446,
       "medianMs": 6398,
@@ -390,6 +396,12 @@
       "medianMs": 3935,
       "p75Ms": 4043,
       "samples": 5
+    },
+    "tests/pages-router-nitro.test.ts": {
+      "estimateMs": 2083,
+      "medianMs": 2083,
+      "p75Ms": 2083,
+      "samples": 1
     },
     "tests/pages-router.test.ts": {
       "estimateMs": 42026,

@@ -9,6 +9,7 @@ import {
 import { DEFAULT_GLOBAL_ERROR_MODULE } from "./default-global-error-module.js";
 import { DEFAULT_GLOBAL_NOT_FOUND_MODULE } from "./default-global-not-found-module.js";
 import { DEFAULT_NOT_FOUND_MODULE } from "./default-not-found-module.js";
+import { shareIsolatePromise } from "./isolate-shared-promise.js";
 import type { AppPageFontPreload } from "./app-page-execution.js";
 import type { AppPageMiddlewareContext } from "./app-page-response.js";
 import type { AppPageSsrHandler } from "./app-page-stream.js";
@@ -18,6 +19,7 @@ import type { ApplyAppPageFileBasedMetadata } from "./app-page-head.js";
 import type { AppPageInterceptOptions } from "./app-page-element-builder.js";
 import { shouldServeStreamingMetadata } from "./streaming-metadata.js";
 import { runOutsideRequestScopes } from "vinext/shims/internal/als-registry";
+import type { AppRenderErrorContextOverrides } from "./app-rsc-error-handler.js";
 
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any
 type AppPageComponent = import("react").ComponentType<any>;
@@ -51,6 +53,7 @@ type AppFallbackRendererOptions<TModule extends AppPageModule = AppPageModule> =
     request: Request,
     pathname: string,
     routePath: string,
+    overrides?: AppRenderErrorContextOverrides,
   ) => AppPageBoundaryOnError;
   fontProviders: AppFallbackRendererFontProviders;
   getAndClearPendingCookies?: () => string[];
@@ -136,6 +139,8 @@ type AppFallbackRenderer<TModule extends AppPageModule = AppPageModule> = {
       boundaryComponent?: AppPageComponent | null;
       boundaryModule?: TModule | null;
       intercept?: AppPageInterceptOptions<TModule> | null;
+      /** The document may be stored, so it must not carry the request's query. */
+      isCacheCandidate?: boolean;
       layouts?: readonly (TModule | null | undefined)[] | null;
       matchedParams?: AppPageParams;
     },
@@ -218,8 +223,8 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
   function resolveGlobalNotFoundModule(): Promise<TModule | null | undefined> | null {
     if (!loadGlobalNotFoundModule) return null;
     if (globalNotFoundModulePromise === null) {
-      globalNotFoundModulePromise = runOutsideRequestScopes(() =>
-        Promise.resolve().then(loadGlobalNotFoundModule),
+      globalNotFoundModulePromise = shareIsolatePromise(
+        runOutsideRequestScopes(() => Promise.resolve().then(loadGlobalNotFoundModule)),
       );
     }
     return globalNotFoundModulePromise;
@@ -267,8 +272,8 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
             boundaryModule: globalNotFoundModule ?? null,
             buildFontLinkHeader: fontProviders.buildFontLinkHeader,
             clearRequestContext,
-            createRscOnErrorHandler(pathname, routePath) {
-              return buildRscOnErrorHandler(request, pathname, routePath);
+            createRscOnErrorHandler(pathname, routePath, overrides) {
+              return buildRscOnErrorHandler(request, pathname, routePath, overrides);
             },
             getFontLinks: fontProviders.getFontLinks,
             getFontPreloads: fontProviders.getFontPreloads,
@@ -313,8 +318,8 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
         boundaryModule: opts?.boundaryModule ?? null,
         buildFontLinkHeader: fontProviders.buildFontLinkHeader,
         clearRequestContext,
-        createRscOnErrorHandler(pathname, routePath) {
-          return buildRscOnErrorHandler(request, pathname, routePath);
+        createRscOnErrorHandler(pathname, routePath, overrides) {
+          return buildRscOnErrorHandler(request, pathname, routePath, overrides);
         },
         getFontLinks: fontProviders.getFontLinks,
         getFontPreloads: fontProviders.getFontPreloads,
@@ -323,6 +328,7 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
         getNavigationContext,
         globalErrorModule: effectiveGlobalErrorModule,
         intercept: opts?.intercept ?? null,
+        isCacheCandidate: opts?.isCacheCandidate,
         isEdgeRuntime: callContext?.isEdgeRuntime,
         isRscRequest,
         layoutModules: useGlobalNotFound ? [] : (opts?.layouts ?? null),
@@ -387,8 +393,8 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
         trailingSlash,
         buildFontLinkHeader: fontProviders.buildFontLinkHeader,
         clearRequestContext,
-        createRscOnErrorHandler(pathname, routePath) {
-          return buildRscOnErrorHandler(request, pathname, routePath);
+        createRscOnErrorHandler(pathname, routePath, overrides) {
+          return buildRscOnErrorHandler(request, pathname, routePath, overrides);
         },
         error,
         errorOrigin,

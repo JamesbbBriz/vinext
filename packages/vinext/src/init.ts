@@ -7,7 +7,8 @@
  *   2. Add "type": "module" to package.json
  *   3. Rename CJS config files to .cjs
  *   4. Add vinext scripts to package.json
- *   5. Generate vite.config.ts and platform files
+ *   5. Generate vite.config.ts and platform files, plus a Tailwind PostCSS
+ *      config when Tailwind is only set up as a Turbopack loader
  *   6. Update .gitignore to include /dist/ and .vinext/
  *   7. Install dependencies (vite, @vitejs/plugin-react, and App Router deps)
  *   8. Print summary
@@ -17,7 +18,7 @@
  */
 
 import fs from "node:fs";
-import path from "pathslash";
+import path, { toSlash } from "pathslash";
 import { spawn, spawnSync } from "node:child_process";
 import {
   detectProject,
@@ -29,11 +30,16 @@ import {
   hasViteConfig,
 } from "./utils/project.js";
 import {
+  cssModulesConfigSource,
+  compactResourceName,
+  findConfigKeepingWorkerName,
   setupCloudflarePlatform,
+  updateViteConfigForCssModules,
   usesCommonJsViteConfig,
   validateCloudflarePlatformSetup,
 } from "./init-cloudflare.js";
 import type { CloudflareInitOptions, InitPlatform } from "./init-platform.js";
+import { getPluginReactUpgradeDeps } from "./utils/plugin-react-version.js";
 import { getReactUpgradeDeps } from "./utils/react-version.js";
 
 export { getReactUpgradeDeps } from "./utils/react-version.js";
@@ -93,6 +99,8 @@ export type InitOptions = {
   port?: number | false;
   /** Skip the compatibility check step */
   skipCheck?: boolean;
+  /** @internal — skip CSS Modules migration in the Next.js deploy harness. */
+  skipCssModules?: boolean;
   /** Force overwrite even if vite.config.ts exists */
   force?: boolean;
   /** Deployment target selected by the user */
@@ -123,7 +131,7 @@ type InitResult = {
   addedTypeModule: boolean;
   /** CJS config files that were renamed ([old, new] pairs) */
   renamedConfigs: Array<[string, string]>;
-  /** Whether scripts were added to package.json */
+  /** Scripts added to package.json or migrated from older generated values */
   addedScripts: string[];
   /** Whether vite.config.ts was generated */
   generatedViteConfig: boolean;
@@ -139,28 +147,178 @@ type InitResult = {
 
 // ─── Vite Config Generation (minimal, non-Cloudflare) ────────────────────────
 
-export function generateViteConfig(_isAppRouter: boolean, prerender = false): string {
+export function generateViteConfig(
+  _isAppRouter: boolean,
+  prerender = false,
+  hasCssModules = false,
+): string {
   const vinextCall = prerender ? `vinext({ prerender: { routes: "*" } })` : "vinext()";
   return `import vinext from "vinext";
-import { defineConfig } from "vite";
+import { defineConfig } from "vite";${hasCssModules ? '\nimport { createHash } from "node:crypto";\nimport path from "node:path";\nimport { patchCssModules } from "vite-css-modules";' : ""}
 
 export default defineConfig({
-  plugins: [${vinextCall}],
+  plugins: [${hasCssModules ? 'patchCssModules({ exportMode: "default" }), ' : ""}${vinextCall}],${hasCssModules ? cssModulesConfigSource() : ""}
 });
 `;
+}
+
+const CSS_MODULE_GLOBS = [
+  "**/*.module.{css,scss,sass}",
+  "**/.*.module.{css,scss,sass}",
+  "**/.*/**/*.module.{css,scss,sass}",
+  "**/.*/**/.*.module.{css,scss,sass}",
+];
+const CSS_MODULE_IGNORES = new Set([
+  "node_modules",
+  ".git",
+  ".next",
+  ".vinext",
+  ".wrangler",
+  ".cloudflare",
+]);
+const CSS_MODULE_ROOT_IGNORES = new Set(["dist", "out", "build", "coverage"]);
+
+export function scanCssModuleFiles(root: string): boolean {
+  const canonicalRoot = path.resolve(root);
+  return fs
+    .globSync(CSS_MODULE_GLOBS, {
+      cwd: root,
+      withFileTypes: true,
+      exclude: (entry) =>
+        entry.isDirectory() &&
+        (CSS_MODULE_IGNORES.has(entry.name) ||
+          (toSlash(entry.parentPath) === canonicalRoot && CSS_MODULE_ROOT_IGNORES.has(entry.name))),
+    })
+    .some((entry) => /\.module\.(css|scss|sass)$/.test(entry.name));
+}
+
+// ─── Tailwind CSS via PostCSS ────────────────────────────────────────────────
+
+const NEXT_CONFIG_FILES = [
+  "next.config.ts",
+  "next.config.mts",
+  "next.config.mjs",
+  "next.config.js",
+  "next.config.cjs",
+];
+const TAILWIND_LOADERS = ["@tailwindcss/turbopack", "@tailwindcss/webpack"];
+
+const TAILWIND_POSTCSS_CONFIG = `const config = {
+  plugins: {
+    "@tailwindcss/postcss": {},
+  },
+};
+
+export default config;
+`;
+
+/**
+ * Whether the project gets Tailwind from a Turbopack loader (as create-next-app
+ * 16.4+ sets up in `turbopack.rules`) rather than from PostCSS, which is the
+ * only way vinext compiles Tailwind. The config is not evaluated: a Next config
+ * that names the loader, or a declared loader package, is enough.
+ */
+function usesTailwindTurbopackLoader(root: string): boolean {
+  for (const file of NEXT_CONFIG_FILES) {
+    const configPath = path.join(root, file);
+    if (!fs.existsSync(configPath)) continue;
+    const source = fs.readFileSync(configPath, "utf-8");
+    if (TAILWIND_LOADERS.some((loader) => source.includes(loader))) return true;
+  }
+  return TAILWIND_LOADERS.some((loader) => isDepInstalled(root, loader));
+}
+
+// postcss-load-config's search order, as Vite uses it; package.json counts
+// only when it has a `postcss` field.
+const POSTCSS_CONFIG_SEARCH_ORDER = [
+  ".postcssrc",
+  ".postcssrc.json",
+  ".postcssrc.yaml",
+  ".postcssrc.yml",
+  ".postcssrc.ts",
+  ".postcssrc.cts",
+  ".postcssrc.mts",
+  ".postcssrc.js",
+  ".postcssrc.cjs",
+  ".postcssrc.mjs",
+  "postcss.config.ts",
+  "postcss.config.cts",
+  "postcss.config.mts",
+  "postcss.config.js",
+  "postcss.config.cjs",
+  "postcss.config.mjs",
+];
+
+/** The source of the PostCSS config Vite would load, which init never replaces. */
+function readPostcssConfig(root: string): string | undefined {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf-8"));
+    // Like the loader, skip falsy values.
+    if (pkg.postcss) return JSON.stringify(pkg.postcss);
+  } catch {
+    // An unreadable package.json has no PostCSS config.
+  }
+  for (const file of POSTCSS_CONFIG_SEARCH_ORDER) {
+    const configPath = path.join(root, file);
+    if (!fs.existsSync(configPath)) continue;
+    // Like the loader, skip blank config files.
+    const source = fs.readFileSync(configPath, "utf-8");
+    if (source.trim() !== "") return source;
+  }
+  return undefined;
+}
+
+/**
+ * How init sets Tailwind up for vinext when Next.js gets it from a Turbopack
+ * loader. Next.js runs PostCSS after that loader, on CSS Tailwind has already
+ * compiled, so adding the PostCSS config leaves Next's output unchanged.
+ *
+ * - `generate`: write `postcss.config.mjs` and install `@tailwindcss/postcss`.
+ * - `install`: the config already uses `@tailwindcss/postcss` (for example
+ *   the one an earlier run generated before its install failed), so only the
+ *   package may be missing.
+ * - `manual`: the config in effect does not mention Tailwind. Init leaves it
+ *   alone and asks the user to set Tailwind up.
+ * - `none`: no Turbopack loader, or Tailwind is already handled.
+ *
+ * Pass `viteConfigPath` only when init keeps that Vite config.
+ */
+type TailwindPostcssSetup = "generate" | "install" | "manual" | "none";
+
+function getTailwindPostcssSetup(root: string, viteConfigPath?: string): TailwindPostcssSetup {
+  if (!usesTailwindTurbopackLoader(root)) return "none";
+  const viteConfig = viteConfigPath ? fs.readFileSync(viteConfigPath, "utf-8") : "";
+  // Vite ignores PostCSS config files when its config sets `css.postcss` or the
+  // Lightning CSS transformer, and a Vite config that mentions Tailwind (e.g.
+  // `@tailwindcss/vite`) handles it there.
+  const config = /postcss|lightningcss|tailwindcss/.test(viteConfig)
+    ? viteConfig
+    : readPostcssConfig(root);
+  if (config === undefined) return "generate";
+  // Lightning CSS replaces PostCSS whatever the PostCSS options say.
+  if (/lightningcss/.test(config) && !config.includes("@tailwindcss/vite")) return "manual";
+  if (config.includes("@tailwindcss/postcss")) return "install";
+  return config.includes("tailwindcss") ? "none" : "manual";
 }
 
 // ─── Script Addition ─────────────────────────────────────────────────────────
 
 /**
- * Add vinext scripts to package.json without overwriting existing scripts.
- * Returns the list of script names that were added.
+ * Add Vite scripts to package.json without overwriting custom scripts.
+ * Exact scripts generated by older vinext versions are migrated in place.
+ * Returns the list of script names that were added or migrated.
  */
 export function addScripts(
   root: string,
-  port: number | false,
+  port?: number | false,
   platform: InitPlatform = "node",
-  options: { warmCdnCache?: boolean; scriptNames?: "namespaced" | "standard" } = {},
+  options: {
+    deployResponseStore?: boolean;
+    warmCdnCache?: boolean;
+    legacyWrangler?: boolean;
+    scriptNames?: "namespaced" | "standard";
+    workerName?: string;
+  } = {},
 ): string[] {
   const pkgPath = path.join(root, "package.json");
   if (!fs.existsSync(pkgPath)) return [];
@@ -174,29 +332,64 @@ export function addScripts(
     }
 
     const added: string[] = [];
-    const addScript = (name: string, command: string) => {
+    const addScript = (
+      name: string,
+      command: string,
+      legacyCommands: Array<string | RegExp> = [],
+    ) => {
       const scriptName = options.scriptNames === "standard" ? name : `${name}:vinext`;
-      if (pkg.scripts[scriptName]) return;
+      const existing = pkg.scripts[scriptName];
+      if (
+        existing &&
+        !legacyCommands.some((legacy) =>
+          typeof legacy === "string" ? existing === legacy : legacy.test(existing),
+        )
+      ) {
+        return;
+      }
+      if (existing === command) return;
       pkg.scripts[scriptName] = command;
       added.push(scriptName);
     };
 
-    addScript("dev", port === false ? "vinext dev" : `vinext dev --port ${port}`);
-    addScript("build", "vinext build");
+    const devScriptName = options.scriptNames === "standard" ? "dev" : "dev:vinext";
+    const legacyDevScript = pkg.scripts[devScriptName];
+    const devCommand =
+      port === undefined &&
+      typeof legacyDevScript === "string" &&
+      /^vinext dev(?: --port \d+)?$/.test(legacyDevScript)
+        ? legacyDevScript.replace(/^vinext /, "vite ")
+        : port === false
+          ? "vite dev"
+          : `vite dev --port ${port ?? 3001}`;
+    addScript("dev", devCommand, ["vinext dev", /^vinext dev --port \d+$/]);
+    addScript("build", "vite build", ["vinext build"]);
     addScript(
       "start",
       platform === "cloudflare"
-        ? "wrangler dev --config dist/server/wrangler.json"
+        ? !options.legacyWrangler
+          ? "vite preview"
+          : "wrangler dev --config dist/server/wrangler.json"
         : "vinext start",
     );
 
     if (platform === "cloudflare") {
       addScript(
         "deploy",
-        options.warmCdnCache
-          ? "vinext-cloudflare deploy --config dist/server/wrangler.json --experimental-warm-cdn-cache"
-          : "vinext-cloudflare deploy --config dist/server/wrangler.json",
+        !options.legacyWrangler
+          ? options.warmCdnCache
+            ? "vinext-cloudflare deploy --warm-cache"
+            : "vinext-cloudflare deploy"
+          : options.warmCdnCache
+            ? "vinext-cloudflare deploy --config dist/server/wrangler.json --warm-cache"
+            : "vinext-cloudflare deploy --config dist/server/wrangler.json",
       );
+      if (options.deployResponseStore && !pkg.scripts["deploy:response-store"]) {
+        pkg.scripts["deploy:response-store"] = !options.legacyWrangler
+          ? `cf deploy --prebuilt --mode production --worker ${compactResourceName(options.workerName ?? detectProject(root).projectName, "-response-store", 63)}`
+          : "wrangler deploy --config wrangler.response-store.jsonc";
+        added.push("deploy:response-store");
+      }
     }
 
     if (added.length > 0) {
@@ -219,6 +412,9 @@ export type InitDependencyGroups = {
 export function getInitDependencyGroups(
   isAppRouter: boolean,
   platform: InitPlatform,
+  cloudflare?: CloudflareInitOptions,
+  hasCssModules = false,
+  tailwindPostcss = false,
 ): InitDependencyGroups {
   const dependencies = ["vinext"];
   const devDependencies = ["vite", "@vitejs/plugin-react"];
@@ -228,13 +424,32 @@ export function getInitDependencyGroups(
   }
   if (platform === "cloudflare") {
     dependencies.push("@vinext/cloudflare");
-    devDependencies.push("@cloudflare/vite-plugin", "wrangler");
+    if (
+      cloudflare?.cdnCache === "response-store" &&
+      (cloudflare.responseStoreMode ?? "service-binding") === "service-binding"
+    ) {
+      dependencies.push("@cloudflare/workers-response-store");
+    }
+    if (!cloudflare?.legacyWrangler) {
+      devDependencies[0] = "vite@8.3.0";
+      // V2 SHA prereleases are not chronological semver versions; follow the beta tag.
+      devDependencies.push("@cloudflare/vite-plugin@beta", "cf@latest");
+    } else {
+      devDependencies.push("@cloudflare/vite-plugin@1", "wrangler");
+    }
   }
+  if (hasCssModules) devDependencies.push("vite-css-modules", "postcss");
+  if (tailwindPostcss) devDependencies.push("@tailwindcss/postcss");
   return { dependencies, devDependencies };
 }
 
-export function getInitDeps(isAppRouter: boolean, platform: InitPlatform): string[] {
-  const groups = getInitDependencyGroups(isAppRouter, platform);
+export function getInitDeps(
+  isAppRouter: boolean,
+  platform: InitPlatform,
+  cloudflare?: CloudflareInitOptions,
+  hasCssModules = false,
+): string[] {
+  const groups = getInitDependencyGroups(isAppRouter, platform, cloudflare, hasCssModules);
   return [...groups.dependencies, ...groups.devDependencies];
 }
 
@@ -248,7 +463,8 @@ export function isDepInstalled(root: string, dep: string): boolean {
       ...pkg.devDependencies,
       ...pkg.peerDependencies,
     };
-    return dep in allDeps;
+    const { name, version, hasExplicitVersion } = parseDependencySpecifier(dep);
+    return name in allDeps && (!hasExplicitVersion || allDeps[name] === version);
   } catch {
     return false;
   }
@@ -327,7 +543,7 @@ function addDependencyEntries(root: string, deps: string[], { dev }: { dev: bool
  * Check if react/react-dom need upgrading for react-server-dom-webpack compatibility.
  *
  * react-server-dom-webpack versions are pinned to match their React version
- * (e.g. rsdw@19.2.6 requires react@^19.2.6). When a project has an older
+ * (e.g. rsdw@19.3.1 requires react@^19.3.1). When a project has an older
  * React (e.g. create-next-app ships react@19.2.3), we need to upgrade
  * react/react-dom BEFORE installing rsdw to avoid peer-dep conflicts.
  *
@@ -351,7 +567,7 @@ async function installDeps(
   const baseCmd = detectPackageManager(root);
   // Strip " -D" for non-dev installs (keeps deps in "dependencies", not "devDependencies")
   const installCmd = dev ? baseCmd : baseCmd.replace(/ -D$/, "");
-  const depsStr = deps.join(" ");
+  const depsStr = deps.map((dep) => JSON.stringify(dep)).join(" ");
 
   return (
     (await exec(`${installCmd} ${depsStr}`, {
@@ -368,7 +584,11 @@ async function installDeps(
  * Creates the file if it doesn't exist. Returns true if the file was modified
  * (or created), false if all entries were already present.
  */
-export function updateGitignore(root: string, platform: InitPlatform = "node"): boolean {
+export function updateGitignore(
+  root: string,
+  platform: InitPlatform = "node",
+  legacyWrangler = false,
+): boolean {
   const gitignorePath = path.join(root, ".gitignore");
   const entries = [
     {
@@ -379,11 +599,19 @@ export function updateGitignore(root: string, platform: InitPlatform = "node"): 
       entry: ".vinext/",
       coveredBy: new Set(["/.vinext/", "/.vinext", ".vinext/", ".vinext"]),
     },
-    ...(platform === "cloudflare"
+    ...(platform === "cloudflare" && legacyWrangler
       ? [
           {
             entry: ".wrangler/",
             coveredBy: new Set(["/.wrangler/", "/.wrangler", ".wrangler/", ".wrangler"]),
+          },
+        ]
+      : []),
+    ...(platform === "cloudflare" && !legacyWrangler
+      ? [
+          {
+            entry: ".cloudflare/",
+            coveredBy: new Set(["/.cloudflare/", "/.cloudflare", ".cloudflare/", ".cloudflare"]),
           },
         ]
       : []),
@@ -410,13 +638,103 @@ export function updateGitignore(root: string, platform: InitPlatform = "node"): 
   return true;
 }
 
+/**
+ * Read `output` from the Next.js config as `vinext build` does: an inline
+ * `vinext({ nextConfig })` in the Vite config wins over next.config, and both
+ * are evaluated with NODE_ENV set to production and `.env.production` loaded as
+ * the build loads it. The Vite config is read as written, without running
+ * plugin `config` hooks, so a plugin that changes `root`, `envDir` or `mode` is
+ * not seen. A config that cannot load here keeps the Worker-first default.
+ * The loader is imported lazily because it needs Vite, which create-vinext-app
+ * runs without.
+ */
+async function resolvesToStaticExport(
+  root: string,
+  viteConfigPath: string | undefined,
+): Promise<boolean> {
+  let configModule: typeof import("./config/next-config.js");
+  let dotenvModule: typeof import("./config/dotenv.js");
+  try {
+    [configModule, dotenvModule] = await Promise.all([
+      import("./config/next-config.js"),
+      import("./config/dotenv.js"),
+    ]);
+  } catch {
+    return false;
+  }
+  const {
+    findVinextNextConfigInPlugins,
+    loadNextConfig,
+    PHASE_PRODUCTION_BUILD,
+    resolveNextConfigInput,
+  } = configModule;
+  // Restore the environment afterwards so the build-time values do not leak
+  // into the rest of init, such as the dependency install.
+  const savedEnv = { ...process.env };
+  // Next.js's vendored global declarations mark NODE_ENV readonly.
+  Reflect.set(process.env, "NODE_ENV", "production");
+  try {
+    // As in a Vite CLI build, the root production dotenv loads before the Vite
+    // config evaluates, then the plugin loads the Vite envDir for the config's
+    // mode before either config source resolves.
+    dotenvModule.loadDotenv({ root, mode: "production" });
+    let mode = "production";
+    let inline: Awaited<ReturnType<typeof findVinextNextConfigInPlugins>> = null;
+    // Like the plugin, the Vite config's root decides where next.config and
+    // the default envDir live, while an explicit envDir resolves from the CLI root.
+    let configRoot = root;
+    let envDir: string | false | undefined;
+    if (viteConfigPath) {
+      try {
+        const { loadConfigFromFile } = await import("vite");
+        const loaded = await loadConfigFromFile(
+          { command: "build", mode: "production", isSsrBuild: false, isPreview: false },
+          viteConfigPath,
+          root,
+          "silent",
+        );
+        if (typeof loaded?.config.mode === "string") mode = loaded.config.mode;
+        if (typeof loaded?.config.root === "string") {
+          configRoot = path.resolve(root, loaded.config.root);
+        }
+        const configuredEnvDir = loaded?.config.envDir;
+        if (configuredEnvDir === false) envDir = false;
+        else if (typeof configuredEnvDir === "string")
+          envDir = path.resolve(root, configuredEnvDir);
+        inline = await findVinextNextConfigInPlugins(loaded?.config.plugins);
+      } catch {
+        // A Vite config whose plugins are not installed yet cannot load here;
+        // next.config still decides.
+      }
+    }
+    if (envDir !== false) dotenvModule.loadDotenv({ root: envDir ?? configRoot, mode });
+    // After loading that dotenv, the plugin's config hook sets NODE_ENV again
+    // before loading next.config, whatever the Vite config assigned.
+    Reflect.set(process.env, "NODE_ENV", "production");
+    const nextConfig = inline
+      ? await resolveNextConfigInput(inline, PHASE_PRODUCTION_BUILD)
+      : await loadNextConfig(configRoot, PHASE_PRODUCTION_BUILD);
+    return nextConfig?.output === "export";
+  } catch {
+    return false;
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!Object.hasOwn(savedEnv, key)) delete process.env[key];
+    }
+    Object.assign(process.env, savedEnv);
+  }
+}
+
 type PlatformSetupContext = {
   root: string;
   isAppRouter: boolean;
   existingViteConfigPath?: string;
+  packageManager?: string;
   viteConfigExists: boolean;
   force: boolean;
   prerender?: boolean;
+  hasCssModules: boolean;
+  isStaticExport?: boolean;
   today?: string;
 };
 
@@ -425,21 +743,35 @@ type PlatformSetupResult = {
   skippedViteConfig: boolean;
   generatedPlatformFiles: string[];
   nextSteps: string[];
+  preservedExistingGenerateScopedName: boolean;
 };
 
 function setupNodePlatform(context: PlatformSetupContext): PlatformSetupResult {
   if (context.viteConfigExists && !context.force) {
+    if (context.hasCssModules && context.existingViteConfigPath) {
+      const current = fs.readFileSync(context.existingViteConfigPath, "utf-8");
+      const update = updateViteConfigForCssModules(context.existingViteConfigPath, current);
+      if (update.code !== current) fs.writeFileSync(context.existingViteConfigPath, update.code);
+      return {
+        generatedViteConfig: update.code !== current,
+        skippedViteConfig: update.code === current,
+        generatedPlatformFiles: [],
+        nextSteps: [],
+        preservedExistingGenerateScopedName: update.preservedExistingGenerateScopedName,
+      };
+    }
     return {
       generatedViteConfig: false,
       skippedViteConfig: true,
       generatedPlatformFiles: [],
       nextSteps: [],
+      preservedExistingGenerateScopedName: false,
     };
   }
 
   fs.writeFileSync(
     context.existingViteConfigPath ?? path.join(context.root, "vite.config.ts"),
-    generateViteConfig(context.isAppRouter, context.prerender),
+    generateViteConfig(context.isAppRouter, context.prerender, context.hasCssModules),
     "utf-8",
   );
   return {
@@ -447,6 +779,7 @@ function setupNodePlatform(context: PlatformSetupContext): PlatformSetupResult {
     skippedViteConfig: false,
     generatedPlatformFiles: [],
     nextSteps: [],
+    preservedExistingGenerateScopedName: false,
   };
 }
 
@@ -454,7 +787,6 @@ function setupNodePlatform(context: PlatformSetupContext): PlatformSetupResult {
 
 export async function init(options: InitOptions): Promise<InitResult> {
   const root = path.resolve(options.root);
-  const port = options.port ?? 3001;
   if (!options.platform) {
     throw new Error("A deployment platform must be selected before running vinext init.");
   }
@@ -462,6 +794,10 @@ export async function init(options: InitOptions): Promise<InitResult> {
   if (platform === "cloudflare" && !options.cloudflare) {
     throw new Error("Cloudflare init options must be resolved before running vinext init.");
   }
+  const cloudflareOptions =
+    platform === "cloudflare" && options.prerender
+      ? { ...options.cloudflare!, prerender: true }
+      : options.cloudflare;
   const exec =
     options._exec ??
     ((cmd: string, opts: { cwd: string; stdio: string }) =>
@@ -520,8 +856,17 @@ export async function init(options: InitOptions): Promise<InitResult> {
   const viteConfigExists = hasViteConfig(root);
 
   const isApp = detectProject(root).isAppRouter;
+  const hasCssModules = !options.skipCssModules && scanCssModuleFiles(root);
+  // Node init with --force replaces the existing Vite config.
+  const tailwindPostcssSetup = getTailwindPostcssSetup(
+    root,
+    platform === "node" && options.force ? undefined : existingViteConfigPath,
+  );
   const pmName = detectPackageManagerName(root);
   const shouldInstall = options.install ?? true;
+
+  const isStaticExport =
+    platform === "cloudflare" && (await resolvesToStaticExport(root, existingViteConfigPath));
 
   if (platform === "cloudflare") {
     validateCloudflarePlatformSetup(
@@ -529,12 +874,22 @@ export async function init(options: InitOptions): Promise<InitResult> {
         root,
         isAppRouter: isApp,
         existingViteConfigPath,
-        prerender: options.prerender,
+        hasCssModules,
+        isStaticExport,
         today: options._today,
       },
-      options.cloudflare!,
+      cloudflareOptions!,
+    );
+  } else if (hasCssModules && existingViteConfigPath && !options.force) {
+    updateViteConfigForCssModules(
+      existingViteConfigPath,
+      fs.readFileSync(existingViteConfigPath, "utf-8"),
     );
   }
+
+  // Checked before setup, which generates cloudflare.config.ts when it is missing.
+  const configKeepingWorkerName =
+    platform === "cloudflare" ? findConfigKeepingWorkerName(root, cloudflareOptions!) : undefined;
 
   // ── Step 1: Compatibility check ────────────────────────────────────────
 
@@ -565,9 +920,17 @@ export async function init(options: InitOptions): Promise<InitResult> {
 
   // ── Step 3: Add scripts ────────────────────────────────────────────────
 
-  const addedScripts = addScripts(root, port, platform, {
+  const deployResponseStore =
+    platform === "cloudflare" &&
+    options.cloudflare?.cdnCache === "response-store" &&
+    (options.cloudflare.responseStoreMode ?? "service-binding") === "service-binding";
+  const addedScripts = addScripts(root, options.port, platform, {
+    deployResponseStore,
     warmCdnCache: options.cloudflare?.warmCdnCache ?? false,
+    legacyWrangler: options.cloudflare?.legacyWrangler,
     scriptNames: options.scriptNames,
+    // An existing config keeps its own Worker names, so --name isn't applied here either.
+    workerName: configKeepingWorkerName ? undefined : options.cloudflare?.name,
   });
 
   // ── Step 4: Generate vite.config.ts ────────────────────────────────────
@@ -576,24 +939,37 @@ export async function init(options: InitOptions): Promise<InitResult> {
     root,
     isAppRouter: isApp,
     existingViteConfigPath,
+    packageManager: pmName,
     viteConfigExists,
     force: options.force ?? false,
     prerender: options.prerender,
+    hasCssModules,
+    isStaticExport,
     today: options._today,
   };
   const platformSetup =
     platform === "cloudflare"
-      ? setupCloudflarePlatform(setupContext, options.cloudflare!)
+      ? setupCloudflarePlatform(setupContext, cloudflareOptions!)
       : setupNodePlatform(setupContext);
   const { generatedViteConfig, skippedViteConfig, generatedPlatformFiles } = platformSetup;
 
+  if (tailwindPostcssSetup === "generate") {
+    fs.writeFileSync(path.join(root, "postcss.config.mjs"), TAILWIND_POSTCSS_CONFIG, "utf-8");
+  }
+
   // ── Step 5: Update .gitignore ──────────────────────────────────────────
 
-  const updatedGitignore = updateGitignore(root, platform);
+  const updatedGitignore = updateGitignore(root, platform, options.cloudflare?.legacyWrangler);
 
   // ── Step 6: Install dependencies last ──────────────────────────────────
 
-  const neededDeps = getInitDependencyGroups(isApp, platform);
+  const neededDeps = getInitDependencyGroups(
+    isApp,
+    platform,
+    options.cloudflare,
+    hasCssModules,
+    tailwindPostcssSetup === "generate" || tailwindPostcssSetup === "install",
+  );
   const missingDependencies = neededDeps.dependencies.filter((dep) => !isDepInstalled(root, dep));
   const missingDevDependencies = neededDeps.devDependencies.filter(
     (dep) => !isDepInstalled(root, dep),
@@ -603,11 +979,20 @@ export async function init(options: InitOptions): Promise<InitResult> {
   const devDependencyEntriesAdded: string[] = [];
 
   // For App Router: react-server-dom-webpack requires react/react-dom versions
-  // to match exactly (e.g. rsdw@19.2.6 needs react@^19.2.6). If the installed
+  // to match exactly (e.g. rsdw@19.3.1 needs react@^19.3.1). If the installed
   // React is too old (common with create-next-app), upgrade it first as a
-  // regular dependency to avoid ERESOLVE peer-dep conflicts.
-  if (isApp && missingDependencies.includes("react-server-dom-webpack")) {
-    const reactUpgrade = getReactUpgradeDeps(root);
+  // regular dependency to avoid ERESOLVE peer-dep conflicts. An already
+  // declared RSDW below the floor is upgraded here too. Installing also checks
+  // declared pins, which a clean install would resolve below the floor.
+  if (isApp) {
+    const reactUpgrade = shouldInstall
+      ? [
+          ...new Set([
+            ...getReactUpgradeDeps(root),
+            ...getReactUpgradeDeps(root, { fromManifest: true, installing: true }),
+          ]),
+        ]
+      : getReactUpgradeDeps(root, { fromManifest: true });
     if (reactUpgrade.length > 0) {
       console.log(`  ${terminalStyle.cyan(terminalStyle.bold("Upgrading dependencies:"))}`);
       console.log(
@@ -628,6 +1013,31 @@ export async function init(options: InitOptions): Promise<InitResult> {
         if (pmName !== "pnpm" || !isApproveBuildsError(error)) throw error;
         dependencyInstallNeedsApproval = true;
       }
+    }
+  }
+
+  // A declared @vitejs/plugin-react below vinext's peer range must move before
+  // vinext installs, or npm stops with ERESOLVE.
+  const pluginReactUpgrade = getPluginReactUpgradeDeps(root);
+  if (pluginReactUpgrade.length > 0) {
+    console.log(`  ${terminalStyle.cyan(terminalStyle.bold("Upgrading devDependencies:"))}`);
+    console.log(
+      formatList(
+        pluginReactUpgrade.map((dep) => dep.replace(/@latest$/, "")),
+        "    ",
+      ),
+    );
+    try {
+      if (shouldInstall) {
+        const installOutput = await installDeps(root, pluginReactUpgrade, exec);
+        if (isApproveBuildsError(installOutput)) dependencyInstallNeedsApproval = true;
+      } else {
+        const added = addDependencyEntries(root, pluginReactUpgrade, { dev: true });
+        devDependencyEntriesAdded.push(...added);
+      }
+    } catch (error) {
+      if (pmName !== "pnpm" || !isApproveBuildsError(error)) throw error;
+      dependencyInstallNeedsApproval = true;
     }
   }
 
@@ -711,7 +1121,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
     console.log(`    ${terminalStyle.green("\u2713")} Renamed ${oldName} \u2192 ${newName}`);
   }
   for (const script of addedScripts) {
-    console.log(`    ${terminalStyle.green("\u2713")} Added ${script} script`);
+    console.log(`    ${terminalStyle.green("\u2713")} Configured ${script} script`);
   }
   if (generatedViteConfig) {
     console.log(`    ${terminalStyle.green("\u2713")} Generated vite.config.ts`);
@@ -729,6 +1139,28 @@ export async function init(options: InitOptions): Promise<InitResult> {
       `    ${terminalStyle.green("\u2713")} Added vinext output directories to .gitignore`,
     );
   }
+  if (hasCssModules) {
+    console.log(`    ${terminalStyle.green("\u2713")} Configured vite-css-modules for CSS Modules`);
+  }
+  if (tailwindPostcssSetup === "generate") {
+    console.log(
+      `    ${terminalStyle.green("\u2713")} Generated postcss.config.mjs for Tailwind CSS (vinext does not run turbopack.rules loaders)`,
+    );
+  } else if (tailwindPostcssSetup === "manual") {
+    console.log(
+      `    ${terminalStyle.yellow("!")} Tailwind CSS is set up as a Turbopack loader, which vinext does not run; set up "@tailwindcss/postcss" or "@tailwindcss/vite" for vinext`,
+    );
+  }
+  if (configKeepingWorkerName) {
+    console.log(
+      `    ${terminalStyle.yellow("!")} Kept the Worker name in the existing ${configKeepingWorkerName}; --name was not applied, so update it there if it should be "${cloudflareOptions!.name}"`,
+    );
+  }
+  if (platformSetup.preservedExistingGenerateScopedName) {
+    console.log(
+      `    ${terminalStyle.yellow("!")} Preserved existing css.modules.generateScopedName; verify it produces identical class names in SSR and client builds`,
+    );
+  }
 
   const nextSteps = [...platformSetup.nextSteps];
   if (dependencyInstallNeedsApproval) {
@@ -742,13 +1174,18 @@ export async function init(options: InitOptions): Promise<InitResult> {
   }
   const scriptName = (name: string) =>
     options.scriptNames === "standard" ? name : `${name}:vinext`;
+  const deployResponseStoreCommandStep = deployResponseStore
+    ? `    ${pmName} run deploy:response-store  Deploy Workers Response Store before the application\n`
+    : "";
   const deployCommandStep =
     platform === "cloudflare"
       ? `    ${pmName} run ${scriptName("deploy")} Deploy to Cloudflare Workers\n`
       : "";
   const startCommandDescription =
     platform === "cloudflare"
-      ? "Start the built Worker locally with Wrangler"
+      ? !options.cloudflare?.legacyWrangler
+        ? "Preview the built Worker locally"
+        : "Start the built Worker locally with Wrangler"
       : "Start vinext production server";
 
   console.log(`
@@ -757,7 +1194,7 @@ ${nextSteps.map((step) => `    ${step}`).join("\n")}${nextSteps.length > 0 ? "\n
     ${pmName} run ${scriptName("dev")}    Start the vinext dev server
     ${pmName} run ${scriptName("build")}  Build production output
     ${pmName} run ${scriptName("start")}  ${startCommandDescription}
-${deployCommandStep}${options.scriptNames === "standard" ? "" : `    ${pmName} run dev           Start Next.js (still works as before)\n`}
+${deployResponseStoreCommandStep}${deployCommandStep}${options.scriptNames === "standard" ? "" : `    ${pmName} run dev           Start Next.js (still works as before)\n`}
 `);
 
   const installedDeps = [...new Set([...dependencyEntriesAdded, ...devDependencyEntriesAdded])];

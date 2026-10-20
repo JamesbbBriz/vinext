@@ -1,9 +1,62 @@
+import {
+  createWorkerCacheabilityAdmissionContext,
+  createCacheabilityAdmissionCaptureBudget,
+} from "../packages/vinext/src/server/cacheability-request.js";
+import {
+  CACHEABILITY_REQUEST_STATE,
+  type RouteCacheabilityState,
+} from "../packages/vinext/src/shims/cacheability-classification.js";
+import { runWithExecutionContext } from "../packages/vinext/src/shims/request-context.js";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { readAppRouteHandlerCacheResponse } from "../packages/vinext/src/server/app-route-handler-cache.js";
 import { isKnownDynamicAppRoute } from "../packages/vinext/src/server/app-route-handler-runtime.js";
 import type { ISRCacheEntry } from "../packages/vinext/src/server/isr-cache.js";
 import type { CachedRouteValue } from "../packages/vinext/src/shims/cache.js";
 import type { HeadersAccessPhase } from "../packages/vinext/src/shims/headers.js";
+import { registerFrameworkTracingIntegration } from "../packages/vinext/src/server/tracer.js";
+import type {
+  FrameworkTracingBackendSpan,
+  ResolvedFrameworkSpanDescriptor,
+} from "../packages/vinext/src/server/framework-tracer.js";
+import { isPromiseLike } from "../packages/vinext/src/utils/promise.js";
+
+type RecordedRouteSpan = {
+  errors: unknown[];
+  status?: string;
+  type: string;
+};
+
+const recordedRouteSpans: RecordedRouteSpan[] = [];
+let activeRouteSpanCount = 0;
+registerFrameworkTracingIntegration({
+  id: "app-route-handler-cache-test",
+  enterSpan<T>(
+    descriptor: ResolvedFrameworkSpanDescriptor,
+    callback: (span: FrameworkTracingBackendSpan) => T,
+  ): T {
+    const recorded: RecordedRouteSpan = { errors: [], type: descriptor.type };
+    recordedRouteSpans.push(recorded);
+    activeRouteSpanCount++;
+    let result: T;
+    try {
+      result = callback({
+        recordException: (error) => recorded.errors.push(error),
+        setAttribute() {},
+        setErrorStatus: (message) => {
+          recorded.status = message ?? "error";
+        },
+      });
+    } catch (error) {
+      activeRouteSpanCount--;
+      throw error;
+    }
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).finally(() => activeRouteSpanCount--) as T;
+    }
+    activeRouteSpanCount--;
+    return result;
+  },
+});
 
 function createDynamicUsageState(): {
   consumeDynamicUsage: () => boolean;
@@ -173,6 +226,112 @@ describe("app route handler cache helpers", () => {
     expect(didClearRequestContext).toBe(true);
   });
 
+  // Next caches error responses produced after a successful initial prerender.
+  // https://github.com/vercel/next.js/blob/v16.2.7/packages/next/src/build/templates/app-route.ts
+  it.each([400, 500])("stores status %s during existing route ISR regeneration", async (status) => {
+    const writes = vi.fn();
+    let regenerate: (() => Promise<void>) | undefined;
+    await readAppRouteHandlerCacheResponse(
+      createReadOptions({
+        isrGet: async () => buildISRCacheEntry(buildCachedRouteValue("original"), true),
+        handlerFn: () => new Response("regenerated error", { status }),
+        isrSet: writes,
+        scheduleBackgroundRegeneration: (_key, render) => {
+          regenerate = render;
+        },
+      }),
+    );
+    await regenerate!();
+    expect(writes).toHaveBeenCalledOnce();
+    expect(writes.mock.calls[0][1].status).toBe(status);
+  });
+
+  it("does not store a regeneration that reads request data while streaming", async () => {
+    const usage = createDynamicUsageState();
+    const writes = vi.fn();
+    let regenerate: (() => Promise<void>) | undefined;
+    const response = await readAppRouteHandlerCacheResponse(
+      createReadOptions({
+        ...usage,
+        routePattern: "/api/late-dynamic-regeneration",
+        isrGet: async () =>
+          buildISRCacheEntry(
+            buildCachedRouteValue("original", { "cache-control": "private, max-age=300" }),
+            true,
+          ),
+        handlerFn: (request) =>
+          new Response(
+            new ReadableStream({
+              async pull(controller) {
+                await Promise.resolve();
+                controller.enqueue(
+                  new TextEncoder().encode(request.headers.get("x-visitor") ?? "anonymous"),
+                );
+                controller.close();
+              },
+            }),
+            { headers: { "Cache-Control": "public, max-age=3600" } },
+          ),
+        isrSet: writes,
+        scheduleBackgroundRegeneration: (_key, render) => {
+          regenerate = render;
+        },
+      }),
+    );
+    expect(response?.headers.get("Cache-Control")).toBe("private, max-age=300");
+    await expect(response?.text()).resolves.toBe("original");
+    await regenerate!();
+    expect(writes).not.toHaveBeenCalled();
+    expect(isKnownDynamicAppRoute("/api/late-dynamic-regeneration")).toBe(true);
+  });
+
+  it.each(["dynamic", "capture-limit"])(
+    "releases rejected regeneration captures: %s",
+    async (reason) => {
+      const budget = createCacheabilityAdmissionCaptureBudget(
+        reason === "capture-limit" ? 1 : 1024,
+      );
+      const context = createWorkerCacheabilityAdmissionContext(
+        { waitUntil() {} },
+        new Request("https://example.com/api/cleanup"),
+        null,
+        "build",
+        true,
+      );
+      (Reflect.get(context, CACHEABILITY_REQUEST_STATE) as RouteCacheabilityState).captureBudget =
+        budget;
+      const writes = vi.fn();
+      const routePattern = `/api/regeneration-cleanup-${reason}`;
+      let regenerate: (() => Promise<void>) | undefined;
+      const response = await readAppRouteHandlerCacheResponse(
+        createReadOptions({
+          routePattern,
+          isrGet: async () => buildISRCacheEntry(buildCachedRouteValue("previous"), true),
+          handlerFn: (request) =>
+            new Response(
+              new ReadableStream({
+                pull(controller) {
+                  if (reason === "dynamic") request.headers.get("x-visitor");
+                  controller.enqueue(new TextEncoder().encode("body"));
+                  controller.close();
+                },
+              }),
+            ),
+          isrSet: writes,
+          runInRevalidationContext: (render) => runWithExecutionContext(context, render),
+          scheduleBackgroundRegeneration: (_key, render) => {
+            regenerate = render;
+          },
+        }),
+      );
+      await response?.body?.cancel();
+      await regenerate!();
+      expect(writes).not.toHaveBeenCalled();
+      expect(budget.reservedBytes).toBe(0);
+      expect(isKnownDynamicAppRoute(routePattern)).toBe(reason === "dynamic");
+    },
+  );
+
   it("returns STALE responses and regenerates cached route handlers in the background", async () => {
     const dynamicUsage = createDynamicUsageState();
     const scheduledRegenerations: Array<() => Promise<void>> = [];
@@ -209,6 +368,7 @@ describe("app route handler cache helpers", () => {
         return "route:" + pathname;
       },
       async isrSet(key, value, policy) {
+        expect(activeRouteSpanCount).toBe(0);
         expect(value.kind).toBe("APP_ROUTE");
         isrSetCalls.push({
           key,
@@ -467,10 +627,67 @@ describe("app route handler cache helpers", () => {
       throw new Error("Expected scheduled route regeneration");
     }
 
+    recordedRouteSpans.length = 0;
     await expect(scheduledRegenRun()).rejects.toThrow(
       "NextResponse.next() was used in a app route handler",
     );
     expect(wroteCache).toBe(false);
+    expect(recordedRouteSpans).toContainEqual({
+      errors: [],
+      type: "AppRouteRouteHandlers.runHandler",
+    });
+  });
+
+  it("keeps stale regeneration control responses successful", async () => {
+    const scheduledRegens: Array<() => Promise<void>> = [];
+    await readAppRouteHandlerCacheResponse(
+      createReadOptions({
+        handlerFn() {
+          throw { digest: "NEXT_REDIRECT;replace;%2Ftarget;307" };
+        },
+        async isrGet() {
+          return buildISRCacheEntry(buildCachedRouteValue("from-stale"), true);
+        },
+        scheduleBackgroundRegeneration(_key, renderFn) {
+          scheduledRegens.push(renderFn);
+        },
+      }),
+    );
+
+    recordedRouteSpans.length = 0;
+    await expect(scheduledRegens[0]!()).resolves.toBeUndefined();
+    expect(recordedRouteSpans).toContainEqual({
+      errors: [],
+      type: "AppRouteRouteHandlers.runHandler",
+    });
+  });
+
+  it("fails stale handler spans when user code throws a validation-message lookalike", async () => {
+    const scheduledRegens: Array<() => Promise<void>> = [];
+    const failure = new Error(
+      "NextResponse.next() was used in a app route handler, this is not supported. See here for more info: https://nextjs.org/docs/messages/next-response-next-in-app-route-handler",
+    );
+    await readAppRouteHandlerCacheResponse(
+      createReadOptions({
+        handlerFn() {
+          throw failure;
+        },
+        async isrGet() {
+          return buildISRCacheEntry(buildCachedRouteValue("from-stale"), true);
+        },
+        scheduleBackgroundRegeneration(_key, renderFn) {
+          scheduledRegens.push(renderFn);
+        },
+      }),
+    );
+
+    recordedRouteSpans.length = 0;
+    await expect(scheduledRegens[0]!()).rejects.toBe(failure);
+    expect(recordedRouteSpans).toContainEqual({
+      errors: [failure],
+      status: failure.message,
+      type: "AppRouteRouteHandlers.runHandler",
+    });
   });
 
   it("falls through on cache read errors", async () => {

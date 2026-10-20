@@ -1,5 +1,5 @@
 import { stripBasePath } from "../utils/base-path.js";
-import type { RouteManifest } from "../routing/app-route-graph.js";
+import type { BrowserRouteManifest } from "../routing/browser-route-manifest.js";
 import {
   AppElementsWire,
   getMountedSlotIds,
@@ -38,6 +38,7 @@ import {
   createSnapshotPathAndSearch,
   type ClientNavigationRenderSnapshot,
 } from "vinext/shims/navigation";
+import { bindAppElementsRenderedSearch } from "vinext/shims/slot";
 import { normalizePathnameForRouteMatch } from "../routing/utils.js";
 import { normalizePath } from "./normalize-path.js";
 import type { BfcacheIdMap } from "./app-history-state.js";
@@ -300,7 +301,7 @@ export function resolvePendingNavigationCommitDispositionDecision(options: {
   activeNavigationId: number;
   currentState: AppRouterState;
   pending: PendingNavigationCommit;
-  routeManifest?: RouteManifest | null;
+  routeManifest?: BrowserRouteManifest | null;
   startedNavigationId: number;
   targetHref?: string;
 }): PendingNavigationCommitDispositionDecision {
@@ -461,7 +462,7 @@ function createPendingRouteSnapshot(pending: PendingNavigationCommit): RouteSnap
 
 function createPendingNavigationOperationToken(options: {
   pending: PendingNavigationCommit;
-  routeManifest: RouteManifest | null;
+  routeManifest: BrowserRouteManifest | null;
   startedNavigationId: number;
   targetSnapshot: RouteSnapshot;
 }): OperationToken {
@@ -486,7 +487,7 @@ function createRootBoundarySnapshotFingerprint(snapshot: RouteSnapshot): string 
 function planPendingRootBoundaryFlightResponse(options: {
   currentState: AppRouterState;
   pending: PendingNavigationCommit;
-  routeManifest: RouteManifest | null;
+  routeManifest: BrowserRouteManifest | null;
   targetHref?: string;
   // The token has already passed commit eligibility (verifyOperationTokenForCommit)
   // in the disposition gate above. Requiring the verified brand here makes that
@@ -665,6 +666,10 @@ export function createPendingNavigationCommitFromElements(
   options: CreatePendingNavigationCommitOptions & { nextElements: AppElements },
 ): PendingNavigationCommit {
   const elements = options.nextElements;
+  // Before any merge into the visible tree: a page still streaming when a
+  // later navigation keeps its branch first renders under that navigation,
+  // but reads the query of the response that delivered it.
+  bindAppElementsRenderedSearch(elements, options.navigationSnapshot);
   const metadata = AppElementsWire.readMetadata(elements);
   const cacheEntryReuseProof =
     metadata.cacheEntryReuseProof ??

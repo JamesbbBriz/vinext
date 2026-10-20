@@ -1,21 +1,19 @@
 import {
   expect,
   test,
-  type APIRequest,
   type APIRequestContext,
   type APIResponse,
   type Page,
   type Response,
 } from "@playwright/test";
 import fs from "node:fs";
+import { waitForStablePromotion } from "./promotion.js";
 import { randomUUID } from "node:crypto";
 import { VINEXT_EXPECTED_WORKER_VERSION_HEADER } from "../../../packages/cloudflare/src/version-headers.js";
 
 const TARGET_PATH = "/prewarm-target";
 const PAGES_TARGET_PATH = "/pages-prewarm";
 const LOADING_SHELL_RSC_SEARCH = "?_rsc=9qLBDIU2NgN178cB";
-const PROMOTION_STABILITY_WINDOW_MS = 60_000;
-const PROMOTION_READINESS_TIMEOUT_MS = 120_000;
 const PROMOTION_PROBE_INTERVAL_MS = 1_000;
 const STALE_SEED_RETRY_TIMEOUT_MS = 45_000;
 
@@ -172,52 +170,6 @@ function expectLoadingShell(observed: ObservedRsc, rscBuildId: string): void {
   expect(observed.headers["x-vinext-rsc-render-mode"]).toBe("prefetch-loading-shell");
 }
 
-async function waitForStablePromotion({
-  baseURL,
-  buildId,
-  playwright,
-  rscBuildId,
-}: {
-  baseURL: string;
-  buildId: string;
-  playwright: { request: APIRequest };
-  rscBuildId: string;
-}): Promise<void> {
-  const deadline = Date.now() + PROMOTION_READINESS_TIMEOUT_MS;
-  let attempt = 0;
-  let lastFailure: unknown;
-  let stableSince: number | undefined;
-
-  while (Date.now() < deadline) {
-    const probeId = `${Date.now()}-${attempt++}`;
-    const probeRequest = await playwright.request.newContext();
-    try {
-      const versionUrl = new URL("/api/prewarm-version", baseURL);
-      versionUrl.searchParams.set("readiness", probeId);
-      const versionResponse = await probeRequest.get(versionUrl.href, { timeout: 5_000 });
-      expect(versionResponse.ok()).toBe(true);
-      expect(versionResponse.headers()["cache-control"]).toContain("no-store");
-      expect(await versionResponse.json()).toEqual({ buildId, rscBuildId });
-
-      stableSince ??= Date.now();
-      if (Date.now() - stableSince >= PROMOTION_STABILITY_WINDOW_MS) {
-        return;
-      }
-    } catch (error) {
-      lastFailure = error;
-      stableSince = undefined;
-    } finally {
-      await probeRequest.dispose();
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, PROMOTION_PROBE_INTERVAL_MS));
-  }
-
-  throw new Error(
-    `Worker promotion did not remain stable for ${PROMOTION_STABILITY_WINDOW_MS}ms: ${String(lastFailure)}`,
-  );
-}
-
 test("deploy-prewarmed variants are reused and late-dynamic HTML stays private", async ({
   baseURL,
   browser,
@@ -228,12 +180,14 @@ test("deploy-prewarmed variants are reused and late-dynamic HTML stays private",
   if (!baseURL) throw new Error("deployed test requires a base URL");
   test.setTimeout(240_000);
 
-  const buildId = fs.readFileSync("examples/workers-cache/dist/server/BUILD_ID", "utf-8").trim();
+  const buildId = fs
+    .readFileSync("examples/response-store-demo/dist/server/BUILD_ID", "utf-8")
+    .trim();
   const rscBuildId = fs
-    .readFileSync("examples/workers-cache/dist/server/RSC_BUILD_ID", "utf-8")
+    .readFileSync("examples/response-store-demo/dist/server/RSC_BUILD_ID", "utf-8")
     .trim();
   const { prerenderSecret } = JSON.parse(
-    fs.readFileSync("examples/workers-cache/dist/server/vinext-server.json", "utf-8"),
+    fs.readFileSync("examples/response-store-demo/dist/server/vinext-server.json", "utf-8"),
   ) as { prerenderSecret: string };
 
   // Match a browser navigation and the HTML request emitted by cdn-warm.ts.

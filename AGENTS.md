@@ -480,6 +480,7 @@ This repo currently resolves `vite` to `@voidzero-dev/vite-plus-core`, which bun
 - **Split state from heavy implementations.** Request-scoped state, handler registration, and small public facades should live in lightweight modules so importing a setter or context helper does not pull the full cache, navigation, or rendering runtime into every environment.
 - **Filter Vite hooks before JavaScript runs.** Add native hook `filter` patterns to `resolveId`, `load`, and `transform` hooks, and skip defensive early returns inside the handler in favor of the filter. Avoid broad compatibility transforms over `node_modules`, generated runtimes, prebundles, and modules that cannot contain the syntax being rewritten.
 - **Prefer lazily loaded chunks.** Keep code that is only needed for specific request types behind dynamic imports so it stays off startup and common request paths. Do not eagerly merge lazy RSC chunks into shared chunks merely to reduce chunk count.
+- **App Router client references are grouped by route in production.** `vinext:rsc-client-reference-loaders` (with `build/client-reference-groups.ts`) loads the `"use client"` modules that the same set of routes reaches through one group chunk, like Next.js' per-route client entries. A reference stays in its own lazy chunk when its estimated cost is over 100 KiB, when route code reaches it through a dynamic import (`next/dynamic`, `React.lazy`), or when its browser module lacks an export the RSC build rendered. Grouping is off in dev, when the client build has any chunk group other than vinext's own (`codeSplitting.groups`, `advancedChunks`, `manualChunks`), and with `disableNextLikeChunking: true`. Keep the cost estimate cheap: it must not add per-module resolution or I/O that would regress build time.
 - **Avoid repeated hot-path work.** Reuse already-computed cache keys and request derivations, hoist immutable regular expressions and lookup tables to module scope, and move deterministic parsing or asset selection to build time when possible. Do not add caching until ownership and invalidation are explicit.
 
 Performance changes must preserve dev/production parity and all supported runtimes. A smaller dev module graph is not a win if it causes stale source-checkout code, changes RSC conditions, or breaks Cloudflare/Nitro bundling.
@@ -538,7 +539,7 @@ When adding support for third-party Next.js libraries:
 
 - **`next/navigation.js` (with .js extension):** Libraries like `nuqs` import with the `.js` extension. Vite's `resolve.alias` does exact matching, so a `resolveId` hook strips `.js` from `next/*` imports and redirects through the shim map.
 - **next-themes:** Works out of the box. ThemeProvider, `useTheme`, SSR script injection all function correctly.
-- **next-intl:** Requires deep integration. It expects a plugin from `next.config.ts` (`createNextIntlPlugin`) that injects config at build time. Simply installing and importing doesn't work.
+- **next-intl:** Works with `createNextIntlPlugin`, or without it when the request config is at `(src/)i18n/request.*`. vinext picks up the plugin's `next-intl/config` alias (including a custom `requestConfig` path) from its webpack/Turbopack config, or auto-detects that default location when the plugin is absent. The plugin's experimental options (`messages` catalogs, `precompile`, `extract`) depend on webpack/Turbopack loaders that don't run. `tests/fixtures/cf-next-intl` ports next-intl's App Router playground and `tests/fixtures/cf-next-intl-example` its canonical App Router example (static rendering); both run their Playwright suites against a Workers build.
 - **General pattern:** Libraries that only import from `next/*` public APIs tend to work. Libraries that depend on Next.js build plugins or internal APIs need custom shimming.
 
 <!--VITE PLUS START-->
@@ -548,6 +549,17 @@ When adding support for third-party Next.js libraries:
 This project is using Vite+, a unified toolchain built on top of Vite, Rolldown, Vitest, tsdown, Oxlint, Oxfmt, and Vite Task. Vite+ wraps runtime management, package management, and frontend tooling in a single global CLI called `vp`. Vite+ is distinct from Vite, and it invokes Vite through `vp dev` and `vp build`. Run `vp help` to print a list of commands and `vp <command> --help` for information about a specific command.
 
 Docs are local at `node_modules/vite-plus/docs` or online at https://viteplus.dev/guide/.
+
+## Built-in Commands vs Scripts
+
+`vp <name>` runs a built-in command. `vp run <name>` runs a `package.json` script or a `vite.config.ts` task. Scripts cannot overwrite built-ins, so `vp dev` and `vp run dev` may do different things. Check `package.json` and `vite.config.ts` first, and run `vp run <name>` when the project defines a script or task with that name.
+
+## Tool Versions
+
+Run `vp toolchain` to show versions and relationships in the active Vite+
+release. Add a tool name to select part of the graph. For example, run
+`vp toolchain vite`. Use `--global` to ignore the local `vite-plus` package. Use
+`vp why <package>` to show the package-manager dependency graph.
 
 ## Review Checklist
 

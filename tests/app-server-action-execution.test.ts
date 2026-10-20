@@ -40,12 +40,18 @@ import {
   runWithRequestContext,
 } from "../packages/vinext/src/shims/unified-request-context.js";
 import {
+  cookies,
   getHeadersContext,
   headersContextFromRequest,
   setHeadersAccessPhase,
   setHeadersContext,
 } from "../packages/vinext/src/shims/headers.js";
 import { withEnvVar } from "./env-test-helpers.js";
+import {
+  createRscOnErrorHandler as createRealRscOnErrorHandler,
+  PRODUCTION_SERVER_COMPONENTS_ERROR_MESSAGE,
+  sanitizeErrorForClient,
+} from "../packages/vinext/src/server/app-rsc-errors.js";
 
 type TestRoute = {
   id: string;
@@ -72,6 +78,26 @@ type TestActionModel = {
   returnValue: unknown;
   root?: string;
 };
+
+function registerTestServerReference(value: unknown, id: string | null): unknown {
+  if (
+    typeof value !== "function" ||
+    id === null ||
+    typeof Reflect.get(value, "$$id") === "string"
+  ) {
+    return value;
+  }
+  Object.defineProperty(value, "$$id", { configurable: true, value: id });
+  return value;
+}
+
+function getDirectTestActionId(body: FormData): string | null {
+  let actionId: string | null = null;
+  for (const key of body.keys()) {
+    if (key.startsWith("$ACTION_ID_")) actionId = key.slice("$ACTION_ID_".length);
+  }
+  return actionId;
+}
 
 function createMultipartRequest(headers?: HeadersInit): Request {
   const requestHeaders = new Headers({
@@ -123,12 +149,15 @@ function createStreamBodyRequest(body: string, headers?: HeadersInit): Request {
 function createOptions(
   overrides: Partial<HandleProgressiveServerActionRequestOptions> = {},
 ): HandleProgressiveServerActionRequestOptions {
-  return {
+  const options: HandleProgressiveServerActionRequestOptions = {
     actionId: null,
     allowedOrigins: [],
     cleanPathname: "/action-source",
     clearRequestContext() {},
     contentType: "multipart/form-data; boundary=vinext",
+    createServerManifest() {
+      return {};
+    },
     async decodeAction() {
       return null;
     },
@@ -149,9 +178,20 @@ function createOptions(
     },
     reportRequestError() {},
     request: createMultipartRequest(),
+    routePattern: "/action-source",
     setHeadersAccessPhase,
+    validateActionReferences() {
+      return true;
+    },
     ...overrides,
   };
+  const decodeAction = options.decodeAction;
+  options.decodeAction = async (body, serverManifest) =>
+    registerTestServerReference(
+      await decodeAction(body, serverManifest),
+      getDirectTestActionId(body),
+    );
+  return options;
 }
 
 type ProgressiveActionRequestResult = Awaited<
@@ -245,7 +285,12 @@ function createRscOptions(
     (({ route: matchedRoute, params, interceptOpts }) =>
       `${matchedRoute.id}:${JSON.stringify(params)}:${interceptOpts?.slot ?? "none"}`);
 
-  return {
+  const options: HandleServerActionRscRequestOptions<
+    string,
+    TestRoute,
+    TestInterceptOptions,
+    TestTemporaryReferences
+  > = {
     actionId: "action-id",
     allowedOrigins: [],
     buildPageElement,
@@ -259,6 +304,9 @@ function createRscOptions(
     },
     createRscOnErrorHandler(_request, pathname, pattern) {
       return () => `${pathname}:${pattern}`;
+    },
+    createServerManifest() {
+      return {};
     },
     createTemporaryReferenceSet() {
       return { marker: "refs" };
@@ -341,6 +389,9 @@ function createRscOptions(
     toInterceptOpts(intercept) {
       return { slot: intercept.slotKey };
     },
+    validateActionReferences() {
+      return true;
+    },
     ...overrides,
     cleanPathname,
     currentRouteMatch:
@@ -350,6 +401,10 @@ function createRscOptions(
     currentRoutePathname: overrides.currentRoutePathname ?? cleanPathname,
     matchRoute,
   };
+  const loadServerAction = options.loadServerAction;
+  options.loadServerAction = async (actionId) =>
+    registerTestServerReference(await loadServerAction(actionId), actionId);
+  return options;
 }
 
 describe("app server action execution helpers", () => {
@@ -371,12 +426,11 @@ describe("app server action execution helpers", () => {
       }),
     );
 
-    expect(result).toMatchObject({ kind: "form-state", actionFailed: true });
-    expect(result && "actionError" in result ? result.actionError : null).toMatchObject({
-      name: "Error",
-      message:
-        "`import('next/root-params').lang()` was used inside a Server Action. This is not supported. Functions from 'next/root-params' can only be called in the context of a route.",
-    });
+    const response = requireProgressiveActionResponse(result);
+    expect(response.status).toBe(500);
+    expect(await response.text()).toBe(
+      "Server action failed: `import('next/root-params').lang()` was used inside a Server Action. This is not supported. Functions from 'next/root-params' can only be called in the context of a route.",
+    );
     errorSpy.mockRestore();
   });
 
@@ -572,14 +626,10 @@ describe("app server action execution helpers", () => {
     }
   });
 
-  it("validates nested bound server references before decoding modules", async () => {
+  it("rejects an empty progressive action id before decoding", async () => {
     const body = new FormData();
-    body.set("$ACTION_REF_1", "");
-    body.set("$ACTION_1:0", JSON.stringify({ id: "selected-action", bound: "$@1" }));
-    body.set("$ACTION_1:1", JSON.stringify(["$ha"]));
-    body.set("$ACTION_1:10", JSON.stringify({ id: "nested-action", bound: null }));
+    body.set("$ACTION_ID_", "");
     const decodeAction = vi.fn();
-    const validateActionReferences = vi.fn(() => false);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     try {
@@ -589,16 +639,53 @@ describe("app server action execution helpers", () => {
             decodeAction,
             forwardAction: async () => null,
             readFormDataWithLimit: async () => body,
-            validateActionReferences,
+            validateActionReferences: (actionIds) => !actionIds.includes(""),
           }),
         ),
       );
 
       expect(response.status).toBe(404);
-      expect(validateActionReferences).toHaveBeenCalledWith(["selected-action", "nested-action"]);
       expect(decodeAction).not.toHaveBeenCalled();
     } finally {
       warning.mockRestore();
+    }
+  });
+
+  it("resolves bound server references through the route-scoped manifest", async () => {
+    const body = new FormData();
+    body.set("$ACTION_REF_1", "");
+    body.set("$ACTION_1:0", JSON.stringify({ id: "selected-action", bound: "$@1" }));
+    const action = vi.fn();
+    const validateActionReferences = vi.fn((actionIds: readonly string[]) =>
+      actionIds.every((actionId) => actionId === "selected-action"),
+    );
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const response = requireProgressiveActionResponse(
+        await handleProgressiveServerActionRequest(
+          createOptions({
+            createServerManifest: () =>
+              new Proxy({}, { get: (_target, id) => ({ id, name: "", chunks: [] }) }),
+            // React resolves the action and each bound `$h` reference with
+            // `serverManifest[id]`.
+            async decodeAction(_body, serverManifest) {
+              Reflect.get(serverManifest, "selected-action");
+              Reflect.get(serverManifest, "nested-action");
+              return action;
+            },
+            forwardAction: async () => null,
+            readFormDataWithLimit: async () => body,
+            validateActionReferences,
+          }),
+        ),
+      );
+
+      expect(response.status).toBe(500);
+      expect(validateActionReferences).toHaveBeenCalledWith(["nested-action"]);
+      expect(action).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
     }
   });
 
@@ -662,13 +749,12 @@ describe("app server action execution helpers", () => {
     expect(response?.status).toBe(500);
     expect(response?.headers.get("content-type")).toBe("text/x-component");
     expect(loadServerAction).not.toHaveBeenCalled();
-    expect(reportRequestError).toHaveBeenCalledTimes(1);
+    // The render's onError reports the rejected action result.
+    expect(reportRequestError).not.toHaveBeenCalled();
     expect(renderedModel.get().root).toBeUndefined();
     expect(renderedModel.get().returnValue.ok).toBe(false);
     // Mirrors the upstream e2e log assertion: `Error: Body exceeded 2mb limit`.
-    expect((renderedModel.get().returnValue.data as Error).message).toContain(
-      "Body exceeded 2mb limit",
-    );
+    await expect(renderedModel.get().returnValue.data).rejects.toThrow("Body exceeded 2mb limit");
     // Stream consumed so clearRequestContext fires after the body drains.
     await response?.text();
     expect(clearContext).toHaveBeenCalledTimes(1);
@@ -692,7 +778,7 @@ describe("app server action execution helpers", () => {
     expect(response?.headers.get("content-type")).toBe("text/x-component");
     expect(loadServerAction).not.toHaveBeenCalled();
     expect(renderedModel.get().returnValue.ok).toBe(false);
-    expect((renderedModel.get().returnValue.data as Error).message).toContain("Body exceeded");
+    await expect(renderedModel.get().returnValue.data).rejects.toThrow("Body exceeded");
   });
 
   it("bounds chunked multipart bodies after resolving a valid action", async () => {
@@ -714,7 +800,7 @@ describe("app server action execution helpers", () => {
     expect(response?.headers.get("content-type")).toBe("text/x-component");
     expect(loadServerAction).toHaveBeenCalledTimes(1);
     expect(renderedModel.get().returnValue.ok).toBe(false);
-    expect((renderedModel.get().returnValue.data as Error).message).toContain("Body exceeded");
+    await expect(renderedModel.get().returnValue.data).rejects.toThrow("Body exceeded");
   });
 
   it("rejects declared-oversized stale multipart actions before action lookup", async () => {
@@ -1013,26 +1099,32 @@ describe("app server action execution helpers", () => {
     const request = createMultipartBodyRequest(formData);
     const formState = ["action-result", "key-path", "reference-id", 1] as never;
     let actionRan = false;
+    let actionManifest: object | undefined;
 
     const result = await handleProgressiveServerActionRequest(
       createOptions({
         contentType: request.headers.get("content-type") ?? "",
-        async decodeAction() {
+        async decodeAction(_body, serverManifest) {
+          actionManifest = serverManifest;
           return () => {
             actionRan = true;
             return { count: 1 };
           };
         },
-        async decodeFormState(actionResult, body) {
+        async decodeFormState(actionResult, body, serverManifest) {
           expect(actionResult).toEqual({ count: 1 });
           expect(body.get("$ACTION_ID_test")).toBe("");
           expect(body.get("field")).toBe("value");
+          // Form state decodes the bound references again, through the same scope.
+          expect(serverManifest).toBe(actionManifest);
+          expect(() => Reflect.get(serverManifest, "foreign-action")).toThrow();
           return formState;
         },
         readFormDataWithLimit(readRequest) {
           return readRequest.formData();
         },
         request,
+        validateActionReferences: (actionIds) => !actionIds.includes("foreign-action"),
       }),
     );
 
@@ -1050,7 +1142,7 @@ describe("app server action execution helpers", () => {
   it("passes HTTP fallback errors as actionError to be rendered by error boundaries", async () => {
     for (const digest of ["NEXT_NOT_FOUND", "NEXT_HTTP_ERROR_FALLBACK;403"]) {
       const clearContext = vi.fn();
-      const reportedErrors: Error[] = [];
+      const reportedErrors: unknown[] = [];
 
       const result = await handleProgressiveServerActionRequest(
         createOptions({
@@ -1080,10 +1172,12 @@ describe("app server action execution helpers", () => {
     }
   });
 
-  it("passes action execution failures as actionError to be rendered by error boundaries", async () => {
-    const reportedErrors: Error[] = [];
-    // Failure-path renders still need to flush action-set cookies onto the
-    // error page response (issue #1483), so the handler captures them here.
+  // Ported from Next.js: test/e2e/on-request-error/server-action-error/server-action-error.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/on-request-error/server-action-error/server-action-error.test.ts
+  // Next.js rethrows the error and answers a plain 500 that still carries the
+  // action's cookies (reproduced against next@16.2.7 build/start).
+  it("answers a plain 500 with middleware headers and the action's cookies for action execution failures", async () => {
+    const reportRequestError = vi.fn();
     const clearedCookies = vi.fn(() => ["session=1; Path=/"]);
     const clearContext = vi.fn();
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1099,29 +1193,42 @@ describe("app server action execution helpers", () => {
           };
         },
         getAndClearPendingCookies: clearedCookies,
-        reportRequestError(err) {
-          reportedErrors.push(err);
-        },
+        middlewareHeaders: new Headers([
+          ["x-middleware-ran", "1"],
+          ["set-cookie", "mw=1; Path=/"],
+          ["cache-control", "public, max-age=60"],
+        ]),
+        reportRequestError,
+        routePattern: "/products/[id]",
       }),
     );
 
-    expect(result).toEqual({
-      kind: "form-state",
-      formState: null,
-      actionError: error,
-      actionFailed: true,
-      pendingCookies: ["session=1; Path=/"],
-      draftCookie: null,
-      revalidationKind: 1,
-    });
-    expect(reportedErrors.map((e) => e.message)).toEqual(["boom"]);
+    const response = requireProgressiveActionResponse(result);
+    expect(response.headers.get("x-middleware-ran")).toBe("1");
+    expect(response.status).toBe(500);
+    expect(response.headers.get("cache-control")).toBe(
+      "no-cache, no-store, max-age=0, must-revalidate",
+    );
+    expect(response.headers.getSetCookie()).toEqual(["mw=1; Path=/", "session=1; Path=/"]);
+    expect(await response.text()).toBe("Server action failed: boom");
+    expect(reportRequestError).toHaveBeenCalledWith(
+      error,
+      expect.objectContaining({ path: "/action-source", method: "POST" }),
+      {
+        routerKind: "App Router",
+        routePath: "/products/[id]",
+        routeType: "action",
+        renderSource: "react-server-components-payload",
+        revalidateReason: undefined,
+      },
+    );
     expect(clearedCookies).toHaveBeenCalledTimes(1);
-    expect(clearContext).not.toHaveBeenCalled(); // Handled by app-rsc-handler
+    expect(clearContext).toHaveBeenCalledTimes(1);
 
     errorSpy.mockRestore();
   });
 
-  it("passes falsy action execution failures to the page render path", async () => {
+  it("answers a plain 500 for falsy action execution failures", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     try {
@@ -1135,15 +1242,9 @@ describe("app server action execution helpers", () => {
         }),
       );
 
-      expect(result).toEqual({
-        kind: "form-state",
-        formState: null,
-        actionError: 0,
-        actionFailed: true,
-        pendingCookies: [],
-        draftCookie: null,
-        revalidationKind: 0,
-      });
+      const response = requireProgressiveActionResponse(result);
+      expect(response.status).toBe(500);
+      expect(await response.text()).toBe("Server action failed: 0");
     } finally {
       errorSpy.mockRestore();
     }
@@ -1152,7 +1253,7 @@ describe("app server action execution helpers", () => {
   // Ported from Next.js: test/e2e/app-dir/no-server-actions/no-server-actions.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/no-server-actions/no-server-actions.test.ts
   it("returns the action-not-found response for progressive action decode misses", async () => {
-    const reportedErrors: Error[] = [];
+    const reportedErrors: unknown[] = [];
     const clearContext = vi.fn();
 
     const response = requireProgressiveActionResponse(
@@ -1226,7 +1327,7 @@ describe("app server action execution helpers", () => {
   // variant did not. See issue #1340.
   it("returns action-not-found when an MPA action targets a page with no server actions", async () => {
     const clearContext = vi.fn();
-    const reportedErrors: Error[] = [];
+    const reportedErrors: unknown[] = [];
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     try {
@@ -1260,10 +1361,9 @@ describe("app server action execution helpers", () => {
     }
   });
 
-  // Route handlers (route.ts) accept raw multipart POSTs that legitimately
-  // decode to no action; those must still fall through to the route-handler
-  // dispatch rather than 404. The page-vs-route distinction comes from the
-  // caller (`hasPageRoute`).
+  // Multipart POSTs without a page match that decode to no action fall
+  // through to the caller's normal dispatch rather than 404. The page
+  // distinction comes from the caller (`hasPageRoute`).
   it("falls through for multipart posts that decode to no action on a non-page route", async () => {
     const response = await handleProgressiveServerActionRequest(
       createOptions({
@@ -1302,7 +1402,7 @@ describe("app server action execution helpers", () => {
         createTemporaryReferenceSet() {
           return temporaryReferences;
         },
-        decodeReply(body, options) {
+        decodeReply(body, _serverManifest, options) {
           expect(body).toBe("encoded-flight-body");
           expect(options.temporaryReferences).toBe(temporaryReferences);
           return Promise.resolve(["first", "second"]);
@@ -1382,6 +1482,156 @@ describe("app server action execution helpers", () => {
     });
     errorSpy.mockRestore();
   });
+
+  // Ported from Next.js: test/e2e/on-request-error/server-action-error/server-action-error.test.ts
+  // https://github.com/vercel/next.js/blob/v16.2.7/test/e2e/on-request-error/server-action-error/server-action-error.test.ts
+  it("reports a production fetch action failure once, through the render of its rejected result", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = new Error("connect postgres://admin:s3cret@10.0.0.5:5432/prod failed");
+      const reportRequestError = vi.fn();
+      let rejection: Promise<unknown> | undefined;
+
+      const response = await withEnvVar("NODE_ENV", "production", () =>
+        handleServerActionRscRequest(
+          createRscOptions({
+            createRscOnErrorHandler(request, pathname, routePath, overrides) {
+              return createRealRscOnErrorHandler({
+                errorContext: {
+                  routerKind: "App Router",
+                  routePath,
+                  routeType: overrides?.routeType ?? "render",
+                  renderSource: overrides?.renderSource,
+                  revalidateReason: undefined,
+                },
+                nodeEnv: "production",
+                reportRequestError,
+                requestInfo: { path: pathname, method: request.method, headers: {} },
+              });
+            },
+            loadServerAction() {
+              return Promise.resolve(() => {
+                throw error;
+              });
+            },
+            // Like React's Flight render, hand the rejection to onError.
+            renderToReadableStream(model, { onError }) {
+              rejection = (model.returnValue.data as Promise<never>).catch((reason) => ({
+                digest: onError?.(reason),
+                reason,
+              }));
+              return new Response("action-error-flight").body;
+            },
+            sanitizeErrorForClient(thrown) {
+              return sanitizeErrorForClient(thrown, "production");
+            },
+          }),
+        ),
+      );
+
+      expect(response?.status).toBe(500);
+      const { digest, reason } = (await rejection) as { digest: unknown; reason: unknown };
+      expect(reason).toBeInstanceOf(Error);
+      expect((reason as Error).message).toBe(PRODUCTION_SERVER_COMPONENTS_ERROR_MESSAGE);
+      expect(digest).toEqual(expect.any(String));
+      expect(digest).toBe((reason as { digest?: unknown }).digest);
+      expect(reportRequestError).toHaveBeenCalledTimes(1);
+      expect(reportRequestError).toHaveBeenCalledWith(
+        error,
+        expect.objectContaining({ path: "/dashboard", method: "POST" }),
+        expect.objectContaining({
+          routeType: "action",
+          renderSource: "react-server-components-payload",
+        }),
+      );
+      expect(errorSpy).toHaveBeenCalledWith("[vinext] Server action error:", error);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("logs a development fetch action failure that already has a digest", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // The render's onError does not log errors that already have a digest.
+      const thrown = Object.assign(new Error("digested"), { digest: "custom" });
+      await handleServerActionRscRequest(
+        createRscOptions({
+          loadServerAction() {
+            return Promise.resolve(() => {
+              throw thrown;
+            });
+          },
+        }),
+      );
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledWith("[vinext] Server action error:", thrown);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  // Ported from Next.js: packages/next/src/lib/is-error.ts getProperError()
+  it.each([
+    [0, "0"],
+    [null, "null"],
+    [undefined, "undefined"],
+    [{ code: "DB_CONNECTION_FAILED" }, '{"code":"DB_CONNECTION_FAILED"}'],
+  ])(
+    "reports a development fetch action that throws %j once, as an Error",
+    async (thrown, message) => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const reportRequestError = vi.fn();
+        let rejection: Promise<unknown> | undefined;
+
+        await handleServerActionRscRequest(
+          createRscOptions({
+            createRscOnErrorHandler(request, pathname, routePath, overrides) {
+              return createRealRscOnErrorHandler({
+                errorContext: {
+                  routerKind: "App Router",
+                  routePath,
+                  routeType: overrides?.routeType ?? "render",
+                  renderSource: overrides?.renderSource,
+                  revalidateReason: undefined,
+                },
+                nodeEnv: "development",
+                reportRequestError,
+                requestInfo: { path: pathname, method: request.method, headers: {} },
+              });
+            },
+            loadServerAction() {
+              return Promise.resolve(() => {
+                throw thrown;
+              });
+            },
+            // Like React's Flight render, hand the rejection to onError.
+            renderToReadableStream(model, { onError }) {
+              rejection = (model.returnValue.data as Promise<never>).catch((reason) => {
+                onError?.(reason);
+                return reason;
+              });
+              return new Response("action-error-flight").body;
+            },
+          }),
+        );
+
+        // As in Next.js, the original value is rejected, and reported as an Error.
+        expect(await rejection).toBe(thrown);
+        expect(reportRequestError).toHaveBeenCalledTimes(1);
+        expect(reportRequestError).toHaveBeenCalledWith(
+          expect.objectContaining({ message }),
+          expect.objectContaining({ method: "POST" }),
+          expect.objectContaining({ routeType: "action" }),
+        );
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    },
+  );
 
   it("rerenders the page for failed fetch actions that revalidate", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1544,11 +1794,13 @@ describe("app server action execution helpers", () => {
     const renderToReadableStream = vi.fn(
       (model: TestActionModel) => new Response(JSON.stringify(model)).body,
     );
+    const createRscOnErrorHandler = vi.fn(() => () => undefined);
 
     const response = await runWithRootParamsScope({ lang: "en" }, () =>
       handleServerActionRscRequest(
         createRscOptions({
           buildPageElement,
+          createRscOnErrorHandler,
           loadServerAction() {
             return Promise.resolve(async () => {
               await Promise.resolve(revalidatePath("/dashboard"));
@@ -1568,6 +1820,15 @@ describe("app server action execution helpers", () => {
       root: "rerendered-page",
       returnValue: { ok: true, data: "updated" },
     });
+    expect(createRscOnErrorHandler).toHaveBeenCalledWith(
+      expect.any(Request),
+      "/dashboard",
+      "/dashboard",
+      {
+        renderSource: "react-server-components-payload",
+        routeType: "action",
+      },
+    );
   });
 
   it("allows deferred post-action render work to read root params", async () => {
@@ -1606,11 +1867,13 @@ describe("app server action execution helpers", () => {
     const renderToReadableStream = vi.fn(
       (model: TestActionModel) => new Response(JSON.stringify(model)).body,
     );
+    const createRscOnErrorHandler = vi.fn(() => () => undefined);
 
     await withEnvVar("__VINEXT_RSC_COMPATIBILITY_ID", "compat-action", async () => {
       const response = await handleServerActionRscRequest(
         createRscOptions({
           buildPageElement,
+          createRscOnErrorHandler,
           loadServerAction() {
             return Promise.resolve(() => {
               deferredRead = deferred.then(() => getRootParam("lang"));
@@ -1629,6 +1892,15 @@ describe("app server action execution helpers", () => {
       expect(response?.headers.get("x-action-revalidated")).toBeNull();
       expect(buildPageElement).not.toHaveBeenCalled();
       expect(setNavigationContext).not.toHaveBeenCalled();
+      expect(createRscOnErrorHandler).toHaveBeenCalledWith(
+        expect.any(Request),
+        "/dashboard",
+        "/dashboard",
+        {
+          renderSource: "react-server-components-payload",
+          routeType: "action",
+        },
+      );
 
       const model = JSON.parse(await response!.text()) as Partial<TestActionModel>;
       expect(model.returnValue).toEqual({ ok: true, data: "action-result" });
@@ -1656,6 +1928,26 @@ describe("app server action execution helpers", () => {
 
     expect(response?.status).toBe(200);
     expect(response?.headers.get("x-action-revalidated")).toBe("1");
+  });
+
+  it("sends the path and query an action re-render rendered with", async () => {
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        loadServerAction() {
+          return Promise.resolve(async () => {
+            await Promise.resolve(revalidatePath("/dashboard"));
+            return "revalidated";
+          });
+        },
+        // The query a rewrite resolved, not the one in the page URL.
+        searchParams: new URLSearchParams("q=rewritten value"),
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("X-Vinext-Rendered-Path-And-Search")).toBe(
+      encodeURIComponent("/dashboard?q=rewritten+value"),
+    );
   });
 
   it("renders same-origin action redirects as a single-pass Flight response", async () => {
@@ -1690,7 +1982,11 @@ describe("app server action execution helpers", () => {
   });
 
   it("passes empty request APIs to force-static action rerender targets", async () => {
-    const buildInputs: Array<{ query: string; header: string | null }> = [];
+    const buildInputs: Array<{
+      query: string;
+      header: string | null;
+      isForceStatic: boolean | undefined;
+    }> = [];
     const targetRoute: TestRoute = {
       id: "dashboard",
       page: {},
@@ -1699,10 +1995,11 @@ describe("app server action execution helpers", () => {
     };
     const response = await handleServerActionRscRequest(
       createRscOptions({
-        buildPageElement({ searchParams }) {
+        buildPageElement({ isForceStatic, searchParams }) {
           buildInputs.push({
             query: searchParams.toString(),
             header: getHeadersContext()?.headers.get("x-request-value") ?? null,
+            isForceStatic,
           });
           return "force-static-target";
         },
@@ -1724,7 +2021,8 @@ describe("app server action execution helpers", () => {
     );
 
     expect(response?.status).toBe(200);
-    expect(buildInputs).toEqual([{ query: "", header: null }]);
+    // Client pages also read an empty query in the browser.
+    expect(buildInputs).toEqual([{ query: "", header: null, isForceStatic: true }]);
   });
 
   it("observes searchParams access for dynamic-error action rerender targets", async () => {
@@ -2538,12 +2836,11 @@ describe("app server action execution helpers", () => {
       expect(response?.status).toBe(500);
       expect(await response?.text()).toBe("too-many-args-flight");
       expect(action).not.toHaveBeenCalled();
-      expect(renderedModel).toEqual({
-        returnValue: {
-          ok: false,
-          data: "Server Action arguments list is too long (1001). Maximum allowed is 1000.",
-        },
-      });
+      expect(renderedModel).toEqual({ returnValue: { ok: false, data: expect.any(Promise) } });
+      const { returnValue } = renderedModel as unknown as CapturedActionModel;
+      await expect(returnValue.data).rejects.toBe(
+        "Server Action arguments list is too long (1001). Maximum allowed is 1000.",
+      );
     } finally {
       errorSpy.mockRestore();
     }
@@ -2719,6 +3016,155 @@ describe("app server action execution helpers", () => {
     expect(decodeReply).not.toHaveBeenCalled();
   });
 
+  it("accepts plugin-rsc's hoisted registration for the requested source export", async () => {
+    const action = vi.fn(() => "saved");
+    Object.defineProperty(action, "$$id", {
+      value: "/app/actions.ts#$$hoist_0_save",
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/actions.ts#save",
+        loadServerAction() {
+          return Promise.resolve(action);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a hoisted registration for a default-exported action", async () => {
+    const action = vi.fn(() => "saved");
+    Object.defineProperty(action, "$$id", {
+      value: "/app/actions.ts#$$hoist_0_save",
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/actions.ts#default",
+        loadServerAction() {
+          return Promise.resolve(action);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a server action registered under another export alias", async () => {
+    const action = vi.fn(() => "saved");
+    Object.defineProperty(action, "$$id", {
+      value: "/app/actions.ts#submit",
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/actions.ts#save",
+        loadServerAction() {
+          return Promise.resolve(action);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not mistake a cache-like user export alias for an opaque cache reference", async () => {
+    const action = vi.fn(() => "saved");
+    Object.defineProperty(action, "$$id", {
+      value: "/app/actions.ts#$$vinext_cache_custom",
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/actions.ts#save",
+        loadServerAction() {
+          return Promise.resolve(action);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a source export whose registered server-reference id is different", async () => {
+    const hidden = vi.fn(() => "private");
+    Object.defineProperty(hidden, "$$id", {
+      value: `/app/records.ts#$$vinext_cache_${"a".repeat(64)}`,
+    });
+
+    const response = await handleServerActionRscRequest(
+      createRscOptions({
+        actionId: "/app/records.ts#readRecord",
+        loadServerAction() {
+          return Promise.resolve(hidden);
+        },
+      }),
+    );
+
+    expect(response?.status).toBe(404);
+    expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
+    expect(hidden).not.toHaveBeenCalled();
+  });
+
+  // React resolves each argument reference with `serverManifest[id]` and throws
+  // when the entry is missing; this decoder stands in for that lookup.
+  function createArgumentReferenceOptions(referenceIds: readonly string[], ownedIds: string[]) {
+    const action = vi.fn(() => "saved");
+    const validateActionReferences = vi.fn((actionIds: readonly string[]) =>
+      actionIds.every((actionId) => ownedIds.includes(actionId)),
+    );
+    const options = createRscOptions({
+      createServerManifest: () =>
+        new Proxy({}, { get: (_target, id) => ({ id, name: "", chunks: [] }) }),
+      decodeReply(_body, serverManifest) {
+        return referenceIds.map((referenceId) => {
+          const entry: unknown = Reflect.get(serverManifest, referenceId);
+          if (!entry) throw new Error(`Could not find the module "${referenceId}"`);
+          return () => entry;
+        });
+      },
+      loadServerAction: () => Promise.resolve(action),
+      validateActionReferences,
+    });
+    return { action, options, validateActionReferences };
+  }
+
+  it("decodes argument references to Server Actions of the current route", async () => {
+    const { action, options, validateActionReferences } = createArgumentReferenceOptions(
+      ["a#owned"],
+      ["a#owned"],
+    );
+
+    const response = await handleServerActionRscRequest(options);
+
+    expect(response?.status).toBe(200);
+    expect(validateActionReferences).toHaveBeenCalledWith(["a#owned"]);
+    expect(action).toHaveBeenCalledWith(expect.any(Function));
+  });
+
+  it("does not resolve argument references to Server Actions of another route", async () => {
+    const { action, options } = createArgumentReferenceOptions(
+      ["a#owned", "b#foreign"],
+      ["a#owned"],
+    );
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const response = await handleServerActionRscRequest(options);
+
+      expect(response?.status).toBe(500);
+      expect(action).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   // Reproduces the prod-build error path where the @vitejs/plugin-rsc server
   // references manifest doesn't include the requested action id. In a build
   // with NO server actions defined at all, the action loader throws
@@ -2729,7 +3175,7 @@ describe("app server action execution helpers", () => {
   // Ported from Next.js: test/e2e/app-dir/no-server-actions/no-server-actions.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/no-server-actions/no-server-actions.test.ts
   it("returns action-not-found when the prod build has no matching server reference", async () => {
-    const reportedErrors: Error[] = [];
+    const reportedErrors: unknown[] = [];
     const renderToReadableStream = vi.fn();
 
     const response = await handleServerActionRscRequest(
@@ -2754,7 +3200,7 @@ describe("app server action execution helpers", () => {
   });
 
   it("keeps unrelated server action loader failures on the generic error path", async () => {
-    const reportedErrors: Error[] = [];
+    const reportedErrors: unknown[] = [];
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const response = await handleServerActionRscRequest(
@@ -2770,7 +3216,9 @@ describe("app server action execution helpers", () => {
 
     expect(response?.status).toBe(500);
     expect(await response?.text()).toBe("Server action failed: module graph crashed");
-    expect(reportedErrors.map((error) => error.message)).toEqual(["module graph crashed"]);
+    expect(
+      reportedErrors.map((error) => (error instanceof Error ? error.message : String(error))),
+    ).toEqual(["module graph crashed"]);
 
     errorSpy.mockRestore();
   });
@@ -3336,5 +3784,178 @@ describe("client recognition of unrecognized server actions", () => {
   it("does not throw for a recognized action response", () => {
     // A recognized action returns an ordinary response without the not-found header.
     expect(() => throwOnServerActionNotFound(new Response("ok"), "abc")).not.toThrow();
+  });
+});
+
+describe("server reference module loading", () => {
+  // Server reference modules are imported on the first request that names
+  // them. Whatever the loaders and decoders observe is what module-scope
+  // cookies()/headers() would capture — and cache for every later caller.
+  // Next.js evaluates action modules outside the request store, where those
+  // calls throw (https://nextjs.org/docs/messages/next-dynamic-api-wrong-context).
+  function readSessionCookie(): Promise<string> {
+    return cookies().then(
+      (jar) => jar.get("session")?.value ?? "none",
+      () => "no-request",
+    );
+  }
+
+  function runAsCaller<T>(request: Request, fn: () => Promise<T>): Promise<T> {
+    return runWithRequestContext(
+      createRequestContext({ headersContext: headersContextFromRequest(request) }),
+      fn,
+    );
+  }
+
+  it("loads and decodes fetch action references outside the caller's request", async () => {
+    const request = createFetchActionRequest({ cookie: "session=first-caller" });
+    const observed: Record<string, string> = {};
+
+    const response = await runAsCaller(request, () =>
+      handleServerActionRscRequest(
+        createRscOptions({
+          request,
+          async loadServerAction() {
+            observed.loadServerAction = await readSessionCookie();
+            return async () => readSessionCookie();
+          },
+          decodeReply() {
+            // React's decodeReply() returns a lazy chunk that only resolves —
+            // and imports the server references it carries — once awaited.
+            const lazyReply: PromiseLike<unknown[]> = {
+              // oxlint-disable-next-line unicorn/no-thenable
+              then(onFulfilled, onRejected) {
+                return readSessionCookie()
+                  .then((session) => {
+                    observed.decodeReply = session;
+                    return [];
+                  })
+                  .then(onFulfilled, onRejected);
+              },
+            };
+            return lazyReply as Promise<unknown[]>;
+          },
+        }),
+      ),
+    );
+
+    expect(observed).toEqual({ loadServerAction: "no-request", decodeReply: "no-request" });
+    // The action itself still runs in the caller's request.
+    expect(JSON.parse(await response!.text()).returnValue).toEqual({
+      ok: true,
+      data: "first-caller",
+    });
+  });
+
+  it("loads multipart fetch action references outside the caller's request", async () => {
+    const request = createFetchActionRequest({ cookie: "session=first-caller" });
+    let observed: string | undefined;
+
+    await runAsCaller(request, () =>
+      handleServerActionRscRequest(
+        createRscOptions({
+          contentType: "multipart/form-data; boundary=vinext",
+          request,
+          async loadServerAction() {
+            observed = await readSessionCookie();
+            return async () => "ok";
+          },
+        }),
+      ),
+    );
+
+    expect(observed).toBe("no-request");
+  });
+
+  // The imports are memoized for the isolate, and workerd drops a canceled
+  // request's pending I/O, so the caller stays alive until they settle.
+  it.each([
+    ["decodes a progressive action", "progressive"],
+    ["loads a fetch action", "fetch"],
+  ] as const)("keeps the request that %s alive until its references load", async (_name, kind) => {
+    let entered: () => void = () => {};
+    const loading = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release: () => void = () => {};
+    const loaded = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const load = async () => {
+      entered();
+      await loaded;
+    };
+    const waitUntil = vi.fn();
+    const formData = new FormData();
+    formData.set("$ACTION_ID_test", "");
+    const request = kind === "progressive" ? createMultipartRequest() : createFetchActionRequest();
+
+    const handled = runWithRequestContext(
+      createRequestContext({
+        executionContext: { waitUntil },
+        headersContext: headersContextFromRequest(request),
+      }),
+      () =>
+        kind === "progressive"
+          ? handleProgressiveServerActionRequest(
+              createOptions({
+                request,
+                async decodeAction() {
+                  await load();
+                  return async () => {};
+                },
+                readFormDataWithLimit: () => Promise.resolve(formData),
+              }),
+            )
+          : handleServerActionRscRequest(
+              createRscOptions({
+                request,
+                async loadServerAction() {
+                  await load();
+                  return async () => "ok";
+                },
+              }),
+            ),
+    );
+
+    await loading;
+    expect(waitUntil).toHaveBeenCalledOnce();
+    release();
+    await handled;
+  });
+
+  it("decodes progressive action references outside the caller's request", async () => {
+    const request = createMultipartRequest({ cookie: "session=first-caller" });
+    const formData = new FormData();
+    formData.set("$ACTION_ID_test", "");
+    const observed: Record<string, string> = {};
+
+    await runAsCaller(request, () =>
+      handleProgressiveServerActionRequest(
+        createOptions({
+          request,
+          async decodeAction() {
+            observed.decodeAction = await readSessionCookie();
+            return async () => {
+              observed.action = await readSessionCookie();
+            };
+          },
+          async decodeFormState() {
+            observed.decodeFormState = await readSessionCookie();
+            return undefined;
+          },
+          readFormDataWithLimit() {
+            return Promise.resolve(formData);
+          },
+        }),
+      ),
+    );
+
+    expect(observed).toEqual({
+      decodeAction: "no-request",
+      // The action itself still runs in the caller's request.
+      action: "first-caller",
+      decodeFormState: "no-request",
+    });
   });
 });

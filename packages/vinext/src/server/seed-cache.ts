@@ -8,7 +8,7 @@
  *
  * This is only useful for the MemoryCacheHandler (the default for Node.js
  * production). Persistent backends like KV already retain entries across
- * deploys and can be pre-populated via TPR or similar mechanisms.
+ * deploys and can be pre-populated from prerendered artifacts.
  *
  * Consistency model:
  * - The manifest is authoritative for which routes were pre-rendered and their
@@ -34,7 +34,7 @@ import path from "pathslash";
 import type { CachedAppPageValue, CachedRouteValue } from "vinext/shims/cache-handler";
 import {
   appIsrCacheKey,
-  isrCacheKey,
+  appIsrFallbackShellKey,
   isrSet,
   isrSetPrerenderedAppPage,
   type IsrWritePolicy,
@@ -47,6 +47,7 @@ import {
 } from "../utils/prerender-output-paths.js";
 import {
   addPregeneratedConcretePath,
+  addPregeneratedRoute,
   clearPregeneratedConcretePaths,
   normalizePregeneratedPathname,
 } from "./pregenerated-concrete-paths.js";
@@ -71,6 +72,7 @@ type PrerenderCacheSeedMetadata = {
 
 type PrerenderCacheSeedOptions = {
   buildAppPageHtmlKey?: (pathname: string) => string;
+  buildAppPageFallbackShellKey?: (pathname: string, suffix: "html" | "rsc") => string;
   buildAppPageRscKey?: (pathname: string) => string;
   buildAppRouteKey?: (pathname: string) => string;
   writeAppPageEntry?: (
@@ -119,22 +121,36 @@ export async function seedMemoryCacheFromPrerender(
   const writeAppRouteEntry = options?.writeAppRouteEntry ?? isrSet;
   let seeded = 0;
 
+  for (const route of routes) {
+    if (route.status === "skipped" && route.reason === "empty-static-params") {
+      addPregeneratedRoute(route.route);
+    }
+  }
+
   const appRoutes = getRenderedAppRoutes(routes);
 
   for (const route of appRoutes) {
     const concretePathname = route.path ?? route.route;
-    if (!isFallbackShellArtifactPath(concretePathname, route)) {
+    const isFallbackShell = isFallbackShellArtifactPath(concretePathname, route);
+    if (!isFallbackShell) {
       addPregeneratedConcretePath(route.route, concretePathname);
     }
 
     const artifactPathname = route.path ?? route.route;
     const cachePathname = normalizePregeneratedPathname(artifactPathname);
-    // Fallback keys support older generated entries that do not export their
+    // Default keys support older generated entries that do not export their
     // runtime key builders. Current App Router entries inject buildAppPage*Key
     // so seeded keys match process.env.__VINEXT_BUILD_ID exactly.
-    const baseKey = isrCacheKey("app", cachePathname, buildId);
-    const htmlKey = options?.buildAppPageHtmlKey?.(cachePathname) ?? baseKey + ":html";
-    const rscKey = options?.buildAppPageRscKey?.(cachePathname) ?? baseKey + ":rsc";
+    const htmlKey = isFallbackShell
+      ? (options?.buildAppPageFallbackShellKey?.(cachePathname, "html") ??
+        appIsrFallbackShellKey(cachePathname, "html", buildId))
+      : (options?.buildAppPageHtmlKey?.(cachePathname) ??
+        appIsrCacheKey(cachePathname, "html", buildId));
+    const rscKey = isFallbackShell
+      ? (options?.buildAppPageFallbackShellKey?.(cachePathname, "rsc") ??
+        appIsrFallbackShellKey(cachePathname, "rsc", buildId))
+      : (options?.buildAppPageRscKey?.(cachePathname) ??
+        appIsrCacheKey(cachePathname, "rsc", buildId));
     const revalidateSeconds = typeof route.revalidate === "number" ? route.revalidate : undefined;
     const expireSeconds = typeof route.expire === "number" ? route.expire : undefined;
     const staleSeconds =
@@ -144,6 +160,11 @@ export async function seedMemoryCacheFromPrerender(
     // prerender so revalidatePath()/revalidateTag() can invalidate the seeded
     // page artifact, not only its nested data-cache entries (#1486).
     const tags = buildAppPageCacheTags(cachePathname, route.tags ?? []);
+    // A page's special error that escaped the shell is seeded with its status
+    // on both entries, and a redirect with its location, as runtime ISR stores it.
+    const status = route.responseStatus;
+    const location = route.headers?.location;
+    const rscHeaders = status !== undefined && location !== undefined ? { location } : undefined;
 
     if (
       await seedHtml(
@@ -153,6 +174,7 @@ export async function seedMemoryCacheFromPrerender(
         artifactPathname,
         trailingSlash,
         route.headers,
+        status,
         revalidateSeconds,
         expireSeconds,
         staleSeconds,
@@ -164,6 +186,8 @@ export async function seedMemoryCacheFromPrerender(
         prerenderDir,
         rscKey,
         artifactPathname,
+        rscHeaders,
+        status,
         revalidateSeconds,
         expireSeconds,
         staleSeconds,
@@ -224,6 +248,7 @@ async function seedHtml(
   pathname: string,
   trailingSlash: boolean,
   headers: Record<string, string | string[]> | undefined,
+  status: number | undefined,
   revalidateSeconds: number | undefined,
   expireSeconds: number | undefined,
   staleSeconds: number | undefined,
@@ -239,7 +264,7 @@ async function seedHtml(
     rscData: undefined,
     headers,
     postponed: undefined,
-    status: undefined,
+    status,
   };
 
   await writeAppPageEntry(key, htmlValue, { expireSeconds, revalidateSeconds, staleSeconds, tags });
@@ -256,6 +281,8 @@ async function seedRsc(
   prerenderDir: string,
   key: string,
   pathname: string,
+  headers: Record<string, string | string[]> | undefined,
+  status: number | undefined,
   revalidateSeconds: number | undefined,
   expireSeconds: number | undefined,
   staleSeconds: number | undefined,
@@ -273,9 +300,9 @@ async function seedRsc(
       rscBuffer.byteOffset,
       rscBuffer.byteOffset + rscBuffer.byteLength,
     ),
-    headers: undefined,
+    headers,
     postponed: undefined,
-    status: undefined,
+    status,
   };
 
   await writeAppPageEntry(key, rscValue, { expireSeconds, revalidateSeconds, staleSeconds, tags });

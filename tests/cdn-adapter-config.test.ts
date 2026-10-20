@@ -8,9 +8,10 @@ import {
   finalizeCdnAdapterBuildOutput,
 } from "../packages/cloudflare/src/cache/cdn-adapter-config.js";
 import {
-  cdnAdapter,
+  workersCacheCdnAdapter,
   DEFAULT_CDN_VERSION_METADATA_BINDING,
-} from "../packages/cloudflare/src/cache/cdn-adapter.js";
+} from "../packages/cloudflare/src/cache/workers-cache-cdn-adapter.js";
+import { responseStoreAdapter } from "../packages/cloudflare/src/cache/response-store-adapter.js";
 import { resolveCdnAdapterConfig } from "../packages/cloudflare/src/deploy-config.js";
 import { assertCdnVersionMetadataConfig } from "../packages/cloudflare/src/wrangler-version-metadata.js";
 
@@ -51,12 +52,14 @@ describe("Cloudflare CDN adapter generated config", () => {
     });
 
     await finalizeCdnAdapterBuildOutput({
+      root,
       outDir: path.dirname(auxiliaryPath),
       isPrimaryServerOutput: false,
       binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
       bindingIsExplicit: false,
     });
     await finalizeCdnAdapterBuildOutput({
+      root,
       outDir: path.dirname(generatedPath),
       isPrimaryServerOutput: true,
       binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
@@ -85,6 +88,7 @@ describe("Cloudflare CDN adapter generated config", () => {
     });
 
     await finalizeCdnAdapterBuildOutput({
+      root,
       outDir: path.dirname(generatedPath),
       isPrimaryServerOutput: true,
       binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
@@ -104,6 +108,7 @@ describe("Cloudflare CDN adapter generated config", () => {
     const before = fs.readFileSync(auxiliaryPath, "utf8");
 
     await finalizeCdnAdapterBuildOutput({
+      root,
       outDir: path.dirname(auxiliaryPath),
       isPrimaryServerOutput: false,
       binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
@@ -124,6 +129,7 @@ describe("Cloudflare CDN adapter generated config", () => {
     });
 
     await finalizeCdnAdapterBuildOutput({
+      root,
       outDir: path.dirname(primaryPath),
       isPrimaryServerOutput: true,
       binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
@@ -141,6 +147,7 @@ describe("Cloudflare CDN adapter generated config", () => {
 
     await expect(
       finalizeCdnAdapterBuildOutput({
+        root,
         outDir,
         isPrimaryServerOutput: true,
         binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
@@ -151,6 +158,21 @@ describe("Cloudflare CDN adapter generated config", () => {
     );
   });
 
+  it("defers CDN policy finalization to Cloudflare Build Output config", async () => {
+    writeJson("cloudflare.config.ts", {});
+    const outDir = path.join(root, ".cloudflare/output/v0/workers/default/bundle");
+
+    await expect(
+      finalizeCdnAdapterBuildOutput({
+        root,
+        outDir,
+        isPrimaryServerOutput: true,
+        binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
+        bindingIsExplicit: false,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it("rejects a malformed generated config in the primary output", async () => {
     const generatedPath = path.join(root, "dist/server/wrangler.json");
     fs.mkdirSync(path.dirname(generatedPath), { recursive: true });
@@ -158,6 +180,7 @@ describe("Cloudflare CDN adapter generated config", () => {
 
     await expect(
       finalizeCdnAdapterBuildOutput({
+        root,
         outDir: path.dirname(generatedPath),
         isPrimaryServerOutput: true,
         binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
@@ -172,6 +195,7 @@ describe("Cloudflare CDN adapter generated config", () => {
       version_metadata: { binding: DEFAULT_CDN_VERSION_METADATA_BINDING },
     });
     await finalizeCdnAdapterBuildOutput({
+      root,
       outDir: path.dirname(generatedPath),
       isPrimaryServerOutput: true,
       binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
@@ -180,6 +204,7 @@ describe("Cloudflare CDN adapter generated config", () => {
     const before = fs.readFileSync(generatedPath, "utf8");
 
     await finalizeCdnAdapterBuildOutput({
+      root,
       outDir: path.dirname(generatedPath),
       isPrimaryServerOutput: true,
       binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
@@ -189,7 +214,7 @@ describe("Cloudflare CDN adapter generated config", () => {
     expect(fs.readFileSync(generatedPath, "utf8")).toBe(before);
   });
 
-  it("rejects an existing custom binding when cdnAdapter uses its default", async () => {
+  it("rejects an existing custom binding when workersCacheCdnAdapter uses its default", async () => {
     const generatedPath = writeGeneratedConfig("dist/server/wrangler.json", {
       name: "test-worker",
       version_metadata: { binding: "EXISTING_VERSION" },
@@ -197,12 +222,15 @@ describe("Cloudflare CDN adapter generated config", () => {
 
     await expect(
       finalizeCdnAdapterBuildOutput({
+        root,
         outDir: path.dirname(generatedPath),
         isPrimaryServerOutput: true,
         binding: DEFAULT_CDN_VERSION_METADATA_BINDING,
         bindingIsExplicit: false,
       }),
-    ).rejects.toThrow('configure cdnAdapter({ versionMetadataBinding: "EXISTING_VERSION" })');
+    ).rejects.toThrow(
+      'configure workersCacheCdnAdapter({ versionMetadataBinding: "EXISTING_VERSION" })',
+    );
     expect(JSON.parse(fs.readFileSync(generatedPath, "utf8")).version_metadata).toEqual({
       binding: "EXISTING_VERSION",
     });
@@ -229,7 +257,7 @@ describe("Cloudflare CDN adapter generated config", () => {
   });
 
   it("exposes finalization only for Cloudflare builds", () => {
-    const output = cdnAdapter().output;
+    const output = workersCacheCdnAdapter().output;
     expect(output.matchesBuild({ plugins: [{ name: "vite-plugin-cloudflare" }] })).toBe(true);
     expect(output.matchesBuild({ plugins: [{ name: "vite-plugin-cloudflare:deploy" }] })).toBe(
       true,
@@ -300,14 +328,17 @@ describe("vinext cache adapter output hook", () => {
 
 describe("CDN version metadata deploy validation", () => {
   it("resolves the built-in adapter's default and custom bindings", () => {
-    expect(resolveCdnAdapterConfig({ cdn: cdnAdapter() })).toEqual({
+    expect(resolveCdnAdapterConfig({ cdn: workersCacheCdnAdapter() })).toEqual({
       versionMetadataBinding: DEFAULT_CDN_VERSION_METADATA_BINDING,
     });
     expect(
       resolveCdnAdapterConfig({
-        cdn: cdnAdapter({ versionMetadataBinding: "CUSTOM_VERSION" }),
+        cdn: workersCacheCdnAdapter({ versionMetadataBinding: "CUSTOM_VERSION" }),
       }),
     ).toEqual({ versionMetadataBinding: "CUSTOM_VERSION" });
+    expect(resolveCdnAdapterConfig(responseStoreAdapter())).toEqual({
+      versionMetadataBinding: DEFAULT_CDN_VERSION_METADATA_BINDING,
+    });
     expect(resolveCdnAdapterConfig({ cdn: { adapter: "custom-adapter" } })).toBeNull();
   });
 

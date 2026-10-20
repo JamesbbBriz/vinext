@@ -666,7 +666,7 @@ describe("ISR (Pages Router)", () => {
     const res = await fetch(`${baseUrl}/about`);
     expect(res.status).toBe(200);
     expect(res.headers.get("x-vinext-cache")).toBeNull();
-    expect(res.headers.get("cache-control")).toBeNull();
+    expect(res.headers.get("cache-control")).toBe("no-cache, must-revalidate");
   });
 });
 
@@ -1602,6 +1602,27 @@ describe("i18n domain routing with basePath (Pages Router)", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toContain('href="http://example.fr/app/about" id="switch-locale"');
+  });
+
+  // Next.js renders the shared getStaticProps /404 for "/404", keeping the
+  // request's trailing slash even when a locale prefix is stripped.
+  it("renders the shared /404 for its own path under a locale prefix", async () => {
+    // A locale-prefixed miss, a direct status request and a rewritten miss.
+    for (const [path, host, requestToken] of [
+      ["/app/en/missing-share-token/", "example.fr", "missing-share-token"],
+      ["/app/fr/404/", "example.com", "/fr/404"],
+      ["/app/missing-alias/", "example.com", "missing-alias"],
+    ]) {
+      const res = await requestNodeServerWithHost(domainPort, path, host);
+
+      if (requestToken === "missing-share-token") expect(res.status).toBe(404);
+      // Vite's dev html-proxy script URLs carry the request path, so check the
+      // rendered router state rather than the whole document.
+      expect({ path, body: res.body.match(/<p id="as-path">[^<]*<\/p>/)?.[0] }).toEqual({
+        path,
+        body: '<p id="as-path">/404/</p>',
+      });
+    }
   });
 });
 
@@ -3457,6 +3478,49 @@ describe("createAppPageRouteBodyMetadata (body-placement canonical)", () => {
     expect(html).toMatch(/<script>document\.querySelectorAll[\s\S]*<\/script><\/div>$/);
   });
 
+  it("body placement: uses opaque icon keys that vary with pathname and metadata", () => {
+    const marker = (pathname: string, icon: string) => {
+      const node = createAppPageRouteBodyMetadata({ icons: { icon } }, pathname, "body");
+      const html = renderToStaticMarkup(node as React.ReactElement);
+      const key = html.match(/data-vinext-streamed-icon="([^"]+)"/)?.[1];
+      expect(key).toMatch(/^vi[a-z0-9]+:0$/);
+      return key;
+    };
+
+    const key = marker("/blog/my-post:pk5ufy:0", "/favicon.ico");
+    expect(marker("/blog/my-post:pk5ufy:0", "/favicon.ico")).toBe(key);
+    expect(marker("/blog/another-post", "/favicon.ico")).not.toBe(key);
+    expect(marker("/blog/my-post:pk5ufy:0", "/other.ico")).not.toBe(key);
+    // These paths collide under the previous single-round 32-bit FNV hash.
+    expect(marker("/products/vb9e3r", "/favicon.ico")).not.toBe(
+      marker("/products/obz81c", "/favicon.ico"),
+    );
+  });
+
+  it("body placement: keeps replacement patterns in the pathname out of icon markup", () => {
+    const render = (pathname: string) =>
+      renderToStaticMarkup(
+        createAppPageRouteBodyMetadata(
+          { icons: { icon: "/favicon.ico", apple: "/apple.png" } },
+          pathname,
+          "body",
+        ) as React.ReactElement,
+      );
+
+    // `$<` matters because attribute escaping turns `<` into `&lt;`, producing `$&`.
+    for (const pattern of ["$&", "$'", "$<"]) {
+      const html = render(`/blog/x${pattern} onerror=alert(1) x`);
+      expect(html).not.toContain("onerror");
+      const markers = [...html.matchAll(/data-vinext-streamed-icon="([^"]+)"/g)].map(
+        ([, marker]) => marker,
+      );
+      expect(markers).toHaveLength(2);
+      for (const marker of markers) {
+        expect(marker).toMatch(/^vi[a-z0-9]+:\d$/);
+      }
+    }
+  });
+
   it("body placement: serializes icon-bearing metadata once", () => {
     let titleReads = 0;
     const title = 'data-vinext-streamed-icon="vinext-pending-streamed-icon-key:0';
@@ -3479,7 +3543,7 @@ describe("createAppPageRouteBodyMetadata (body-placement canonical)", () => {
     expect(titleReads).toBe(2);
     expect(html).toContain(`<title>${title}</title>`);
     expect(html).not.toContain(' data-injected="true"');
-    expect(html).toContain("/icons&quot; data-injected=&quot;true:");
+    expect(html).not.toContain("/icons");
   });
 
   it("body placement: includes icon cleanup reconciliation without streamed icons", () => {
@@ -4162,7 +4226,7 @@ describe("instrumentation.ts support", () => {
       }),
     };
 
-    await runInstrumentation(mockRunner, "/fake/instrumentation.ts");
+    await runInstrumentation(mockRunner, "/fake/register-instrumentation.ts");
 
     expect(registerCalled).toBe(true);
     expect(getOnRequestErrorHandler()).toBe(mockOnRequestError);
@@ -4183,13 +4247,18 @@ describe("instrumentation.ts support", () => {
       }),
     };
 
-    await runInstrumentation(mockRunner, "/fake/instrumentation.ts");
+    await runInstrumentation(mockRunner, "/fake/report-error-instrumentation.ts");
 
     const testError = new Error("test error");
     await reportRequestError(
       testError,
       { path: "/blog/1", method: "GET", headers: {} },
-      { routerKind: "Pages Router", routePath: "/blog/[slug]", routeType: "render" },
+      {
+        routerKind: "Pages Router",
+        routePath: "/blog/[slug]",
+        routeType: "render",
+        revalidateReason: undefined,
+      },
     );
 
     expect(reportedErrors.length).toBe(1);
@@ -4214,7 +4283,12 @@ describe("instrumentation.ts support", () => {
     await reportRequestError(
       new Error("test"),
       { path: "/", method: "GET", headers: {} },
-      { routerKind: "App Router", routePath: "/", routeType: "render" },
+      {
+        routerKind: "App Router",
+        routePath: "/",
+        routeType: "render",
+        revalidateReason: undefined,
+      },
     );
   });
 
@@ -4230,24 +4304,89 @@ describe("instrumentation.ts support", () => {
     await runInstrumentation(mockRunner, "/fake/empty-instrumentation.ts");
   });
 
-  it("runInstrumentation handles import errors gracefully", async () => {
+  it("runInstrumentation propagates import errors", async () => {
     const { runInstrumentation } = await import("../packages/vinext/src/server/instrumentation.js");
     const mockRunner = {
       import: async (_id: string) => {
         throw new TypeError("Cannot read properties of undefined (reading 'outsideEmitter')");
       },
     };
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      await runInstrumentation(mockRunner, "/fake/instrumentation.ts");
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        "[vinext] Failed to load instrumentation:",
-        "Cannot read properties of undefined (reading 'outsideEmitter')",
-      );
-    } finally {
-      consoleErrorSpy.mockRestore();
-    }
+    await expect(runInstrumentation(mockRunner, "/fake/instrumentation.ts")).rejects.toThrow(
+      "Cannot read properties of undefined (reading 'outsideEmitter')",
+    );
   });
+
+  // Next.js propagates instrumentation registration failures during server preparation.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/dev/next-dev-server.ts
+  it("does not serve Pages dev requests when instrumentation registration fails", async () => {
+    const fs = await import("node:fs/promises");
+    const tmpDir = await createIsolatedFixture(PAGES_FIXTURE_DIR, "vinext-inst-failure-");
+    await fs.writeFile(
+      path.join(tmpDir, "instrumentation.ts"),
+      'export async function register() { throw new Error("instrumentation failed") }',
+    );
+
+    let server: ViteDevServer | undefined;
+    try {
+      const started = await startFixtureServer(tmpDir, { appDir: null });
+      server = started.server;
+      for (const [path, method] of [
+        ["/api/hello", "GET"],
+        ["/dedupe-script.js", "POST"],
+      ] as const) {
+        const response = await fetch(started.baseUrl + path, { method });
+        expect(response.status).toBe(500);
+        await expect(response.text()).resolves.toContain("instrumentation failed");
+      }
+    } finally {
+      await server?.close();
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  }, 30_000);
+
+  // Ported from Next.js: packages/next/src/server/route-modules/pages/pages-handler.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/route-modules/pages/pages-handler.ts
+  it("awaits Pages dev render error reporting before completing the response", async () => {
+    const fs = await import("node:fs/promises");
+    const tmpDir = await createIsolatedFixture(PAGES_FIXTURE_DIR, "vinext-pages-error-report-");
+    let server: ViteDevServer | undefined;
+    let baseUrl: string | undefined;
+    try {
+      const started = await startFixtureServer(tmpDir, { appDir: null });
+      server = started.server;
+      baseUrl = started.baseUrl;
+      await fetch(`${started.baseUrl}/api/instrumentation-test`, { method: "DELETE" });
+
+      let responseSettled = false;
+      const responsePromise = fetch(`${started.baseUrl}/gssp-throw`, {
+        headers: { "x-vinext-test-deferred-error": "1" },
+      }).then((response) => {
+        responseSettled = true;
+        return response;
+      });
+      await vi.waitFor(async () => {
+        const state = await fetch(`${started.baseUrl}/api/instrumentation-test`).then((value) =>
+          value.json(),
+        );
+        expect(state.errorReportStarted).toBe(true);
+      });
+      expect(responseSettled).toBe(false);
+      await fetch(`${started.baseUrl}/api/instrumentation-test`, { method: "PATCH" });
+
+      const response = await responsePromise;
+      expect(response.status).toBe(500);
+      const state = await fetch(`${started.baseUrl}/api/instrumentation-test`).then((value) =>
+        value.json(),
+      );
+      expect(state.errors).toContainEqual(expect.objectContaining({ path: "/gssp-throw" }));
+    } finally {
+      if (baseUrl) {
+        await fetch(`${baseUrl}/api/instrumentation-test`, { method: "PATCH" }).catch(() => {});
+      }
+      await server?.close();
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  }, 30_000);
 });
 
 describe("production server compression", () => {
@@ -4269,16 +4408,30 @@ describe("production server compression", () => {
     expect(negotiateEncoding(req as any)).toBe("identity");
   });
 
-  it("COMPRESSIBLE_TYPES includes expected content types", async () => {
-    const { COMPRESSIBLE_TYPES } = await import("../packages/vinext/src/server/prod-server.js");
-    expect(COMPRESSIBLE_TYPES.has("text/html")).toBe(true);
-    expect(COMPRESSIBLE_TYPES.has("application/javascript")).toBe(true);
-    expect(COMPRESSIBLE_TYPES.has("application/json")).toBe(true);
-    expect(COMPRESSIBLE_TYPES.has("text/css")).toBe(true);
-    expect(COMPRESSIBLE_TYPES.has("image/svg+xml")).toBe(true);
-    // Binary formats should not be compressible
-    expect(COMPRESSIBLE_TYPES.has("image/png")).toBe(false);
-    expect(COMPRESSIBLE_TYPES.has("image/jpeg")).toBe(false);
+  it("isCompressibleContentType matches Next.js's compressible() rules", async () => {
+    const { isCompressibleContentType } =
+      await import("../packages/vinext/src/server/prod-server.js");
+    expect(isCompressibleContentType("text/html")).toBe(true);
+    expect(isCompressibleContentType("application/javascript")).toBe(true);
+    expect(isCompressibleContentType("application/json")).toBe(true);
+    expect(isCompressibleContentType("text/css")).toBe(true);
+    expect(isCompressibleContentType("image/svg+xml")).toBe(true);
+    // RSC payloads, through the text/* rule.
+    expect(isCompressibleContentType("text/x-component")).toBe(true);
+    // Parameters, surrounding whitespace, and case are ignored.
+    expect(isCompressibleContentType(" Text/HTML ; charset=utf-8")).toBe(true);
+    // Structured-syntax suffixes and mime-db's compressible entries.
+    expect(isCompressibleContentType("application/x-custom+json")).toBe(true);
+    expect(isCompressibleContentType("application/vnd.api+xml")).toBe(true);
+    expect(isCompressibleContentType("font/ttf")).toBe(true);
+    expect(isCompressibleContentType("image/x-icon")).toBe(true);
+    // Binary formats, and responses without a Content-Type, are not.
+    expect(isCompressibleContentType("image/png")).toBe(false);
+    expect(isCompressibleContentType("image/jpeg")).toBe(false);
+    expect(isCompressibleContentType("font/woff2")).toBe(false);
+    expect(isCompressibleContentType("application/octet-stream")).toBe(false);
+    expect(isCompressibleContentType("")).toBe(false);
+    expect(isCompressibleContentType(null)).toBe(false);
   });
 
   it("COMPRESS_THRESHOLD is a reasonable minimum", async () => {
@@ -4481,10 +4634,11 @@ describe("production server compression", () => {
     sendCompressed(req as any, res as any, body, "text/html", 200, {}, true);
 
     expect(writtenStatus).toBe(200);
-    // Headers match what a GET would send (negotiated compression announced)…
-    expect(writtenHeaders["Content-Encoding"]).toBe("gzip");
+    // Like Next.js's compression middleware, HEAD responses are never
+    // compressed: they vary by Accept-Encoding and keep the identity length.
+    expect(writtenHeaders["Content-Encoding"]).toBeUndefined();
+    expect(writtenHeaders["Content-Length"]).toBe(String(Buffer.byteLength(body)));
     expect(writtenHeaders["Vary"]).toBe("Accept-Encoding");
-    // …but no body is written and the compressor is never spun up.
     expect(ended).toBe(true);
     expect(chunks).toEqual([]);
   });
@@ -4755,6 +4909,133 @@ describe("Set-Cookie header preservation in prod-server", () => {
     });
   }
 
+  it("sendWebResponse compresses RSC responses", async () => {
+    const { sendWebResponse } = await import("../packages/vinext/src/server/prod-server.js");
+    const payload = '0:["$","div",null,{"children":"' + "x".repeat(2000) + '"}]\n';
+    const response = new Response(payload, {
+      headers: { "content-type": "text/x-component" },
+    });
+    const req = {
+      method: "GET",
+      headers: { "accept-encoding": "gzip" },
+    };
+    const res = new CapturingNodeResponse();
+    const chunks: Buffer[] = [];
+    res.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+
+    await sendWebResponse(response, req as any, res as any, true);
+    await finished(res);
+
+    const rawBody = Buffer.concat(chunks);
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["Content-Encoding"]).toBe("gzip");
+    expect(String(res.headers["Vary"])).toContain("Accept-Encoding");
+    expect(rawBody.byteLength).toBeLessThan(Buffer.byteLength(payload));
+    expect(zlib.gunzipSync(rawBody).toString("utf8")).toBe(payload);
+  });
+
+  // The following ports the response filter of Next.js's compression middleware
+  // (next/dist/compiled/compression, installed by server/lib/router-server.ts).
+  async function sendWebResponseWithGzip(response: Response) {
+    const { sendWebResponse } = await import("../packages/vinext/src/server/prod-server.js");
+    const req = { method: "GET", headers: { "accept-encoding": "gzip" } };
+    const res = new CapturingNodeResponse();
+    const chunks: Buffer[] = [];
+    res.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    await sendWebResponse(response, req as any, res as any, true);
+    await finished(res);
+    return { res, body: Buffer.concat(chunks) };
+  }
+
+  it("sendWebResponse keeps a Content-Length below the threshold uncompressed", async () => {
+    const payload = "x".repeat(1023);
+    const { res, body } = await sendWebResponseWithGzip(
+      new Response(payload, {
+        headers: { "content-type": "text/x-component", "content-length": "1023" },
+      }),
+    );
+    expect(res.headers["Content-Encoding"]).toBeUndefined();
+    expect(res.headers["content-length"]).toBe("1023");
+    expect(res.headers["Vary"]).toBe("Accept-Encoding");
+    expect(body.toString()).toBe(payload);
+  });
+
+  it("sendWebResponse compresses streamed bodies of unknown length regardless of size", async () => {
+    const { res, body } = await sendWebResponseWithGzip(
+      new Response("small", { headers: { "content-type": "text/x-component" } }),
+    );
+    expect(res.headers["Content-Encoding"]).toBe("gzip");
+    expect(zlib.gunzipSync(body).toString()).toBe("small");
+  });
+
+  it("sendWebResponse honors Cache-Control: no-transform", async () => {
+    const payload = "x".repeat(2000);
+    const { res, body } = await sendWebResponseWithGzip(
+      new Response(payload, {
+        headers: { "content-type": "text/html", "cache-control": "public, no-transform" },
+      }),
+    );
+    expect(res.headers["Content-Encoding"]).toBeUndefined();
+    expect(res.headers["Vary"]).toBeUndefined();
+    expect(body.toString()).toBe(payload);
+  });
+
+  it("sendWebResponse varies empty compressible responses without encoding them", async () => {
+    const { res } = await sendWebResponseWithGzip(
+      new Response(null, { status: 204, headers: { "content-type": "text/html" } }),
+    );
+    expect(res.statusCode).toBe(204);
+    expect(res.headers["Content-Encoding"]).toBeUndefined();
+    expect(res.headers["Vary"]).toBe("Accept-Encoding");
+  });
+
+  it("sendWebResponse does not compress or vary non-compressible types", async () => {
+    const { res } = await sendWebResponseWithGzip(
+      new Response("x".repeat(2000), { headers: { "content-type": "image/png" } }),
+    );
+    expect(res.headers["Content-Encoding"]).toBeUndefined();
+    expect(res.headers["Vary"]).toBeUndefined();
+  });
+
+  it("sendWebResponse does not compress when compression is disabled", async () => {
+    const { sendWebResponse } = await import("../packages/vinext/src/server/prod-server.js");
+    const req = { method: "GET", headers: { "accept-encoding": "gzip" } };
+    const res = new CapturingNodeResponse();
+    res.resume();
+    await sendWebResponse(
+      new Response("x".repeat(2000), { headers: { "content-type": "text/x-component" } }),
+      req as any,
+      res as any,
+      false,
+    );
+    await finished(res);
+    expect(res.headers["Content-Encoding"]).toBeUndefined();
+    expect(res.headers["Vary"]).toBeUndefined();
+  });
+
+  it("sendCompressed does not re-encode a body that already has a Content-Encoding", async () => {
+    const { sendCompressed } = await import("../packages/vinext/src/server/prod-server.js");
+    const encoded = zlib.gzipSync("x".repeat(2000));
+    const req = { method: "GET", headers: { "accept-encoding": "gzip" } };
+    const res = new CapturingNodeResponse();
+    const chunks: Buffer[] = [];
+    res.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    sendCompressed(
+      req as any,
+      res as any,
+      encoded,
+      "application/json",
+      200,
+      { "content-encoding": "gzip" },
+      true,
+    );
+    await finished(res);
+    expect(res.headers["content-encoding"]).toBe("gzip");
+    expect(res.headers["Content-Encoding"]).toBeUndefined();
+    expect(res.headers["Vary"]).toBe("Accept-Encoding");
+    expect(Buffer.concat(chunks).equals(encoded)).toBe(true);
+  });
+
   it("sendWebResponse cancels streamed bodies for HEAD requests", async () => {
     const { sendWebResponse } = await import("../packages/vinext/src/server/prod-server.js");
 
@@ -4797,7 +5078,8 @@ describe("Set-Cookie header preservation in prod-server", () => {
 
     expect(status).toBe(200);
     expect(writtenHeaders["content-type"]).toBe("text/html; charset=utf-8");
-    expect(writtenHeaders["Content-Encoding"]).toBe("br");
+    // HEAD responses are never compressed, matching Next.js.
+    expect(writtenHeaders["Content-Encoding"]).toBeUndefined();
     expect(writtenHeaders["Vary"]).toContain("Accept-Encoding");
     expect(ended).toBe(true);
     expect(chunks).toEqual([]);
@@ -4824,8 +5106,63 @@ describe("Set-Cookie header preservation in prod-server", () => {
     await finished(res);
 
     expect(res.statusCode).toBe(200);
-    expect(res.headers["Vary"]).toBeUndefined();
+    expect(res.headers["content-encoding"]).toBe("br");
+    // Next.js's compression middleware adds Vary before it sees the
+    // existing encoding.
+    expect(res.headers["Vary"]).toBe("Accept-Encoding");
     expect(Buffer.concat(chunks).toString()).toBe("encoded");
+  });
+
+  it("sendWebResponse resolves after the response body finishes", async () => {
+    const { sendWebResponse } = await import("../packages/vinext/src/server/prod-server.js");
+    let release!: () => void;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("first"));
+          release = () => {
+            controller.enqueue(new TextEncoder().encode("last"));
+            controller.close();
+          };
+        },
+      }),
+    );
+    const res = new CapturingNodeResponse();
+    res.resume();
+    let resolved = false;
+
+    const sending = sendWebResponse(
+      response,
+      { method: "GET", headers: {} } as any,
+      res as any,
+      false,
+    ).then(() => {
+      resolved = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(resolved).toBe(false);
+    release();
+    await sending;
+    expect(resolved).toBe(true);
+  });
+
+  it("keeps the Node request boundary open for an asynchronously piped response", async () => {
+    const { waitForNodeResponseCompletion } =
+      await import("../packages/vinext/src/server/prod-server.js");
+    const res = new CapturingNodeResponse();
+    res.resume();
+    let resolved = false;
+
+    const waiting = waitForNodeResponseCompletion(res as any).then(() => {
+      resolved = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(resolved).toBe(false);
+
+    res.end("static body");
+    await waiting;
+    expect(resolved).toBe(true);
   });
 
   it("sendWebResponse varies identity responses by Accept-Encoding", async () => {

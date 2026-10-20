@@ -3,7 +3,11 @@ import type { NavigationContext } from "vinext/shims/navigation";
 import type { RootParams } from "vinext/shims/root-params";
 import { _consumeRequestScopedCacheLife } from "vinext/shims/cache-request-state";
 import type { CacheControlMetadata } from "vinext/shims/cache-handler";
-import { consumeDynamicUsage, consumeInvalidDynamicUsageError } from "vinext/shims/headers";
+import {
+  consumeDynamicUsage,
+  consumeInvalidDynamicUsageError,
+  isRenderDynamicLatched,
+} from "vinext/shims/headers";
 import { getCollectedFetchTags } from "vinext/shims/fetch-cache";
 import {
   consumeAppPageRenderObservationState,
@@ -18,11 +22,14 @@ import {
 } from "./app-page-execution.js";
 import {
   buildAppPageLinkHeader,
+  createAppPageSsrErrorHandler,
   isAppSsrRenderResult,
   type AppPageSsrHandler,
 } from "./app-page-stream.js";
 import { readStreamAsText } from "../utils/text-stream.js";
 import { buildAppPageTags } from "./implicit-tags.js";
+import { recordAppPageRenderError, traceAppPageRender } from "./app-page-tracing.js";
+import type { FrameworkSpan } from "./framework-tracer.js";
 
 type AppPageRenderableElement = ReactNode | Record<string, ReactNode>;
 type AppPageCacheRoute = {
@@ -42,9 +49,18 @@ export type RenderAppPageCacheArtifactsOptions = {
   getNavigationContext: () => NavigationContext | null;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
   mountedSlotsHeader?: string | null;
+  /** Start mirroring Flight into Next.js's `self.__next_f` once this returns true. */
+  mirrorNextFlight?: () => boolean;
   navigationParams: Record<string, unknown>;
+  isCapturedRscError?: (error: unknown) => boolean;
   onError: (error: unknown, requestInfo: unknown, errorContext: unknown) => unknown;
+  onSsrError?: (error: unknown) => unknown;
   reactMaxHeadersLength?: number;
+  /**
+   * Render the document of a special error that rejected the shell, or return
+   * null to fail the render with it.
+   */
+  renderShellSpecialError?: (error: unknown) => Promise<AppPageCacheSpecialErrorDocument | null>;
   renderToReadableStream: (
     element: AppPageRenderableElement,
     options: { onError: (error: unknown, requestInfo: unknown, errorContext: unknown) => unknown },
@@ -55,14 +71,28 @@ export type RenderAppPageCacheArtifactsOptions = {
   isForceStatic?: boolean;
 };
 
+type AppPageCacheSpecialErrorDocument = {
+  /** Response headers stored with the entries, such as a redirect's `location`. */
+  headers?: Record<string, string>;
+  html: string;
+  /** The renderer's own `Link` header, without middleware's. */
+  linkHeader?: string;
+  status: number;
+};
+
 export type RenderAppPageCacheArtifactsResult = {
   cacheControl?: CacheControlMetadata;
+  headers?: Record<string, string>;
   html: string;
   htmlRenderObservation: ReturnType<typeof createAppPageRenderObservation>;
   linkHeader?: string;
   rscData?: ArrayBuffer;
   rscRenderObservation?: ReturnType<typeof createAppPageRenderObservation>;
+  /** The status of a render whose shell ended in a special error. */
+  status?: number;
   tags: string[];
+  /** The render used a dynamic API, so its output must not be stored. */
+  usedDynamicApi: boolean;
 };
 
 /**
@@ -74,45 +104,88 @@ export type RenderAppPageCacheArtifactsResult = {
 export async function renderAppPageCacheArtifacts(
   options: RenderAppPageCacheArtifactsOptions,
 ): Promise<RenderAppPageCacheArtifactsResult> {
+  return traceAppPageRender(options.route.pattern, "prerender", (renderSpan) =>
+    renderAppPageCacheArtifactsImpl(options, renderSpan),
+  );
+}
+
+async function renderAppPageCacheArtifactsImpl(
+  options: RenderAppPageCacheArtifactsOptions,
+  renderSpan: FrameworkSpan,
+): Promise<RenderAppPageCacheArtifactsResult> {
   const rscStream = options.renderToReadableStream(options.element, {
-    onError: options.onError,
+    onError(error, requestInfo, errorContext) {
+      recordAppPageRenderError(renderSpan, error);
+      return options.onError(error, requestInfo, errorContext);
+    },
   });
   const rscCapture = teeAppPageRscStreamForCapture(rscStream, options.captureRscData);
   const capturedRscDataRef: { value: Promise<ArrayBuffer> | null } = { value: null };
   const fontPreloads = options.getFontPreloads();
   const ssrHandler = await options.loadSsrHandler();
-  const htmlResult = await ssrHandler.handleSsr(
-    rscCapture.ssrStream,
-    options.getNavigationContext(),
-    {
-      links: options.getFontLinks(),
-      styles: options.getFontStyles(),
-      preloads: fontPreloads,
-    },
-    {
-      basePath: options.basePath,
-      clientTraceMetadata: options.clientTraceMetadata,
-      reactMaxHeadersLength: options.reactMaxHeadersLength,
-      rootParams: options.rootParams,
-      waitForAllReady: options.waitForAllReady,
-      isStaticGeneration: true,
-      isForceStatic: options.isForceStatic,
-      ...(rscCapture.sideStream
-        ? {
-            sideStream: rscCapture.sideStream,
-            capturedRscDataRef,
-          }
-        : {}),
-    },
-  );
-  const htmlStream = isAppSsrRenderResult(htmlResult) ? htmlResult.htmlStream : htmlResult;
-  const reactLinkHeader = isAppSsrRenderResult(htmlResult) ? htmlResult.linkHeader : undefined;
-  const linkHeader = buildAppPageLinkHeader(
-    reactLinkHeader,
-    buildAppPageFontLinkHeader(fontPreloads),
-    options.reactMaxHeadersLength,
-  );
-  const html = await readStreamAsText(htmlStream);
+  let htmlResult: Awaited<ReturnType<AppPageSsrHandler["handleSsr"]>> | null = null;
+  let specialErrorDocument: AppPageCacheSpecialErrorDocument | null = null;
+  try {
+    htmlResult = await ssrHandler.handleSsr(
+      rscCapture.ssrStream,
+      options.getNavigationContext(),
+      {
+        links: options.getFontLinks(),
+        styles: options.getFontStyles(),
+        preloads: fontPreloads,
+      },
+      {
+        basePath: options.basePath,
+        clientTraceMetadata: options.clientTraceMetadata,
+        reactMaxHeadersLength: options.reactMaxHeadersLength,
+        rootParams: options.rootParams,
+        waitForAllReady: options.waitForAllReady,
+        mirrorNextFlight: options.mirrorNextFlight,
+        isStaticGeneration: true,
+        isForceStatic: options.isForceStatic,
+        onSsrError:
+          options.onSsrError && options.isCapturedRscError
+            ? createAppPageSsrErrorHandler((error) => {
+                recordAppPageRenderError(renderSpan, error);
+                return options.onSsrError?.(error);
+              }, options.isCapturedRscError)
+            : options.onSsrError
+              ? (error) => {
+                  recordAppPageRenderError(renderSpan, error);
+                  return options.onSsrError?.(error);
+                }
+              : undefined,
+        ...(rscCapture.sideStream
+          ? {
+              sideStream: rscCapture.sideStream,
+              capturedRscDataRef,
+            }
+          : {}),
+      },
+    );
+  } catch (error) {
+    if (!options.renderShellSpecialError) throw error;
+    // The page's Flight render goes on after its shell rejected. Let it finish
+    // before the special-error document clears the request context, so that
+    // what it does, such as reading cookies(), decides the store.
+    await capturedRscDataRef.value?.catch(() => {});
+    // As in Next.js, a special error that rejects the shell is the render's
+    // outcome, stored with its status beside the page's RSC payload.
+    specialErrorDocument = await options.renderShellSpecialError(error);
+    if (!specialErrorDocument) throw error;
+  }
+  let html = specialErrorDocument?.html ?? "";
+  let linkHeader = specialErrorDocument?.linkHeader;
+  if (htmlResult) {
+    const htmlStream = isAppSsrRenderResult(htmlResult) ? htmlResult.htmlStream : htmlResult;
+    const reactLinkHeader = isAppSsrRenderResult(htmlResult) ? htmlResult.linkHeader : undefined;
+    linkHeader = buildAppPageLinkHeader(
+      reactLinkHeader,
+      buildAppPageFontLinkHeader(fontPreloads),
+      options.reactMaxHeadersLength,
+    );
+    html = await readStreamAsText(htmlStream);
+  }
 
   let rscData: ArrayBuffer | undefined;
   if (options.captureRscData) {
@@ -133,7 +206,9 @@ export async function renderAppPageCacheArtifacts(
   );
   const observationState = consumeAppPageRenderObservationState();
   consumeInvalidDynamicUsageError();
-  consumeDynamicUsage();
+  // SSR runs in a child scope, so a client page's searchParams read there
+  // reaches only the render's dynamic latch.
+  const usedDynamicApi = consumeDynamicUsage() || isRenderDynamicLatched();
 
   const htmlRenderObservation = createAppPageRenderObservation({
     boundaryOutcome: { kind: "success" },
@@ -155,7 +230,11 @@ export async function renderAppPageCacheArtifacts(
     html,
     htmlRenderObservation,
     ...(linkHeader ? { linkHeader } : {}),
+    ...(specialErrorDocument
+      ? { headers: specialErrorDocument.headers, status: specialErrorDocument.status }
+      : {}),
     tags,
+    usedDynamicApi,
     cacheControl:
       typeof cacheLife?.revalidate === "number"
         ? // `stale` must survive regeneration: this producer feeds

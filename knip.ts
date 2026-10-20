@@ -44,12 +44,26 @@ export default {
         "tests/e2e/web-worker/fixtures/**/{vite.config.ts,*.worker.ts}",
         "tests/e2e/nextjs-worker/fixture/**/*.{js,ts,tsx}",
         "tests/e2e/cacheability-components/fixture/{next.config.ts,vite.config.ts,app/**/{page,route}.{ts,tsx}}",
+        "tests/e2e/cloudflare-static-export/fixture/{vite.config.ts,app/**/route.ts}",
       ],
       project: ["tests/**/*.{js,ts}", "!tests/fixtures/**"],
       ignoreDependencies: [
         // Loaded dynamically by @vitejs/plugin-react when the React Compiler
         // integration test enables `react: { compiler: true }`.
         "oxc-transform-react",
+        // OG tests resolve these from vinext's @vercel/og install, not the root workspace.
+        "@vercel/og",
+        // The CommonJS syntax tests resolve this from vinext's install, not the root workspace.
+        "vite-plugin-commonjs",
+        // The Static Assets worker test resolves this from the Cloudflare fixture's wrangler install.
+        "miniflare",
+        // scripts/version.mts resolves release APIs from the pinned Changesets CLI,
+        // keeping its dependency tree authoritative instead of installing separate copies.
+        "@manypkg/get-packages",
+        "@changesets/config",
+        "@changesets/get-release-plan",
+        "@changesets/apply-release-plan",
+        "@changesets/should-skip-package",
       ],
     },
     "packages/vinext": {
@@ -72,6 +86,8 @@ export default {
         "src/server/app-page-ppr-runtime.ts",
         "src/server/app-prerender-static-params.ts",
         "src/server/app-route-module-loader.ts",
+        "src/server/nitro-public-files.ts",
+        "src/server/nitro-public-files-plugin.ts",
         // Client-side instrumentation bundle: loaded as a side-effect module
         // by the generated hydration entries (import "vinext/instrumentation-client"),
         // so its public surface (clientInstrumentationHooks, getClientInstrumentationHooks)
@@ -118,6 +134,13 @@ export default {
       entry: [...entriesFromPackageJson("packages/cloudflare/package.json")],
       project: ["src/**/*.{ts,tsx}"],
     },
+    "packages/workers-response-store": {
+      entry: [
+        ...entriesFromPackageJson("packages/workers-response-store/package.json"),
+        "example/service-binding/{cache-worker,user-worker}.ts",
+      ],
+      project: ["src/**/*.{ts,tsx}", "example/**/*.ts"],
+    },
     "packages/create-vinext-app": {
       entry: [...entriesFromPackageJson("packages/create-vinext-app/package.json")],
       project: ["src/**/*.{ts,tsx}"],
@@ -130,8 +153,13 @@ export default {
         "vite",
       ],
     },
+    "apps/web": {
+      entry: ["cloudflare.config.ts", "worker/index.ts"],
+      // Resolved by the Vite plugin from the auxiliary Worker's config entrypoint.
+      ignoreDependencies: ["@cloudflare/workers-response-store"],
+    },
   },
-  ignoreWorkspaces: ["examples/**", "tests/fixtures/**", "benchmarks/**"],
+  ignoreWorkspaces: ["examples/**", "tests/fixtures/**", "tests/e2e/**/fixture", "benchmarks/**"],
   ignoreDependencies: [
     // Imported only by declarations vendored from Next.js. @next/env and
     // sharp are covered by ambient stubs in @vinext/types; server-only is a
@@ -164,16 +192,19 @@ export default {
     "cloudflare",
   ],
   ignoreBinaries: [
-    // workspace's own bin, invoked in CI
+    // Consumer-project bins invoked in CI after installing into a cloned repo.
+    "vite",
     "vinext",
     // system/user-project binaries invoked by runtime scripts
     "ps",
     "taskkill",
     "eslint",
+    "oxlint",
     "gh",
     "jq",
   ],
   ignoreFiles: [
+    "tests/e2e/cloudflare-static-export/fixture/dist/**",
     "tests/e2e/app-router/nextjs-compat/playwright.nextjs-compat.config.ts",
     "tests/e2e/app-front-redirect-issue/fixture/**/*.{js,ts,tsx}",
     // stub module loaded via `path.resolve()` as a Vite alias target

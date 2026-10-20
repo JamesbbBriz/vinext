@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import { createAppRscOnErrorHandler } from "../packages/vinext/src/server/app-rsc-error-handler.js";
 import { errorDigest } from "../packages/vinext/src/server/app-rsc-errors.js";
+import { getRevalidateSecret } from "../packages/vinext/src/server/revalidation-request.js";
 
 function makeReq(
   url = "https://example.com/feed",
@@ -60,6 +61,62 @@ describe("createAppRscOnErrorHandler", () => {
       routerKind: "App Router",
       routePath: "/posts/[slug]",
       routeType: "render",
+      renderSource: "react-server-components",
+      revalidateReason: undefined,
+    });
+  });
+
+  it("reports RSC payload and on-demand revalidation context", () => {
+    const reportRequestError = vi.fn();
+    const request = makeReq("https://example.com/feed.rsc", "GET", {
+      RSC: "1",
+      "x-prerender-revalidate": getRevalidateSecret(),
+    });
+    const onError = createAppRscOnErrorHandler(
+      reportRequestError,
+      request,
+      "/feed",
+      "/posts/[slug]",
+      { revalidateReason: "stale" },
+    );
+
+    onError(new Error("payload failed"));
+
+    expect(reportRequestError.mock.calls[0]?.[2]).toEqual({
+      routerKind: "App Router",
+      routePath: "/posts/[slug]",
+      routeType: "render",
+      renderSource: "react-server-components-payload",
+      revalidateReason: "on-demand",
+    });
+  });
+
+  it("applies action, SSR, and stale regeneration context overrides", () => {
+    const reportRequestError = vi.fn();
+    const onError = createAppRscOnErrorHandler(
+      reportRequestError,
+      makeReq("https://example.com/products/one", "POST"),
+      "/products/one",
+      "/products/[slug]",
+      {
+        renderSource: "server-rendering",
+        revalidateReason: "stale",
+        routeType: "action",
+      },
+    );
+
+    const error = new Error("action SSR failed");
+    error.stack = "action SSR stack";
+
+    expect(onError(error)).toBe(errorDigest("action SSR failedaction SSR stack"));
+    expect(error).not.toHaveProperty("digest");
+
+    expect(reportRequestError.mock.calls[0]?.[2]).toEqual({
+      routerKind: "App Router",
+      routePath: "/products/[slug]",
+      routeType: "action",
+      renderSource: "server-rendering",
+      revalidateReason: "stale",
     });
   });
 
@@ -85,16 +142,26 @@ describe("createAppRscOnErrorHandler", () => {
     }
   });
 
-  it("returned handler reports non-Error thrown values by wrapping them", () => {
+  // Ported from Next.js: packages/next/src/server/app-render/create-error-handler.tsx
+  it("returned handler only hashes a thrown string, like Next.js", () => {
     const reportRequestError = vi.fn();
     const onError = createAppRscOnErrorHandler(reportRequestError, makeReq(), "/feed", "/feed");
 
-    onError("a plain string");
+    expect(onError("a plain string")).toMatch(/^\d+$/);
+
+    expect(reportRequestError).not.toHaveBeenCalled();
+  });
+
+  it("returned handler reports other non-Error thrown values as an Error, like Next.js", () => {
+    const reportRequestError = vi.fn();
+    const onError = createAppRscOnErrorHandler(reportRequestError, makeReq(), "/feed", "/feed");
+
+    const digest = onError({ code: "E_FEED" });
 
     expect(reportRequestError).toHaveBeenCalledOnce();
     const [error] = reportRequestError.mock.calls[0];
     expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toBe("a plain string");
+    expect(error).toMatchObject({ message: '{"code":"E_FEED"}', digest });
   });
 
   it("requestInfo headers are a plain Record, not Headers", () => {

@@ -2,6 +2,12 @@ import { redirect } from "next/navigation";
 
 export const revalidate = 60;
 
+// Next.js only ISR-caches a dynamic-segment route that exports
+// generateStaticParams (an empty list opts every path into on-demand ISR).
+export function generateStaticParams() {
+  return [];
+}
+
 export default async function CdnStageAppPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
   if (slug === "redirect") redirect("/about");

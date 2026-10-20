@@ -4,7 +4,7 @@ import { waitForAppRouterHydration } from "../helpers";
 /**
  * Static export E2E tests for the App Router.
  *
- * These tests run against a `vinext build` output served as static files.
+ * These tests run against a `vite build` output served as static files.
  * The static export fixture uses `output: "export"` in next.config.mjs,
  * so no server-side rendering is involved — all pages are pre-rendered
  * HTML files served by a lightweight HTTP server on port 4180.
@@ -230,5 +230,27 @@ test.describe("Static Export — App Router", () => {
   test("404 page for non-existent route", async ({ page }) => {
     const response = await page.goto(`${BASE}/nonexistent-page/`);
     expect(response?.status()).toBe(404);
+  });
+
+  // The 404 page's payload carries the deployment version too, like Next.js'
+  // build ID in every initial RSC payload, so its links stay soft navigations.
+  test("soft-navigates from the static 404 page", async ({ page }) => {
+    const documentPaths: string[] = [];
+    page.on("request", (request) => {
+      if (request.resourceType() === "document") {
+        documentPaths.push(new URL(request.url()).pathname);
+      }
+    });
+    await page.goto(`${BASE}/nonexistent-page/`);
+    await waitForAppRouterHydration(page);
+    await page.evaluate(() => Reflect.set(window, "__staticExportSoftNavigation", true));
+    await page.locator('a[href="/"]').click();
+    await page.waitForURL(`${BASE}/`);
+    await expect(page.locator("h1")).toHaveText("Static Export — App Router");
+
+    expect(documentPaths).toEqual(["/nonexistent-page/"]);
+    expect(await page.evaluate(() => Reflect.get(window, "__staticExportSoftNavigation"))).toBe(
+      true,
+    );
   });
 });

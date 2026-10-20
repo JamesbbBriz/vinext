@@ -5,19 +5,24 @@ import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 // Runtime imports use source paths so the create package bundles the shared init implementation.
 import { init } from "../../vinext/src/init";
-import { resolveInitOptions } from "../../vinext/src/init-platform";
+import { resolveInitOptions, validateWorkerName } from "../../vinext/src/init-platform";
 
 type PackageManagerName = "npm" | "pnpm" | "yarn" | "bun";
 type InitPlatform = "cloudflare" | "node";
 type InitDataCache = "kv" | "none";
-type InitCdnCache = "data-cache" | "workers-cache";
+type InitCdnCache = "data-cache" | "none" | "response-store" | "static-assets" | "workers-cache";
 type InitImageOptimization = "cloudflare-images" | "none";
+type InitResponseStoreMode = "self-contained" | "service-binding";
 
 type CloudflareInitOptions = {
   dataCache: InitDataCache;
   cdnCache: InitCdnCache;
   imageOptimization: InitImageOptimization;
+  responseStoreMode?: InitResponseStoreMode;
   warmCdnCache?: boolean;
+  legacyWrangler?: boolean;
+  /** Worker name for generated config, instead of one derived from package.json. */
+  name?: string;
 };
 
 type PlatformPromptOptions = {
@@ -66,8 +71,14 @@ const packageManagerFlags: Record<string, PackageManagerName> = {
   "--use-bun": "bun",
 };
 
-function getTemplateFiles(platform: InitPlatform): Record<string, string> {
+function getTemplateFiles(initOptions: ResolvedInitOptions): Record<string, string> {
+  const { platform } = initOptions;
   const isCloudflare = platform === "cloudflare";
+  const useCf = isCloudflare && !initOptions.cloudflare?.legacyWrangler;
+  const revalidate =
+    !isCloudflare || initOptions.cloudflare?.cdnCache !== "none"
+      ? "export const revalidate = 300;\n\n"
+      : "";
   const apiMessage = isCloudflare ? "Hello from vinext on Cloudflare Workers" : "Hello from vinext";
   const title = isCloudflare ? "vinext on Cloudflare Workers" : "vinext app";
   const secondaryLink = isCloudflare
@@ -90,7 +101,7 @@ function getTemplateFiles(platform: InitPlatform): Record<string, string> {
   const actionCard = isCloudflare
     ? `<div className="rounded-lg border border-slate-200 bg-white p-5">
             <h2 className="font-semibold">Deploy</h2>
-            <p className="mt-2 text-sm leading-6 text-slate-600">Ship the generated Worker with Wrangler.</p>
+            <p className="mt-2 text-sm leading-6 text-slate-600">Ship the generated Worker with ${useCf ? "cf" : "Wrangler"}.</p>
             <code className="mt-4 block rounded bg-slate-100 px-3 py-2 text-sm">pnpm run deploy</code>
           </div>`
     : `<div className="rounded-lg border border-slate-200 bg-white p-5">
@@ -148,9 +159,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
 ${secondaryLink}
 ];
 
-export const revalidate = 300;
-
-export default function Home() {
+${revalidate}export default function Home() {
   return (
     <main className="min-h-screen bg-slate-50 px-6 py-10 text-slate-950">
       <section className="mx-auto flex max-w-4xl flex-col gap-8">
@@ -231,7 +240,7 @@ This project was created with create-vinext-app.
 
 - \`pnpm run dev\` starts the vinext dev server.
 - \`pnpm run build\` builds ${isCloudflare ? "the Cloudflare Worker output" : "production output"}.
-- \`pnpm run start\` ${isCloudflare ? "starts the built Worker locally with Wrangler" : "starts the production server locally"}.
+- \`pnpm run start\` ${isCloudflare ? (useCf ? "previews the built Worker locally" : "starts the built Worker locally with Wrangler") : "starts the production server locally"}.
 ${isCloudflare ? "- `pnpm run deploy` deploys the Cloudflare Worker.\n" : ""}
 `,
     "tsconfig.json": `{
@@ -245,7 +254,7 @@ ${isCloudflare ? "- `pnpm run deploy` deploys the Cloudflare Worker.\n" : ""}
     "esModuleInterop": true,
     "module": "esnext",
     "moduleResolution": "bundler",
-    "resolveJsonModule": true,
+    ${useCf ? '"allowImportingTsExtensions": true,\n    ' : ""}"resolveJsonModule": true,
     "isolatedModules": true,
     "jsx": "preserve",
     "incremental": true,
@@ -254,7 +263,7 @@ ${isCloudflare ? "- `pnpm run deploy` deploys the Cloudflare Worker.\n" : ""}
       "@/*": ["./*"]
     }
   },
-  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"${useCf ? ', ".cloudflare/types"' : ""}],
   "exclude": ["node_modules"]
 }
 `,
@@ -273,15 +282,18 @@ function printHelp(): void {
 
   Options:
     --platform <target>          Deployment target: cloudflare or node
+    --name <name>                Cloudflare Worker name (default: derived from the directory)
     --data-cache <type>          Cloudflare data cache: kv or none
-    --cdn-cache <type>           Cloudflare CDN cache: data-cache or workers-cache
+    --cdn-cache <type>           Cloudflare CDN cache: none, response-store, workers-cache,
+                                 static-assets, or data-cache
+    --response-store-mode <type> Workers Response Store mode: service-binding or self-contained
     --image-optimization <type>  Cloudflare image optimization: cloudflare-images or none
     --prerender                  Configure vinext to pre-render static routes
     --no-prerender               Do not configure pre-rendering
-    --experimental-warm-cdn-cache
-                                 Add experimental CDN pre-warming to the Cloudflare deploy script
-    --no-experimental-warm-cdn-cache
-                                 Do not add experimental CDN pre-warming to the deploy script
+    --legacy-wrangler-cloudflare-init
+                                 Use the legacy Wrangler setup instead of cf
+    --warm-cache                 Add cache warming to the Cloudflare deploy script
+    --no-warm-cache              Do not add cache warming to the deploy script
     --use-npm                    Use npm
     --use-pnpm                   Use pnpm
     --use-yarn                   Use Yarn
@@ -332,8 +344,10 @@ function parseArgs(args: string[]): ParsedArgs {
     if (arg.startsWith("-")) {
       if (
         arg === "--platform" ||
+        arg === "--name" ||
         arg === "--data-cache" ||
         arg === "--cdn-cache" ||
+        arg === "--response-store-mode" ||
         arg === "--image-optimization"
       ) {
         index++;
@@ -430,7 +444,7 @@ function writeTemplate(
 ): void {
   fs.mkdirSync(root, { recursive: true });
   writePackageJson(root, appName, packageManager);
-  for (const [relativePath, content] of Object.entries(getTemplateFiles(initOptions.platform))) {
+  for (const [relativePath, content] of Object.entries(getTemplateFiles(initOptions))) {
     writeFile(root, relativePath, content);
   }
 }
@@ -454,6 +468,9 @@ export async function createVinextApp(options: CreateVinextAppOptions): Promise<
   if (!isFolderEmpty(root)) {
     throw new Error(`The directory "${root}" contains files that could conflict.`);
   }
+  // init() validates this too, but only after the template is written.
+  const workerName = options.initOptions.cloudflare?.name;
+  if (workerName !== undefined) validateWorkerName(workerName);
 
   console.log(`Creating a new vinext app in ${root}.\n`);
   writeTemplate(root, appName, options.packageManager, options.initOptions);

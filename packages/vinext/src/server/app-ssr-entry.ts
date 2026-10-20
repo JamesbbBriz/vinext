@@ -19,10 +19,14 @@ import {
   setNavigationContext,
 } from "vinext/shims/navigation-server";
 import { runWithNavigationContext } from "vinext/shims/navigation-state";
+import { startCandidateSearchParamsGate } from "./app-ssr-search-params-gate.js";
+import { onRenderDynamicLatched } from "vinext/shims/internal/headers-state";
+import { createClientPageSsrSearchParamsSource } from "./app-page-search-params-observation.js";
 import { runWithRootParamsScope, type RootParams } from "vinext/shims/root-params";
-import { isOpenRedirectShaped } from "./open-redirect.js";
+import { isOpenRedirectShaped, repeatedSlashRedirectResponse } from "./open-redirect.js";
 import { notFoundResponse } from "./http-error-responses.js";
 import { withScriptNonce } from "vinext/shims/script-nonce-context";
+import { withAppRouterTree } from "vinext/shims/app-router-tree-context";
 import {
   BeforeInteractiveContext,
   type BeforeInteractiveInlineScript,
@@ -35,6 +39,8 @@ import {
 } from "./html.js";
 import { renderBeforeInteractiveInlineScripts } from "./before-interactive-head.js";
 import {
+  createNavigationRuntimeRenderedSearchScript,
+  createNavigationRuntimeRscCompatibilityScript,
   createNavigationRuntimeRscMetadataScript,
   createRscEmbedTransform,
   createTickBufferedTransform,
@@ -45,18 +51,23 @@ import type { AppSsrRenderResult } from "./app-page-stream.js";
 import { deferUntilStreamConsumed } from "./defer-until-stream-consumed.js";
 import { createSsrErrorMetaRenderer } from "./app-ssr-error-meta.js";
 import { createInitialDevServerErrorScript } from "./dev-initial-server-error.js";
-import { getClientTraceMetadataHTML } from "./client-trace-metadata.js";
+import {
+  getClientTraceMetadataHTML,
+  markClientTraceMetadataBlock,
+} from "./client-trace-metadata.js";
 import { AppElementsWire, type AppWireElements } from "./app-elements.js";
 import { createInitialBfcacheMaps } from "./app-bfcache-identity.js";
 import { BfcacheIdentityMapContext, ElementsContext, Slot } from "vinext/shims/slot";
 import { AppRouterContext } from "vinext/shims/internal/app-router-context";
 import { createClientReferencePreloader } from "./app-client-reference-preloader.js";
-import { RSC_FORM_STATE_GLOBAL } from "./app-browser-hydration.js";
+import { RSC_FORM_STATE_GLOBAL } from "../client/browser-globals.js";
 import { isPprFallbackShellAbortError } from "vinext/shims/ppr-fallback-shell";
 import DefaultGlobalError from "vinext/shims/default-global-error";
 import { appendAssetDeploymentIdQuery } from "../utils/deployment-id.js";
 import { ssrAppRouterInstance } from "./app-ssr-router-instance.js";
-// @ts-expect-error — resolved by the vinext build plugin in SSR environments.
+import { createRenderStreamCancellation, isAppRenderAbortError } from "./app-render-abort-error.js";
+import { getNextErrorDigest } from "./next-error-digest.js";
+// @ts-expect-error — resolved by the vinext Vite plugin in SSR environments.
 import pagesClientAssets from "virtual:vinext-pages-client-assets";
 import { setPagesClientAssets, type PagesClientAssets } from "./pages-client-assets.js";
 
@@ -308,7 +319,7 @@ function extractBootstrapModuleUrl(bootstrapScriptContent?: string): string | un
 
 function buildModulePreloadHtml(bootstrapModuleUrl?: string, nonce?: string): string {
   if (!bootstrapModuleUrl) return "";
-  return `<link rel="modulepreload"${createNonceAttribute(nonce)} href="${escapeHtmlAttr(bootstrapModuleUrl)}" />\n`;
+  return `<link rel="modulepreload"${createNonceAttribute(nonce)} href="${escapeHtmlAttr(bootstrapModuleUrl)}" crossorigin="${pagesClientAssets.crossOrigin ?? ""}" />\n`;
 }
 
 function buildHeadInjectionHtml(
@@ -334,6 +345,11 @@ function buildHeadInjectionHtml(
     ),
     scriptNonce,
   );
+  // Rendered with the page, so a cached page keeps the ID of the deployment
+  // that rendered its embedded payload.
+  const compatibilityScript = createNavigationRuntimeRscCompatibilityScript();
+  const rscCompatibilityScript =
+    compatibilityScript === "" ? "" : createInlineScriptTag(compatibilityScript, scriptNonce);
   const formStateScript =
     formState === null
       ? ""
@@ -344,6 +360,7 @@ function buildHeadInjectionHtml(
 
   return (
     rscMetadataScript +
+    rscCompatibilityScript +
     formStateScript +
     buildModulePreloadHtml(bootstrapModuleUrl, scriptNonce) +
     insertedHTML +
@@ -383,6 +400,8 @@ export async function handleSsr(
      * SSR head. Undefined or empty disables emission entirely.
      */
     clientTraceMetadata?: readonly string[];
+    /** Private marker used to identify only this render's injected trace tags. */
+    clientTraceMetadataMarker?: string;
     /**
      * Maximum total length (in characters) of the preload `Link` header React
      * emits during SSR. `0` disables emission. From `reactMaxHeadersLength` in
@@ -392,8 +411,11 @@ export async function handleSsr(
     rootParams?: RootParams;
     /** Dev-only: original server error to surface in the browser overlay. */
     initialDevServerError?: unknown;
-    /** Mirror inline Flight chunks into Next.js's `self.__next_f` transport. */
-    mirrorNextFlight?: boolean;
+    /** Report an SSR/Fizz render failure through instrumentation. */
+    onSsrError?: (error: unknown) => unknown;
+    /** Mirror inline Flight chunks into Next.js's `self.__next_f` transport, or start
+     *  mirroring once a function returns true. */
+    mirrorNextFlight?: boolean | (() => boolean);
     /** When true, wait for the full React tree (including Suspense boundaries)
      *  to resolve before returning the HTML stream. Used for static prerender
      *  and ISR cache writes to avoid caching fallback content. */
@@ -402,16 +424,50 @@ export async function handleSsr(
     isStaticGeneration?: boolean;
     /** `dynamic = "force-static"` suppresses the useSearchParams bailout. */
     isForceStatic?: boolean;
+    /**
+     * Production render that may be stored under a query-free key. SSR
+     * `useSearchParams()` waits on a per-request gate, and the navigation
+     * payload leaves the query for the browser to read.
+     */
+    isCacheCandidate?: boolean;
     fallbackToErrorDocumentOnShellError?: boolean;
     dynamicStaleTimeSeconds?: number;
     getInitialNavigationCacheMetadata?: () => InitialNavigationCacheMetadata;
   },
 ): Promise<AppSsrRenderResult> {
   return runWithNavigationContext(async () => {
+    const assetCrossOrigin = pagesClientAssets.crossOrigin ?? "";
+    // Static generation already bails out at once, and force-static reads an
+    // empty query, so neither needs the gate.
+    const searchParamsGate =
+      options?.isCacheCandidate === true &&
+      options.isStaticGeneration !== true &&
+      options.isForceStatic !== true
+        ? startCandidateSearchParamsGate()
+        : null;
+    // The gate stops listening once it settles, but a client page behind a
+    // later boundary can still turn the render dynamic.
+    let rendersDynamic = false;
+    const stopWatchingDynamic = searchParamsGate
+      ? onRenderDynamicLatched(() => {
+          rendersDynamic = true;
+        })
+      : null;
+    const requiredNavigationContext = requireNavigationContext(navContext);
     const ssrNavigationContext = {
-      ...requireNavigationContext(navContext),
+      ...requiredNavigationContext,
       isStaticGeneration: options?.isStaticGeneration,
       isForceStatic: options?.isForceStatic,
+      searchParamsGate: searchParamsGate?.gate,
+      // A client page reading this marks the render dynamic, like a server
+      // page's searchParams.
+      getClientPageSearchParams: createClientPageSsrSearchParamsSource(
+        requiredNavigationContext.searchParams,
+        {
+          isForceStatic: options?.isForceStatic,
+          isPprFallbackShell: options?.pprFallbackShellSignal !== undefined,
+        },
+      ),
     };
 
     await clientReferencePreloader.preload();
@@ -421,6 +477,7 @@ export async function handleSsr(
     clearServerInsertedHTML();
 
     const cleanup = (): void => {
+      stopWatchingDynamic?.();
       setNavigationContext(null);
       clearServerInsertedHTML();
     };
@@ -454,12 +511,17 @@ export async function handleSsr(
           });
         }
 
+        if (searchParamsGate) {
+          ssrStream = searchParamsGate.settleWhenConsumed(ssrStream);
+        }
+
         let flightRoot: PromiseLike<AppWireElements> | null = null;
 
         function VinextFlightRoot(): ReactNode {
           for (const moduleUrl of pagesClientAssets.appBootstrapPreinitModules ?? []) {
             preinitModule(moduleUrl, {
               as: "script",
+              crossOrigin: assetCrossOrigin,
               nonce: options?.scriptNonce,
             });
           }
@@ -533,7 +595,10 @@ export async function handleSsr(
           { value: registerBeforeInteractiveInlineScript },
           ssrTree,
         );
-        const ssrRoot = withScriptNonce(treeWithBeforeInteractive, options?.scriptNonce);
+        const ssrRoot = withScriptNonce(
+          withAppRouterTree(treeWithBeforeInteractive),
+          options?.scriptNonce,
+        );
 
         // plugin-rsc returns the bootstrap as `import("<url>")` so callers can
         // inject it via `bootstrapScriptContent`. We hand the URL to React's
@@ -567,6 +632,7 @@ export async function handleSsr(
         });
 
         const pprFallbackShellSignal = options?.pprFallbackShellSignal;
+        const htmlCancellation = createRenderStreamCancellation();
         // React emits a preload `Link` header (capped to `maxHeadersLength`)
         // via `onHeaders`. It fires before the shell resolves, so `linkHeader`
         // is populated by the time `renderToReadableStream` resolves below.
@@ -594,7 +660,9 @@ export async function handleSsr(
           //  - React still applies `nonce` to the emitted
           //    `<script type="module" src=…>` tag, so nonce-based CSP
           //    (`script-src 'nonce-…' 'strict-dynamic'`) keeps working.
-          bootstrapModules: bootstrapModuleUrl ? [bootstrapModuleUrl] : undefined,
+          bootstrapModules: bootstrapModuleUrl
+            ? [{ src: bootstrapModuleUrl, crossOrigin: assetCrossOrigin }]
+            : undefined,
           formState: options?.formState ?? null,
           nonce: options?.scriptNonce,
           onHeaders: captureHeaders
@@ -610,12 +678,19 @@ export async function handleSsr(
             if (pprFallbackShellSignal && isPprFallbackShellAbortError(error)) {
               return undefined;
             }
+            if (isAppRenderAbortError(error) || htmlCancellation.isReason(error)) {
+              return undefined;
+            }
 
             errorMetaRenderer.capture(error);
 
-            if (error && typeof error === "object" && "digest" in error) {
-              return String(error.digest);
+            const instrumentationDigest = options?.onSsrError?.(error);
+            if (typeof instrumentationDigest === "string") {
+              return instrumentationDigest;
             }
+
+            const existingDigest = getNextErrorDigest(error);
+            if (existingDigest !== null) return existingDigest;
 
             if (process.env.NODE_ENV === "production" && error) {
               const message = getErrorMessage(error);
@@ -628,6 +703,7 @@ export async function handleSsr(
         };
 
         let htmlStream: ReadableStream<Uint8Array>;
+        let renderComplete = Promise.resolve();
         let shellErrorRecovered = false;
         let shouldDelayInitialHtmlPull = false;
         if (pprFallbackShellSignal) {
@@ -637,6 +713,10 @@ export async function handleSsr(
             ...renderOptions,
             signal: htmlAbortController.signal,
           });
+          // Known limitation: unlike Next.js, nothing waits for modules that are
+          // still loading. A next/dynamic() without `loading` whose import is
+          // pending here has no Suspense boundary of its own, so it suspends to
+          // the nearest one; with no loading.js above it, the shell is empty.
           setTimeout(() => htmlAbortController.abort(), 0);
           htmlStream = (await pendingHtml).prelude;
         } else {
@@ -645,6 +725,7 @@ export async function handleSsr(
             streamingHtmlStream = await renderToReadableStream(ssrRoot, {
               ...renderOptions,
             });
+            renderComplete = streamingHtmlStream.allReady;
 
             if (options?.waitForAllReady === true) {
               await streamingHtmlStream.allReady;
@@ -688,11 +769,28 @@ export async function handleSsr(
         let traceMetaHTML: string | null = null;
         const getTraceMetaHTML = (): string => {
           if (traceMetaHTML === null) {
-            traceMetaHTML = getClientTraceMetadataHTML(options?.clientTraceMetadata);
+            traceMetaHTML = markClientTraceMetadataBlock(
+              getClientTraceMetadataHTML(options?.clientTraceMetadata, options?.isStaticGeneration),
+              options?.clientTraceMetadataMarker,
+            );
           }
           return traceMetaHTML;
         };
         let didInjectHeadHTML = false;
+        let headHidQuery = false;
+        let didSendRenderedSearch = false;
+        // A render that turns dynamic after the head hid its query won't be
+        // stored either, so a later flush sends the query its client pages
+        // read, ahead of their HTML (see `client-page-root.tsx`).
+        const getRenderedSearchHTML = (): string => {
+          if (!headHidQuery || !rendersDynamic || didSendRenderedSearch) return "";
+          didSendRenderedSearch = true;
+          const search = ssrNavigationContext.searchParams.toString();
+          return createInlineScriptTag(
+            createNavigationRuntimeRenderedSearchScript(search ? `?${search}` : ""),
+            options?.scriptNonce,
+          );
+        };
         const getInsertedHTML = (): string => {
           const insertedHTML = renderInsertedHtml(renderServerInsertedHTML());
           const errorMetaHTML = errorMetaRenderer.flush();
@@ -700,17 +798,28 @@ export async function handleSsr(
             options?.initialDevServerError,
             options?.scriptNonce,
           );
-          if (didInjectHeadHTML) return insertedHTML + errorMetaHTML;
+          if (didInjectHeadHTML) return insertedHTML + errorMetaHTML + getRenderedSearchHTML();
 
           didInjectHeadHTML = true;
+          // A stored document must not carry the request's query, so the
+          // browser reads it from its own URL instead. A gate that has
+          // already opened means the render won't be stored, so it keeps the
+          // effective query (which a rewrite may have changed).
+          const hidesQuery = searchParamsGate !== null && searchParamsGate.gate.decision !== "real";
+          headHidQuery = hidesQuery;
+          const isSearchParamsFromBrowser =
+            hidesQuery ||
+            (options?.isStaticGeneration === true ? options.isForceStatic !== true : undefined);
           return buildHeadInjectionHtml(
-            ssrNavigationContext,
+            hidesQuery
+              ? { ...ssrNavigationContext, searchParams: new URLSearchParams() }
+              : ssrNavigationContext,
             bootstrapModuleUrl,
             options?.formState ?? null,
             insertedHTML + errorMetaHTML + getTraceMetaHTML() + initialDevServerErrorHTML,
             fontHTML,
             options?.dynamicStaleTimeSeconds,
-            options?.isStaticGeneration === true ? options.isForceStatic !== true : undefined,
+            isSearchParamsFromBrowser,
             options?.scriptNonce,
           );
         };
@@ -743,6 +852,8 @@ export async function handleSsr(
             ),
           ),
           cleanup,
+          undefined,
+          htmlCancellation.record,
         );
 
         return {
@@ -756,6 +867,7 @@ export async function handleSsr(
           // *where* the blocking happens — do not move the `allReady` await onto
           // this promise expecting it to be load-bearing in production.
           metadataReady: Promise.resolve(),
+          renderComplete,
           capturedRscData: options?.capturedRscDataRef?.value ?? null,
           shellErrorRecovered,
           linkHeader: reactLinkHeader,
@@ -771,8 +883,11 @@ export async function handleSsr(
 export default {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    // Block protocol-relative URL open redirects (including percent-encoded
-    // variants like /%5Cevil.com/). See request-pipeline.ts for details.
+    // Redirect repeated slashes / backslashes like Next.js and block encoded
+    // protocol-relative shapes (/%5Cevil.com/). See
+    // `guardProtocolRelativeUrl` in request-pipeline.ts for details.
+    const slashRedirect = repeatedSlashRedirectResponse(url.pathname + url.search);
+    if (slashRedirect) return slashRedirect;
     if (isOpenRedirectShaped(url.pathname)) {
       return notFoundResponse();
     }

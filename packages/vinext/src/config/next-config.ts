@@ -5,21 +5,123 @@
  * Unsupported options are logged as warnings.
  */
 import path, { toSlash } from "pathslash";
-import { createRequire } from "node:module";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createRequire, Module } from "node:module";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { PluginOption } from "vite";
 import commonjs from "vite-plugin-commonjs";
 import { PHASE_DEVELOPMENT_SERVER } from "vinext/shims/constants";
-import { normalizePageExtensions } from "../routing/file-matcher.js";
+import { DEFAULT_PAGE_EXTENSIONS, normalizePageExtensions } from "../routing/file-matcher.js";
 import { getHtmlLimitedBotRegex } from "../utils/html-limited-bots.js";
 import { flattenPluginOptions } from "../utils/plugin-options.js";
 import { isUnknownRecord } from "../utils/record.js";
-import { applyLocaleToRoutes, isExternalUrl } from "./config-matchers.js";
+import { applyLocaleToRoutes, configSourceError, isExternalUrl } from "./config-matchers.js";
 import { loadTsconfigResolutionForRoot } from "./tsconfig-paths.js";
 import { loadCommonJsModule, shouldRetryAsCommonJs } from "../utils/commonjs-loader.js";
 export const VINEXT_NEXT_CONFIG_PLUGIN_PROPERTY = "__vinextNextConfig";
+
+type ResolveFilename = (
+  request: string,
+  parent?: Module | null,
+  isMain?: boolean,
+  options?: { paths?: string[] },
+) => string;
+
+const CommonJsModule = Module as typeof Module & { _resolveFilename: ResolveFilename };
+const vinextNextPackageJson = fileURLToPath(new URL("../../next-package.json", import.meta.url));
+let nextPackageIdentityUsers = 0;
+let originalResolveFilename: ResolveFilename | undefined;
+type ConfigRootState = {
+  storage: AsyncLocalStorage<ConfigRootLease>;
+  queue: Promise<void>;
+};
+type ConfigRootLease = {
+  active: boolean;
+  queue: Promise<void>;
+};
+const processWithConfigRootState = process as NodeJS.Process & {
+  __vinextConfigRootState?: ConfigRootState;
+};
+const configRootState = (processWithConfigRootState.__vinextConfigRootState ??= {
+  storage: new AsyncLocalStorage<ConfigRootLease>(),
+  queue: Promise.resolve(),
+});
+
+// Next.js config wrappers commonly scan with relative fs/glob calls, so changing
+// process.cwd itself is required; overriding process.cwd() would not root those
+// operations. Serialize top-level loads because cwd is process-wide. Each ALS
+// lease owns a child queue so nested sibling loads are serialized, while an
+// escaped descendant of a completed load falls back to the process queue.
+async function withConfigRoot<T>(root: string, callback: () => T | Promise<T>): Promise<T> {
+  const inheritedLease = configRootState.storage.getStore();
+  const lock = inheritedLease?.active ? inheritedLease : configRootState;
+  const waitForTurn = lock.queue;
+  let release = () => {};
+  lock.queue = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await waitForTurn;
+
+  const lease: ConfigRootLease = { active: true, queue: Promise.resolve() };
+  const run = async () => {
+    const previousCwd = process.cwd();
+    process.chdir(root);
+    try {
+      return await callback();
+    } finally {
+      lease.active = false;
+      await lease.queue;
+      process.chdir(previousCwd);
+    }
+  };
+
+  try {
+    return await configRootState.storage.run(lease, run);
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Let Next.js config wrappers inspect the framework compatibility version even
+ * after an app has replaced the `next` package with vinext.
+ *
+ * Existing `next` installations always win. The fallback is active only while
+ * evaluating next.config, where wrappers such as next-intl and Sentry call
+ * `require.resolve("next/package.json")` synchronously.
+ */
+async function withNextPackageIdentity<T>(callback: () => T | Promise<T>): Promise<T> {
+  if (nextPackageIdentityUsers++ === 0) {
+    originalResolveFilename = CommonJsModule._resolveFilename;
+    CommonJsModule._resolveFilename = function resolveFilename(request, ...args) {
+      try {
+        return originalResolveFilename!.call(this, request, ...args);
+      } catch (error) {
+        if (
+          request === "next/package.json" &&
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "MODULE_NOT_FOUND"
+        ) {
+          return vinextNextPackageJson;
+        }
+        throw error;
+      }
+    };
+  }
+
+  try {
+    return await callback();
+  } finally {
+    nextPackageIdentityUsers -= 1;
+    if (nextPackageIdentityUsers === 0 && originalResolveFilename) {
+      CommonJsModule._resolveFilename = originalResolveFilename;
+      originalResolveFilename = undefined;
+    }
+  }
+}
 
 /**
  * Parse a body size limit value (string or number) into bytes.
@@ -178,6 +280,17 @@ export type NextConfig = {
   crossOrigin?: "anonymous" | "use-credentials";
   /** Whether to add trailing slashes */
   trailingSlash?: boolean;
+  /**
+   * Skip the automatic trailing-slash redirects and keep `<Link>`/router
+   * hrefs exactly as written.
+   * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/skipTrailingSlashRedirect
+   */
+  skipTrailingSlashRedirect?: boolean;
+  /**
+   * Compress responses from the Node production server. Defaults to true.
+   * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/compress
+   */
+  compress?: boolean;
   /** Keep the original request URL visible to middleware/proxy. */
   skipProxyUrlNormalize?: boolean;
   /** @deprecated Use `skipProxyUrlNormalize` instead. */
@@ -284,7 +397,7 @@ export type NextConfig = {
   cacheComponents?: boolean;
   /**
    * Enables source maps while generating static pages.
-   * Helps with errors during the prerender phase in `vinext build`.
+   * Helps with errors during the prerender phase in `vite build`.
    * Defaults to `true`. Set to `false` to disable.
    */
   enablePrerenderSourceMaps?: boolean;
@@ -404,6 +517,9 @@ export type ResolvedNextConfig = {
    */
   assetPrefix: string;
   trailingSlash: boolean;
+  skipTrailingSlashRedirect: boolean;
+  /** Whether the Node production server compresses responses (`compress`, default true). */
+  compress: boolean;
   skipProxyUrlNormalize: boolean;
   typescript: { tsconfigPath?: string };
   output: "" | "export" | "standalone";
@@ -411,6 +527,10 @@ export type ResolvedNextConfig = {
   resolveExtensions: string[] | null;
   serverResolveExtensions: string[] | null;
   instrumentationClientInject: string[];
+  /** Route manifest injected by Next.js-compatible instrumentation plugins. */
+  instrumentationClientRouteManifest: string | undefined;
+  /** Server globals injected into instrumentation.ts by wrapped webpack configs. */
+  instrumentationServerValueInjections: Record<string, unknown>;
   cacheComponents: boolean;
   appNavFailHandling: boolean;
   /**
@@ -678,6 +798,17 @@ function warnConfigLoadFailure(filename: string, err: Error): void {
 }
 
 /**
+ * The `defaultConfig` handed to a function-form next.config. Next.js passes
+ * its full `defaultConfig` (packages/next/src/server/config-shared.ts); vinext
+ * passes the subset configs are known to read, with values matching Next.js,
+ * so `[...defaultConfig.pageExtensions, "page.js"]` works. Fresh per call so a
+ * config that mutates it cannot leak into later loads.
+ */
+function createFunctionConfigDefaults(): NextConfig {
+  return { pageExtensions: [...DEFAULT_PAGE_EXTENSIONS], compress: true };
+}
+
+/**
  * Resolve a Next-style config value, calling it if it's a function-form config
  * (Next.js supports `module.exports = (phase, opts) => config`).
  */
@@ -687,7 +818,7 @@ async function resolveConfigValue(
 ): Promise<NextConfig> {
   if (typeof config === "function") {
     const result = await config(phase, {
-      defaultConfig: {},
+      defaultConfig: createFunctionConfigDefaults(),
     });
     return result as NextConfig;
   }
@@ -946,6 +1077,12 @@ function warnDeprecatedConfigOptions(config: NextConfig, root: string): void {
   for (const [propertyPath, warning] of warnings) {
     if (hasConfigProperty(config, propertyPath)) warnConfigOnce(warning);
   }
+  // Next.js drops nullish nested values before warning about the moved key.
+  if (readOptionalRecord(config.experimental)?.skipTrailingSlashRedirect != null) {
+    warnConfigOnce(
+      `\`experimental.skipTrailingSlashRedirect\` has been moved to \`skipTrailingSlashRedirect\`. Please update your ${configFileName} file accordingly.`,
+    );
+  }
 }
 
 export async function resolveNextConfigInput(
@@ -993,6 +1130,15 @@ async function loadConfigViaRequire(
 export async function loadNextConfig(
   root: string,
   phase: string = DEFAULT_PHASE,
+): Promise<NextConfig | null> {
+  return withConfigRoot(root, () =>
+    withNextPackageIdentity(() => loadNextConfigWithPackageIdentity(root, phase)),
+  );
+}
+
+async function loadNextConfigWithPackageIdentity(
+  root: string,
+  phase: string,
 ): Promise<NextConfig | null> {
   const configPath = findNextConfigPath(root);
   if (!configPath) return null;
@@ -1088,7 +1234,7 @@ export async function loadNextConfig(
               `const cjsExports = cjsModule && cjsModule.exports;\n` +
               `const cjsValue = cjsExports != null && (cjsExports !== cjsInitial || (typeof cjsExports === "object" && Object.keys(cjsExports).length > 0)) ? cjsExports : undefined;\n` +
               `const value = cjsValue ?? configModule.default ?? configModule;\n` +
-              `export default typeof value === "function" ? await value(${phaseLiteral}, { defaultConfig: {} }) : value;\n`
+              `export default typeof value === "function" ? await value(${phaseLiteral}, { defaultConfig: ${JSON.stringify(createFunctionConfigDefaults())} }) : value;\n`
             );
           },
         },
@@ -1234,14 +1380,16 @@ function resolveDeploymentId(configDeploymentId: unknown): string | undefined {
 /**
  * Resolve the App Router RSC compatibility identity for a build.
  *
- * This token is baked into the client bundle and echoed by the server in the
- * `X-Vinext-RSC-Compatibility-Id` response header; browser navigation rejects
- * RSC payloads whose token differs (deploy skew) without exposing the raw
- * build ID. When the user pins a `deploymentId` we reuse it (already stable
- * across plugin instances); otherwise we mint a random UUID.
+ * The server sends this token with each page (the navigation bootstrap) and in
+ * the `X-Vinext-RSC-Compatibility-Id` response header; browser navigation
+ * rejects RSC payloads whose token differs from its page's (deploy skew)
+ * without exposing the raw build ID. It is never inlined into the client
+ * bundle, where a per-build value would rename chunks on every build. When
+ * the user pins a `deploymentId` we reuse it (already stable across plugin
+ * instances); otherwise we mint a random UUID.
  *
  * NOTE: like `resolveBuildId`, this is non-deterministic in the no-deploymentId
- * case, so a single `vinext build` that instantiates the plugin more than once
+ * case, so a single `vite build` that instantiates the plugin more than once
  * (App Router `buildApp()` + the hybrid Pages Router `vite.build()`) must
  * resolve it once and share it — see `__VINEXT_SHARED_RSC_COMPATIBILITY_ID`.
  */
@@ -1563,6 +1711,132 @@ function normalizeI18nConfig(value: unknown): NextI18nConfig | null {
 }
 
 /**
+ * Fail config loading on an invalid source, as Next.js fails the build
+ * (load-custom-routes.ts checkCustomRoutes), instead of silently skipping a
+ * redirect or security header per request.
+ */
+function validateConfigSources(type: string, routes: ReadonlyArray<{ source: unknown }>): void {
+  const invalid: string[] = [];
+  for (const route of routes) {
+    const error = configSourceError(route?.source);
+    if (!error) continue;
+    invalid.push(`  ${describeSource(route?.source)}: ${error}`);
+  }
+  if (invalid.length > 0) {
+    throw new Error(
+      `Invalid next.config.js ${type} source${invalid.length === 1 ? "" : "s"}:\n${invalid.join("\n")}`,
+    );
+  }
+}
+
+/**
+ * A route source for an error message. Only a string is shown as is; any
+ * other value, such as a BigInt, may not serialize.
+ */
+function describeSource(source: unknown): string {
+  return typeof source === "string"
+    ? JSON.stringify(source)
+    : `(${source === null ? "null" : typeof source})`;
+}
+
+const CONDITION_TYPES = new Set(["header", "cookie", "query", "host"]);
+
+/**
+ * Fail config loading on a malformed has/missing list or item, with the rules
+ * of Next.js's checkCustomRoutes (load-custom-routes.ts). The matchers rely on
+ * these shapes.
+ */
+function validateConfigConditions(
+  type: string,
+  routes: ReadonlyArray<{ source: unknown; has?: unknown; missing?: unknown }>,
+): void {
+  const invalid: string[] = [];
+  for (const route of routes) {
+    const source = describeSource(route?.source);
+    for (const field of ["has", "missing"] as const) {
+      const items = route?.[field];
+      if (items === undefined) continue;
+      if (!Array.isArray(items)) {
+        invalid.push(`  ${source}: \`${field}\` must be undefined or an array`);
+        continue;
+      }
+      for (const item of items as unknown[]) {
+        const condition = (item ?? {}) as { type?: unknown; key?: unknown; value?: unknown };
+        const parts: string[] = [];
+        if (!CONDITION_TYPES.has(condition.type as string)) parts.push("invalid type");
+        if (typeof condition.key !== "string" && condition.type !== "host") {
+          parts.push("invalid key");
+        }
+        if (condition.value !== undefined && typeof condition.value !== "string") {
+          parts.push("invalid value");
+        }
+        if (condition.value === undefined && condition.type === "host") {
+          parts.push('value is required for "host" type');
+        }
+        if (parts.length > 0) {
+          invalid.push(
+            `  ${source}: \`${field}\` item: ${parts.join(", ")} for ${describeConfigValue(item)}`,
+          );
+        }
+      }
+    }
+  }
+  if (invalid.length > 0) {
+    throw new Error(
+      `Invalid next.config.js ${type} has/missing condition${invalid.length === 1 ? "" : "s"}:\n` +
+        `${invalid.join("\n")}\n` +
+        "Each item must be { type: header, cookie, query or host, key: string, value?: string }, " +
+        "with a value and no key required for host.",
+    );
+  }
+}
+
+/** JSON for a config value, or its type when JSON cannot serialize it. */
+function describeConfigValue(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? `(${typeof value})`;
+  } catch {
+    return `(${typeof value})`;
+  }
+}
+
+/**
+ * The sources Next.js's processRoutes builds from `routes` by adding the
+ * basePath and locale prefixes, which checkCustomRoutes then checks again
+ * (load-custom-routes.ts). vinext adds basePath at match time instead, so
+ * these exist only for that check.
+ */
+function processedRouteSources(
+  routes: ReadonlyArray<NextRedirect | NextRewrite | NextHeader>,
+  type: "redirect" | "rewrite" | "header",
+  options: { basePath: string; i18n: NextI18nConfig | null; trailingSlash: boolean },
+): Array<{ source: string }> {
+  const { basePath, i18n, trailingSlash } = options;
+  // escapeStringRegexp, which also escapes "-".
+  const escape = (value: string) => value.replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+  const suffixFor = (source: string) => (source === "/" && !trailingSlash ? "" : source);
+  const defaultLocales =
+    i18n && type === "redirect"
+      ? [...(i18n.domains ?? []).map((domain) => domain.defaultLocale), i18n.defaultLocale]
+      : [];
+  const sources: Array<{ source: string }> = [];
+  for (const route of routes) {
+    const sourceBasePath = basePath && route.basePath !== false ? basePath : "";
+    let source = route.source;
+    if (i18n && route.locale !== false) {
+      if ("destination" in route && route.destination?.startsWith("/")) {
+        for (const locale of defaultLocales) {
+          sources.push({ source: `${sourceBasePath}/${locale}${suffixFor(source)}` });
+        }
+      }
+      source = `/:nextInternalLocale(${i18n.locales.map(escape).join("|")})${suffixFor(source)}`;
+    }
+    sources.push({ source: `${sourceBasePath}${source === "/" && sourceBasePath ? "" : source}` });
+  }
+  return sources;
+}
+
+/**
  * Resolve a NextConfig into a fully-resolved ResolvedNextConfig.
  * Awaits async functions for redirects/rewrites/headers.
  */
@@ -1579,6 +1853,8 @@ export async function resolveNextConfig(
       basePath: "",
       assetPrefix: "",
       trailingSlash: false,
+      skipTrailingSlashRedirect: false,
+      compress: true,
       skipProxyUrlNormalize: false,
       typescript: {},
       output: "",
@@ -1626,6 +1902,8 @@ export async function resolveNextConfig(
       compilerDefine: {},
       compilerDefineServer: {},
       instrumentationClientInject: [],
+      instrumentationClientRouteManifest: undefined,
+      instrumentationServerValueInjections: {},
       clientTraceMetadata: undefined,
       staleTimes: { ...DEFAULT_STALE_TIMES },
       useLightningcss: false,
@@ -1692,6 +1970,33 @@ export async function resolveNextConfig(
 
   {
     const allRewrites = [...rewrites.beforeFiles, ...rewrites.afterFiles, ...rewrites.fallback];
+    // Before the checks below read their fields, so a missing entry is
+    // reported rather than crashing them.
+    validateConfigSources("redirect", redirects);
+    validateConfigSources("rewrite", allRewrites);
+    validateConfigConditions("redirect", redirects);
+    validateConfigConditions("rewrite", allRewrites);
+
+    // Like Next.js' checkCustomRoutes (packages/next/src/lib/load-custom-routes.ts),
+    // reject a `basePath: false` rewrite to an internal destination: nothing
+    // outside the basePath resolves, so only an external URL is valid there.
+    const invalidBasePathRewrites = allRewrites.filter(
+      (rewrite) =>
+        rewrite.basePath === false &&
+        !(rewrite.destination.startsWith("http://") || rewrite.destination.startsWith("https://")),
+    );
+    if (invalidBasePathRewrites.length > 0) {
+      throw new Error(
+        invalidBasePathRewrites
+          .map(
+            (rewrite) =>
+              `The route ${rewrite.source} rewrites urls outside of the basePath. Please use a destination that starts with \`http://\` or \`https://\` https://nextjs.org/docs/messages/invalid-external-rewrite`,
+          )
+          .concat(`Invalid rewrite${invalidBasePathRewrites.length === 1 ? "" : "s"} found`)
+          .join("\n"),
+      );
+    }
+
     const externalRewrites = allRewrites.filter((rewrite) => isExternalUrl(rewrite.destination));
 
     if (externalRewrites.length > 0) {
@@ -1714,6 +2019,28 @@ export async function resolveNextConfig(
   let headers: NextHeader[] = [];
   if (config.headers) {
     headers = await config.headers();
+  }
+
+  validateConfigSources("header", headers);
+  validateConfigConditions("header", headers);
+  // Next.js checks the routes again after adding the basePath and locale
+  // prefixes.
+  if (config.basePath || i18n) {
+    const processOptions = {
+      basePath: config.basePath ?? "",
+      i18n,
+      trailingSlash: config.trailingSlash ?? false,
+    };
+    validateConfigSources("redirect", processedRouteSources(redirects, "redirect", processOptions));
+    validateConfigSources(
+      "rewrite",
+      processedRouteSources(
+        [...rewrites.beforeFiles, ...rewrites.afterFiles, ...rewrites.fallback],
+        "rewrite",
+        processOptions,
+      ),
+    );
+    validateConfigSources("header", processedRouteSources(headers, "header", processOptions));
   }
 
   // Probe wrapped webpack config for client and server resolution. Alias and
@@ -1855,11 +2182,12 @@ export async function resolveNextConfig(
     if (
       mdx ||
       Object.keys(webpackProbe.aliases).length > 0 ||
-      webpackProbe.resolveExtensionsCustomized
+      webpackProbe.resolveExtensionsCustomized ||
+      webpackProbe.instrumentationClientRouteManifest !== undefined
     ) {
       console.warn(
         '[vinext] next.config option "webpack" is only partially supported. ' +
-          "vinext preserves resolve.alias, resolve.extensions, and MDX loader settings, but other webpack customization is ignored",
+          "vinext preserves resolve.alias, resolve.extensions, MDX loader settings, and instrumentation-client route manifests, but other webpack customization is ignored",
       );
     } else {
       console.warn(
@@ -1935,6 +2263,13 @@ export async function resolveNextConfig(
     basePath: config.basePath ?? "",
     assetPrefix: normalizeAssetPrefix(config.assetPrefix),
     trailingSlash: config.trailingSlash ?? false,
+    // Next.js copies the legacy `experimental.skipTrailingSlashRedirect` over
+    // the top-level key (warnOptionHasBeenMovedOutOfExperimental), after
+    // dropping nullish nested values, so only a set legacy value overrides it.
+    skipTrailingSlashRedirect:
+      (experimental?.skipTrailingSlashRedirect ?? config.skipTrailingSlashRedirect) === true,
+    // Next.js disables compression only for an explicit `compress: false`.
+    compress: config.compress !== false,
     skipProxyUrlNormalize:
       config.skipProxyUrlNormalize ?? config.skipMiddlewareUrlNormalize ?? false,
     typescript:
@@ -1950,6 +2285,8 @@ export async function resolveNextConfig(
           (x): x is string => typeof x === "string",
         )
       : [],
+    instrumentationClientRouteManifest: webpackProbe.instrumentationClientRouteManifest,
+    instrumentationServerValueInjections: webpackProbe.instrumentationServerValueInjections,
     cacheComponents: config.cacheComponents ?? false,
     appNavFailHandling: experimental?.appNavFailHandling === true,
     gestureTransition: experimental?.gestureTransition === true,
@@ -2102,6 +2439,8 @@ async function probeWebpackConfig(
   resolveExtensions: string[] | null;
   serverResolveExtensions: string[] | null;
   resolveExtensionsCustomized: boolean;
+  instrumentationClientRouteManifest: string | undefined;
+  instrumentationServerValueInjections: Record<string, unknown>;
 }> {
   if (typeof config.webpack !== "function") {
     return {
@@ -2110,6 +2449,8 @@ async function probeWebpackConfig(
       resolveExtensions: null,
       serverResolveExtensions: null,
       resolveExtensionsCustomized: false,
+      instrumentationClientRouteManifest: undefined,
+      instrumentationServerValueInjections: {},
     };
   }
 
@@ -2135,6 +2476,13 @@ async function probeWebpackConfig(
       serverResolveExtensions: serverProbe.resolveExtensions,
       resolveExtensionsCustomized:
         clientProbe.resolveExtensions !== null || serverProbe.resolveExtensions !== null,
+      instrumentationClientRouteManifest: extractInstrumentationClientRouteManifest(
+        clientProbe.rules,
+      ),
+      instrumentationServerValueInjections: extractInstrumentationServerValueInjections(
+        serverProbe.rules,
+        root,
+      ),
     };
   } catch {
     return {
@@ -2143,8 +2491,103 @@ async function probeWebpackConfig(
       resolveExtensions: null,
       serverResolveExtensions: null,
       resolveExtensionsCustomized: false,
+      instrumentationClientRouteManifest: undefined,
+      instrumentationServerValueInjections: {},
     };
   }
+}
+
+// Sentry's unchanged `withSentryConfig` emits its route manifest through the
+// same webpack value-injection loader it uses with Next.js. Vinext does not run
+// webpack loaders, so preserve that already-computed value during our existing
+// config probe rather than independently rebuilding the manifest.
+function isValueInjectionLoader(use: unknown): use is { options?: { values?: unknown } } {
+  if (!isUnknownRecord(use) || typeof use.loader !== "string") return false;
+  return /(?:^|[/\\])value-?injection-?loader\.[cm]?[jt]s$/i.test(use.loader);
+}
+
+// oxlint-disable-next-line typescript/no-explicit-any
+function extractInstrumentationClientRouteManifest(rules: any[]): string | undefined {
+  let manifest: string | undefined;
+
+  // oxlint-disable-next-line typescript/no-explicit-any
+  const visit = (rule: any): void => {
+    if (!rule || typeof rule !== "object") return;
+    if (Array.isArray(rule)) {
+      for (const child of rule) visit(child);
+      return;
+    }
+    if (Array.isArray(rule.oneOf)) for (const child of rule.oneOf) visit(child);
+    if (Array.isArray(rule.rules)) for (const child of rule.rules) visit(child);
+    const uses = Array.isArray(rule.use) ? rule.use : rule.use ? [rule.use] : [];
+    for (const use of uses) {
+      if (!isValueInjectionLoader(use) || !isUnknownRecord(use.options?.values)) continue;
+      const value = use.options.values._sentryRouteManifest;
+      if (typeof value === "string") manifest = value;
+    }
+  };
+
+  for (const rule of rules) visit(rule);
+  return manifest;
+}
+
+// Preserve generic value-injection rules that wrapped Next.js configs target at
+// the standard server instrumentation module. Vinext does not execute webpack
+// loaders, so its Vite transform applies the already-computed JSON values.
+function matchesWebpackCondition(condition: unknown, value: string): boolean {
+  if (typeof condition === "string") return value.startsWith(condition);
+  if (condition instanceof RegExp) {
+    condition.lastIndex = 0;
+    const matches = condition.test(value);
+    condition.lastIndex = 0;
+    return matches;
+  }
+  if (Array.isArray(condition)) {
+    return condition.some((child) => matchesWebpackCondition(child, value));
+  }
+  return false;
+}
+
+function extractInstrumentationServerValueInjections(
+  rules: unknown[],
+  root: string,
+): Record<string, unknown> {
+  const values: Record<string, unknown> = {};
+  const candidates = ["instrumentation.ts", "src/instrumentation.ts"].flatMap((candidate) => [
+    candidate,
+    path.join(root, candidate),
+  ]);
+
+  // oxlint-disable-next-line typescript/no-explicit-any
+  const visit = (rule: any): void => {
+    if (!rule || typeof rule !== "object") return;
+    if (Array.isArray(rule)) {
+      for (const child of rule) visit(child);
+      return;
+    }
+    if (Array.isArray(rule.oneOf)) for (const child of rule.oneOf) visit(child);
+    if (Array.isArray(rule.rules)) for (const child of rule.rules) visit(child);
+
+    const applies = candidates.some(
+      (candidate) =>
+        matchesWebpackCondition(rule.test, candidate) &&
+        (rule.include === undefined || matchesWebpackCondition(rule.include, candidate)) &&
+        (rule.exclude === undefined || !matchesWebpackCondition(rule.exclude, candidate)),
+    );
+    if (!applies) return;
+
+    const uses = Array.isArray(rule.use) ? rule.use : rule.use ? [rule.use] : [];
+    for (const use of uses) {
+      if (!isValueInjectionLoader(use)) continue;
+      const injected = use.options?.values;
+      if (isUnknownRecord(injected)) {
+        Object.assign(values, injected);
+      }
+    }
+  };
+
+  for (const rule of rules) visit(rule);
+  return values;
 }
 
 const DEFAULT_WEBPACK_RESOLVE_EXTENSIONS = [".js", ".mjs", ".tsx", ".ts", ".jsx", ".json", ".wasm"];
@@ -2162,6 +2605,9 @@ async function runWebpackConfigProbe(
 }> {
   // oxlint-disable-next-line typescript/no-explicit-any
   const rules: any[] = [];
+  class WebpackPluginStub {
+    constructor(_options: unknown) {}
+  }
   const mockConfig = {
     context: root,
     resolve: {
@@ -2174,9 +2620,11 @@ async function runWebpackConfigProbe(
   };
   // oxlint-disable-next-line typescript/no-unsafe-function-type
   const result = await (config.webpack as Function)(mockConfig, {
+    config,
     defaultLoaders: { babel: { loader: "next-babel-loader" } },
     ...options,
     dir: root,
+    webpack: new Proxy({}, { get: () => WebpackPluginStub }),
   });
   const finalConfig = result ?? mockConfig;
   // oxlint-disable-next-line typescript/no-explicit-any

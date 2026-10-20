@@ -1,5 +1,5 @@
 import type { UserConfig } from "vite";
-import { toSlash } from "pathslash";
+import path, { toSlash } from "pathslash";
 
 type ClientAssetFileNameInfo = {
   readonly name?: string;
@@ -9,11 +9,13 @@ type ClientAssetFileNameInfo = {
 };
 
 const ROUTE_OWNED_CLIENT_SHIMS = new Set([
+  "app-router-tree-context",
   "compat-router",
   "dynamic",
   "dynamic-preload-chunks",
   "form",
   "image",
+  "image-props",
   "internal/hybrid-client-route-owner",
   "layout-segment-context",
   "legacy-image",
@@ -339,7 +341,8 @@ export function createMultiStageCodeSplittingConfig(
 
 /**
  * Keep router stage chunks beside the server entry so their generated
- * `./vinext-client-assets.js` external continues to resolve. Other chunks keep
+ * `./vinext-client-assets.js` and deploy-filled cacheability externals continue
+ * to resolve. Other chunks keep
  * the host's existing output pattern (or vinext's server-assets default).
  */
 export function createMultiStageChunkFileNames(
@@ -359,6 +362,7 @@ export function createMultiStageChunkFileNames(
         "pages-request-stage-entry",
         "pages-response-stage-entry",
         "virtual_vinext-rsc-entry",
+        "virtual_vinext-request-stage",
         "virtual_vinext-response-stage",
       ].some((entryName) => name.includes(entryName))
     ) {
@@ -368,4 +372,64 @@ export function createMultiStageChunkFileNames(
     const pattern = existing ?? joinAssetFileNamePattern(assetsDir, "[name]-[hash].js");
     return pattern.replaceAll("[name]", name);
   };
+}
+
+/**
+ * The client environment builds after RSC and SSR, and Vite empties its
+ * output directory first. A client output directory that is, or contains, a
+ * server output directory would therefore delete the server build.
+ */
+export function assertClientOutDirIsSeparate(
+  root: string,
+  dirs: { clientOutDir?: string; rscOutDir?: string; ssrOutDir?: string },
+): void {
+  if (!dirs.clientOutDir) return;
+  const clientOutDir = path.resolve(root, dirs.clientOutDir);
+  const serverOutDirs = [
+    ["rscOutDir", dirs.rscOutDir ?? "dist/server"],
+    ["ssrOutDir", dirs.ssrOutDir ?? "dist/server/ssr"],
+  ] as const;
+  for (const [name, dir] of serverOutDirs) {
+    const relative = path.relative(clientOutDir, path.resolve(root, dir));
+    if (relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) continue;
+    throw new Error(
+      `[vinext] clientOutDir "${dirs.clientOutDir}" contains ${name} "${dir}". ` +
+        "The client build runs last and empties its output directory, which would delete " +
+        "the server build. Use separate output directories.",
+    );
+  }
+}
+
+function hasChunkGroups(output: unknown, ownGroups: ReadonlySet<unknown>): boolean {
+  if (!output || typeof output !== "object") return false;
+  const { advancedChunks, codeSplitting, manualChunks } = output as {
+    advancedChunks?: { groups?: readonly unknown[] };
+    codeSplitting?: unknown;
+    manualChunks?: unknown;
+  };
+  if (manualChunks !== undefined) return true;
+  const groups = [
+    ...(advancedChunks?.groups ?? []),
+    ...((codeSplitting && typeof codeSplitting === "object"
+      ? (codeSplitting as { groups?: readonly unknown[] }).groups
+      : undefined) ?? []),
+  ];
+  return groups.some((group) => !ownGroups.has(group));
+}
+
+/**
+ * Whether client output options have chunk groups (`codeSplitting.groups`,
+ * `advancedChunks.groups` or `manualChunks`) other than vinext's own
+ * `ownGroups`, whether they came from the user or another plugin. vinext's
+ * client-reference route grouping is disabled in that case: a manual group can
+ * move modules out of a route group's chunk, and that combination has been
+ * seen to evaluate modules out of order and break hydration.
+ */
+export function hasUserClientChunkGroups(
+  output: unknown,
+  ownGroups: ReadonlySet<unknown>,
+): boolean {
+  return Array.isArray(output)
+    ? output.some((entry) => hasChunkGroups(entry, ownGroups))
+    : hasChunkGroups(output, ownGroups);
 }

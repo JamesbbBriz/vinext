@@ -14,6 +14,7 @@
  * never touches the Workers runtime — instantiation is deferred to the first
  * request.
  */
+import path from "pathslash";
 import { flattenPluginOptions } from "../utils/plugin-options.js";
 import type { VinextMultiStageOutput } from "../server/multi-stage.js";
 
@@ -38,10 +39,12 @@ export type CdnCacheAdapterCapabilities = {
    * The shared cache selects response variants using every request header
    * named by `Vary`, comparing the header values verbatim.
    *
-   * Vinext only uses the canonical deploy-warmed RSC request shape when this
-   * guarantee is present. URL-only caches retain the contextual `_rsc` digest.
+   * Deploy warmup can address the canonical full-route and loading-shell RSC
+   * variants when this guarantee is present.
    */
   responseVary?: "verbatim";
+  /** Warm by observing framework `X-Vinext-Cache` admission instead of an edge-cache header. */
+  warmup?: "data-cache" | "response-store";
   /**
    * Rewrites and other request routing run before the shared response stage,
    * and the resolved response-stage invocation participates in cache identity.
@@ -77,12 +80,23 @@ export type CacheAdapterBuildOutput = {
     outDir: string;
     isPrimaryServerOutput: boolean;
   }) => Promise<void> | void;
+  /** Package locally prerendered artifacts after the prerender phase completes. */
+  finalizePrerenderOutput?: (output: {
+    root: string;
+    clientOutDir: string;
+  }) => Promise<void> | void;
 };
 
 export type CacheAdapterDescriptor<O extends Record<string, unknown> = Record<string, unknown>> = {
   /**
    * Module specifier (or absolute path, e.g. from `require.resolve(...)`) whose
-   * default export is a cache adapter factory.
+   * default export creates the adapter from one `{ env, options }` argument:
+   * either a factory `({ env, options }) => adapter` or a class
+   * `new Adapter({ env, options })`. Class syntax is invoked with `new`; any
+   * other function is called. For a constructor that is not class syntax (an
+   * ES5-compiled, bound or Proxy-wrapped class), export
+   * `(args) => new Adapter(args)`. The result must be the adapter object
+   * itself, not a Promise.
    */
   adapter: string;
   /** JSON-serializable options forwarded to the factory at runtime. */
@@ -97,12 +111,60 @@ export function hasVerbatimResponseVary(cache?: VinextCacheConfig | null): boole
   return cache?.cdn?.capabilities?.responseVary === "verbatim";
 }
 
+export function supportsCanonicalRscWarmup(cache?: VinextCacheConfig | null): boolean {
+  return hasVerbatimResponseVary(cache);
+}
+
+export function cacheWarmupStatusSource(
+  cache?: VinextCacheConfig | null,
+): "cloudflare" | "data-cache" | "vinext" {
+  if (cache?.cdn?.capabilities?.warmup === "response-store") return "vinext";
+  if (cache?.cdn?.capabilities?.warmup === "data-cache") return "data-cache";
+  if (!cache?.cdn?.adapter && cache?.data?.capabilities?.warmup === "data-cache") {
+    return "data-cache";
+  }
+  return "cloudflare";
+}
+
+function prerenderOutputFinalizers(cache?: VinextCacheConfig | null) {
+  return [cache?.data?.output, cache?.cdn?.output]
+    .map((output) =>
+      output && "finalizePrerenderOutput" in output ? output.finalizePrerenderOutput : undefined,
+    )
+    .filter(
+      (finalize): finalize is NonNullable<CacheAdapterBuildOutput["finalizePrerenderOutput"]> =>
+        Boolean(finalize),
+    );
+}
+
+/** Whether a configured adapter consumes locally prerendered build artifacts. */
+export function hasCacheAdapterPrerenderOutput(cache?: VinextCacheConfig | null): boolean {
+  return prerenderOutputFinalizers(cache).length > 0;
+}
+
+/** Let configured adapters package locally prerendered build artifacts. */
+export async function finalizeCacheAdapterPrerenderOutput(
+  cache: VinextCacheConfig | null | undefined,
+  root: string,
+  output: { clientOutDir?: string } = {},
+): Promise<void> {
+  for (const finalize of new Set(prerenderOutputFinalizers(cache))) {
+    await finalize({
+      root,
+      clientOutDir: path.resolve(root, output.clientOutDir ?? "dist/client"),
+    });
+  }
+}
+
 export function hasUncachedRequestRouting(cache?: VinextCacheConfig | null): boolean {
   return cache?.cdn?.capabilities?.requestRouting === "uncached-stage";
 }
 
 export function hasBuildIdentityResponseHeader(cache?: VinextCacheConfig | null): boolean {
-  return cache?.cdn?.capabilities?.buildIdentity === "response-header";
+  return (
+    cache?.cdn?.capabilities?.buildIdentity === "response-header" ||
+    (!cache?.cdn?.adapter && cache?.data?.capabilities?.buildIdentity === "response-header")
+  );
 }
 
 export function requiresRouteCacheabilityProbeManifest(cache?: VinextCacheConfig | null): boolean {
@@ -199,6 +261,8 @@ function inlineOptions(adapter: string, options: Record<string, unknown> | undef
 export function generateCacheAdaptersModule(cache?: VinextCacheConfig): string {
   const data = cache?.data;
   const cdn = cache?.cdn;
+  const dataProvidesBuildIdentity =
+    !cdn?.adapter && data?.capabilities?.buildIdentity === "response-header";
 
   // Nothing configured → a no-op so the unconditional import in the server
   // entries stays valid and tree-shakes to almost nothing.
@@ -212,6 +276,7 @@ export function generateCacheAdaptersModule(cache?: VinextCacheConfig): string {
 
   const lines: string[] = [
     "// vinext: generated from the `cache` option in your vinext() plugin config.",
+    `import { instantiateCacheAdapter } from "vinext/shims/cache-adapter-instantiate";`,
   ];
 
   if (data?.adapter) {
@@ -221,6 +286,11 @@ export function generateCacheAdaptersModule(cache?: VinextCacheConfig): string {
   if (cdn?.adapter) {
     lines.push(`import __vinextCdnAdapterFactory from ${JSON.stringify(cdn.adapter)};`);
     lines.push(`import { registerCdnCacheAdapter } from "vinext/shims/cdn-cache-state";`);
+  } else if (dataProvidesBuildIdentity) {
+    lines.push(
+      `import { DefaultCdnCacheAdapter } from "vinext/shims/cdn-cache";`,
+      `import { registerCdnCacheAdapter } from "vinext/shims/cdn-cache-state";`,
+    );
   }
 
   lines.push(
@@ -246,10 +316,19 @@ export function generateCacheAdaptersModule(cache?: VinextCacheConfig): string {
   if (data?.adapter) {
     lines.push(
       "  try {",
-      `    registerDataCacheHandler(() => __vinextDataAdapterFactory({ env, options: ${inlineOptions(
+      `    registerDataCacheHandler(() => instantiateCacheAdapter(__vinextDataAdapterFactory, { env, options: ${inlineOptions(
         data.adapter,
         data.options,
-      )} }));`,
+      )} }, "data"));`,
+    );
+    if (dataProvidesBuildIdentity) {
+      lines.push(
+        "    registerCdnCacheAdapter(() => new DefaultCdnCacheAdapter(",
+        "      process.env.__VINEXT_RSC_BUILD_IDENTITY || process.env.__VINEXT_BUILD_ID,",
+        "    ));",
+      );
+    }
+    lines.push(
       "  } catch (error) {",
       '    console.warn("[vinext] failed to initialize the configured data cache adapter; ' +
         'using the default handler.\\n" + __vinextFormatAdapterError(error));',
@@ -259,10 +338,10 @@ export function generateCacheAdaptersModule(cache?: VinextCacheConfig): string {
   if (cdn?.adapter) {
     lines.push(
       "  try {",
-      `    registerCdnCacheAdapter(() => __vinextCdnAdapterFactory({ env, options: ${inlineOptions(
+      `    registerCdnCacheAdapter(() => instantiateCacheAdapter(__vinextCdnAdapterFactory, { env, options: ${inlineOptions(
         cdn.adapter,
         cdn.options,
-      )} }));`,
+      )} }, "cdn"));`,
       "  } catch (error) {",
       '    console.warn("[vinext] failed to initialize the configured CDN cache adapter; ' +
         'using the default adapter.\\n" + __vinextFormatAdapterError(error));',
@@ -276,5 +355,5 @@ export function generateCacheAdaptersModule(cache?: VinextCacheConfig): string {
 
 /** Generate request-stage registration without importing a configured data adapter. */
 export function generateCdnCacheAdapterModule(cache?: VinextCacheConfig): string {
-  return `${generateCacheAdaptersModule(cache?.cdn ? { cdn: cache.cdn } : undefined)}export const hasConfiguredDataCache = ${Boolean(cache?.data?.adapter)};\n`;
+  return `${generateCacheAdaptersModule(cache?.cdn ? { cdn: cache.cdn } : undefined)}export const hasConfiguredDataCache = ${Boolean(cache?.data?.adapter)};\nexport const configuredCdnCacheAdapterOptions = ${inlineOptions(cache?.cdn?.adapter ?? "cdn", cache?.cdn?.options)};\n`;
 }

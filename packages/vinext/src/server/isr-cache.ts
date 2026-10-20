@@ -13,6 +13,7 @@
  * because it only uses the standard get/set interface.
  */
 
+import { createHash } from "node:crypto";
 import {
   type CacheControlMetadata,
   type CacheHandlerValue,
@@ -21,16 +22,17 @@ import {
   type CachedAppPageValue,
 } from "vinext/shims/cache-handler";
 import { getCdnCacheAdapter } from "vinext/shims/cdn-cache";
-import { fnv1a64 } from "../utils/hash.js";
+import { normalizePathnameForRouteMatch } from "../routing/utils.js";
 import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { reportRequestError, type OnRequestErrorContext } from "./instrumentation.js";
+import { shareIsolatePromise } from "./isolate-shared-promise.js";
 import { normalizeMountedSlotsHeader } from "./app-mounted-slots-header.js";
 import {
   APP_RSC_RENDER_MODE_NAVIGATION,
   getRscRenderModeCacheVariant,
   type AppRscRenderMode,
 } from "./app-rsc-render-mode.js";
-import { normalizeAppPageInterceptionProofPathname } from "./app-page-render-identity.js";
+import { isInterceptionMatchedUrlPath } from "./normalize-path.js";
 import type { RenderObservation } from "./cache-proof.js";
 import { PRERENDER_REVALIDATE_ONLY_GENERATED_HEADER } from "../utils/protocol-headers.js";
 export { normalizeMountedSlotsHeader };
@@ -113,6 +115,19 @@ export function isrCacheControl(
     ...(claims.expireSeconds === undefined ? {} : { expire: claims.expireSeconds }),
     ...(claims.staleSeconds === undefined ? {} : { stale: claims.staleSeconds }),
   };
+}
+
+/**
+ * The route-level `expireTime` only bounds a finite revalidate. Like Next.js,
+ * a `revalidate = false` entry keeps no expire of its own and stays until it
+ * is invalidated; only a cacheLife expire can bound it.
+ * https://github.com/vercel/next.js/blob/v16.2.7/packages/next/src/build/index.ts#L3035-L3058
+ */
+export function resolveRouteExpireSeconds(
+  revalidateSeconds: number | false | null,
+  expireSeconds: number | undefined,
+): number | undefined {
+  return revalidateSeconds === false || revalidateSeconds === Infinity ? undefined : expireSeconds;
 }
 
 /**
@@ -221,13 +236,15 @@ export function coalesceOnDemandRevalidation<T>(
 
   // Defer invocation until after the promise is registered, matching Next.js's
   // response-cache scheduler and closing the same-tick stampede window.
-  const promise = Promise.resolve()
-    .then(renderFn)
-    .finally(() => {
-      if (pendingOnDemandRegenerations.get(key) === promise) {
-        pendingOnDemandRegenerations.delete(key);
-      }
-    });
+  const promise: Promise<T> = shareIsolatePromise(
+    Promise.resolve()
+      .then(renderFn)
+      .finally(() => {
+        if (pendingOnDemandRegenerations.get(key) === promise) {
+          pendingOnDemandRegenerations.delete(key);
+        }
+      }),
+  );
   pendingOnDemandRegenerations.set(key, promise);
   return promise;
 }
@@ -244,7 +261,8 @@ export function coalesceOnDemandRevalidation<T>(
  *
  * When `errorContext` is provided and the render function fails, the error
  * is reported via `reportRequestError` (instrumentation hook) with
- * `revalidateReason: "stale"`.
+ * `revalidateReason: "stale"`, unless `shouldReport` suppresses an error that
+ * an inner render boundary already reported.
  */
 export function triggerBackgroundRegeneration(
   key: string,
@@ -253,6 +271,7 @@ export function triggerBackgroundRegeneration(
     routerKind: OnRequestErrorContext["routerKind"];
     routePath: string;
     routeType: OnRequestErrorContext["routeType"];
+    shouldReport?: (error: unknown) => boolean;
   },
 ): void {
   // Edge-managed CDN adapters revalidate by re-requesting the origin, so the
@@ -261,11 +280,11 @@ export function triggerBackgroundRegeneration(
   if (pendingRegenerations.has(key)) return;
 
   const promise = renderFn()
-    .catch((err) => {
+    .catch(async (err) => {
       console.error(`[vinext] ISR background regeneration failed for ${key}:`, err);
-      if (errorContext) {
-        void reportRequestError(
-          err instanceof Error ? err : new Error(String(err)),
+      if (errorContext && (errorContext.shouldReport?.(err) ?? true)) {
+        await reportRequestError(
+          err,
           { path: key, method: "GET", headers: {} },
           {
             routerKind: errorContext.routerKind,
@@ -337,12 +356,20 @@ function normalizeCachePathname(pathname: string): string {
   return pathname === "/" ? "/" : pathname.replace(/\/$/, "");
 }
 
+/**
+ * Digest a request-controlled key part. It must be collision resistant: a
+ * crafted value that shared a weaker hash with another would share its entry.
+ */
+function digestKeyPart(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 function buildCacheKey(prefix: string, pathname: string, suffix?: string): string {
   const normalized = normalizeCachePathname(pathname);
   const suffixPart = suffix ? `:${suffix}` : "";
   const key = `${prefix}:${normalized}${suffixPart}`;
   if (key.length <= 200) return key;
-  return `${prefix}:__hash:${fnv1a64(normalized)}${suffixPart}`;
+  return `${prefix}:__hash:${digestKeyPart(normalized)}${suffixPart}`;
 }
 
 /**
@@ -352,6 +379,21 @@ function buildCacheKey(prefix: string, pathname: string, suffix?: string): strin
 export function isrCacheKey(router: string, pathname: string, buildId?: string): string {
   const prefix = buildId ? `${router}:${buildId}` : router;
   return buildCacheKey(prefix, pathname);
+}
+
+/** Build and request time share the same locale-stripped Pages pathname identity. */
+export function pagesIsrCacheKey(
+  pathname: string,
+  buildId?: string,
+  i18nCacheVariant?: string | null,
+): string {
+  // Decode once per segment, preserving escaped delimiters and literal escapes.
+  // Strip the pathname's trailing slash before appending the locale/domain variant.
+  const normalized = normalizeCachePathname(normalizePathnameForRouteMatch(pathname));
+  const variant = i18nCacheVariant ? `::i18n=${encodeURIComponent(i18nCacheVariant)}` : "";
+  // Legacy keys retained raw escapes. A stable build ID must not let a new
+  // literal-percent pathname reinterpret an old encoded-parameter entry.
+  return isrCacheKey("pages:v2", normalized + variant, buildId);
 }
 
 /**
@@ -366,7 +408,25 @@ export function appIsrCacheKey(
   suffix: string,
   buildId = process.env.__VINEXT_BUILD_ID,
 ): string {
-  const prefix = buildId ? `app:${buildId}` : "app";
+  // Keep incompatible App cache identities unreachable even when generateBuildId is stable.
+  const prefix = buildId ? `app:v2:${buildId}` : "app:v2";
+  return buildCacheKey(prefix, pathname, suffix);
+}
+
+/**
+ * Compute the ISR key for a PPR fallback shell artifact, such as the HTML for
+ * `/en/[slug]`. Shells get their own namespace: a request for the literal path
+ * `/en/%5Bslug%5D` decodes to the same pathname, and its render must not be
+ * stored where every unknown `[slug]` reads its shell. The namespace is a
+ * prefix of its own rather than a part after the build ID, which can contain
+ * `:` and so could spell it.
+ */
+export function appIsrFallbackShellKey(
+  pathname: string,
+  suffix: "html" | "rsc",
+  buildId = process.env.__VINEXT_BUILD_ID,
+): string {
+  const prefix = buildId ? `app-fallback-shell:v1:${buildId}` : "app-fallback-shell:v1";
   return buildCacheKey(prefix, pathname, suffix);
 }
 
@@ -374,8 +434,15 @@ export function appIsrHtmlKey(pathname: string): string {
   return appIsrCacheKey(pathname, "html");
 }
 
+export function appIsrFallbackShellHtmlKey(pathname: string): string {
+  return appIsrFallbackShellKey(pathname, "html");
+}
+
 function normalizeInterceptionContextForCacheKey(interceptionContext: string): string | null {
-  return normalizeAppPageInterceptionProofPathname(interceptionContext);
+  // Key on the raw context. The source is matched on its raw segments, so two
+  // spellings that decode alike (`/feed` and `/%66eed`) can render different
+  // source trees and must not share an entry.
+  return isInterceptionMatchedUrlPath(interceptionContext) ? interceptionContext : null;
 }
 
 /**
@@ -402,9 +469,9 @@ export function appIsrRscKey(
       ? null
       : normalizeInterceptionContextForCacheKey(interceptionContext);
   const variant = [
-    sourceVariant ? `source:${fnv1a64(sourceVariant)}` : null,
-    interceptionId ? `selector:${fnv1a64(interceptionId)}` : null,
-    normalizedMountedSlotsHeader ? `slots:${fnv1a64(normalizedMountedSlotsHeader)}` : null,
+    sourceVariant ? `source:${digestKeyPart(sourceVariant)}` : null,
+    interceptionId ? `selector:${digestKeyPart(interceptionId)}` : null,
+    normalizedMountedSlotsHeader ? `slots:${digestKeyPart(normalizedMountedSlotsHeader)}` : null,
     getRscRenderModeCacheVariant(renderMode),
   ]
     .filter((part) => part !== null)
@@ -413,5 +480,6 @@ export function appIsrRscKey(
 }
 
 export function appIsrRouteKey(pathname: string): string {
-  return appIsrCacheKey(pathname, "route");
+  const suffix = pathname !== "/" && pathname.endsWith("/") ? "route:trailing-slash" : "route";
+  return appIsrCacheKey(pathname, suffix);
 }

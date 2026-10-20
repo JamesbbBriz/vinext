@@ -8,7 +8,7 @@
  * `new Response(...)` boilerplate.
  *
  * Sites with route-specific bodies (e.g. `"404 - API route not found"`,
- * `"Image not found"`, generated worker templates) intentionally remain inline
+ * generated worker templates) intentionally remain inline
  * because their bodies are either tested-against fixtures or run inside template
  * strings that have no access to runtime imports.
  *
@@ -97,6 +97,7 @@ export function notFoundStaticAssetResponse(headers?: HeadersInit): Response {
   responseHeaders.delete("content-length");
   responseHeaders.delete("transfer-encoding");
   responseHeaders.set("Content-Type", "text/plain; charset=utf-8");
+  responseHeaders.set("Cache-Control", "private, no-cache, no-store, max-age=0, must-revalidate");
   return new Response("Not Found", {
     status: 404,
     headers: responseHeaders,

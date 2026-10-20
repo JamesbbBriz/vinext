@@ -1,0 +1,98 @@
+export const metadata = {
+  slug: "getting-started/migrating",
+  title: "Migrate a Next.js app",
+  description: "Add vinext alongside an existing Next.js setup without rewriting the application.",
+  section: "Getting Started",
+  sectionOrder: 1,
+  order: 3,
+  navTitle: "Migrate a Next.js app",
+  keywords: ["migrate Next.js to vinext", "vinext compatibility", "Next.js Vite migration"],
+};
+
+import { PackageManagerCommand } from "../../apps/web/app/docs/_package-manager";
+
+> Migration is non-destructive. `vinext init` leaves your Next.js scripts and source files in place, then adds parallel `*:vinext` scripts for evaluation.
+
+## 1. Check compatibility
+
+<PackageManagerCommand
+  commands={{
+    pnpm: "pnpm dlx vinext check",
+    npm: "npx vinext check",
+    yarn: "yarn dlx vinext check",
+    bun: "bunx vinext check",
+    vp: "vpx vinext check",
+  }}
+/>
+
+The scanner reports known unsupported configuration, imports, and project patterns. Also check the [compatibility dashboard](/compatibility) and open issues for behavior specific to your application.
+
+## 2. Initialize vinext
+
+<PackageManagerCommand
+  commands={{
+    pnpm: "pnpm dlx vinext init",
+    npm: "npx vinext init",
+    yarn: "yarn dlx vinext init",
+    bun: "bunx vinext init",
+    vp: "vpx vinext init",
+  }}
+/>
+
+Choose Cloudflare or Node when prompted. The command installs the required packages, adds ESM and Vite configuration, and creates deployment config for the selected platform.
+
+For a non-interactive run, select the target explicitly:
+
+<PackageManagerCommand
+  commands={{
+    pnpm: "pnpm dlx vinext init --platform=cloudflare\npnpm dlx vinext init --platform=node",
+    npm: "npx vinext init --platform=cloudflare\nnpx vinext init --platform=node",
+    yarn: "yarn dlx vinext init --platform=cloudflare\nyarn dlx vinext init --platform=node",
+    bun: "bunx vinext init --platform=cloudflare\nbunx vinext init --platform=node",
+    vp: "vpx vinext init --platform=cloudflare\nvpx vinext init --platform=node",
+  }}
+/>
+
+## 3. Run both toolchains
+
+<PackageManagerCommand
+  commands={{
+    pnpm: "pnpm dev:vinext\npnpm build:vinext\npnpm dev",
+    npm: "npm run dev:vinext\nnpm run build:vinext\nnpm run dev",
+    yarn: "yarn dev:vinext\nyarn build:vinext\nyarn dev",
+    bun: "bun run dev:vinext\nbun run build:vinext\nbun run dev",
+    vp: "vp run dev:vinext\nvp run build:vinext\nvp run dev",
+  }}
+/>
+
+Compare the routes and workflows your application depends on. Start with authentication, middleware, mutations, caching, and deployment bindings rather than only checking the home page.
+
+## Styling
+
+### CSS Modules
+
+If the project contains CSS Modules, init adds `vite-css-modules` and configures stable class names so PostCSS runs before class scoping. It updates inline Vite config objects automatically. For dynamic configs (factories, spreads, identifier exports, or CommonJS), init stops before changing the project rather than guessing how to rewrite the config. To continue with init, convert the Vite config to an inline object; otherwise finish the migration manually with equivalent CSS settings:
+
+```ts
+import { createHash } from "node:crypto";
+import path from "node:path";
+import { patchCssModules } from "vite-css-modules";
+import { defineConfig } from "vite";
+import vinext from "vinext";
+
+export default defineConfig({
+  plugins: [patchCssModules({ exportMode: "default" }), vinext()],
+  css: {
+    modules: {
+      generateScopedName(name: string, filename: string) {
+        const relativePath = path
+          .relative(import.meta.dirname, filename.replace(/\?.*$/, ""))
+          .replaceAll("\\", "/");
+        return `_${name}_${createHash("sha256").update(relativePath).digest("hex").slice(0, 7)}`;
+      },
+    },
+  },
+});
+```
+
+Keep any other plugins and options in your existing config; place `patchCssModules` before `vinext`.

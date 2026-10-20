@@ -1,16 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { VinextCacheConfig } from "vinext/internal/cache-adapters";
+import type { VinextCacheConfig } from "vinext/internal/config/prerender";
 import { findViteConfigPath } from "vinext/internal/utils/project";
-import {
-  DEFAULT_KV_DATA_CACHE_BINDING,
-  type KvDataAdapterOptions,
-} from "./cache/kv-data-adapter.js";
 import {
   DEFAULT_CDN_VERSION_METADATA_BINDING,
   type CdnAdapterOptions,
-} from "./cache/cdn-adapter.js";
+} from "./cache/workers-cache-cdn-adapter.js";
 
 function escapeRegExp(value: string): string {
   return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
@@ -111,15 +107,12 @@ export function viteConfigHasCacheAdapter(root: string): boolean {
     return true;
   }
   const block = extractCacheBlock(content);
-  if (!block) return false; // no cache config at all
+  if (!block) {
+    const assigned = /\bcache\s*:\s*([^,}\n]+)/.exec(content)?.[1].trim();
+    return Boolean(assigned && assigned !== "undefined" && assigned !== "null");
+  }
   return cacheFieldAssigned(block, "cdn") || cacheFieldAssigned(block, "data");
 }
-
-export type ResolvedKvDataAdapterConfig = {
-  binding: string;
-  appPrefix?: string;
-  ttlSeconds?: number;
-};
 
 export type ResolvedCdnAdapterConfig = {
   versionMetadataBinding: string;
@@ -127,14 +120,17 @@ export type ResolvedCdnAdapterConfig = {
 
 function isCloudflareCdnAdapterPath(adapter: string): boolean {
   const normalized = adapter.replace(/\\/g, "/");
-  const bundledRuntime = fileURLToPath(
-    new URL("./cache/cdn-adapter.runtime.js", import.meta.url),
-  ).replace(/\\/g, "/");
-  return (
-    normalized === "@vinext/cloudflare/cache/cdn-adapter.runtime" ||
-    normalized === "@vinext/cloudflare/cache/cdn-adapter.runtime.js" ||
-    normalized === bundledRuntime
-  );
+  return ["cdn-adapter.runtime", "response-store-cdn.runtime"].some((runtime) => {
+    const bundledRuntime = fileURLToPath(new URL(`./cache/${runtime}.js`, import.meta.url)).replace(
+      /\\/g,
+      "/",
+    );
+    return (
+      normalized === `@vinext/cloudflare/cache/${runtime}` ||
+      normalized === `@vinext/cloudflare/cache/${runtime}.js` ||
+      normalized === bundledRuntime
+    );
+  });
 }
 
 export function resolveCdnAdapterConfig(
@@ -150,44 +146,6 @@ export function resolveCdnAdapterConfig(
       options.versionMetadataBinding.length > 0
         ? options.versionMetadataBinding
         : DEFAULT_CDN_VERSION_METADATA_BINDING,
-  };
-}
-
-function isCloudflareKvDataAdapterPath(adapter: string): boolean {
-  const normalized = adapter.replace(/\\/g, "/");
-  return (
-    normalized === "@vinext/cloudflare/cache/kv-data-adapter.runtime" ||
-    normalized === "@vinext/cloudflare/cache/kv-data-adapter.runtime.js" ||
-    normalized.endsWith("/cache/kv-data-adapter.runtime.js")
-  );
-}
-
-function readPositiveNumberOption(
-  options: KvDataAdapterOptions | undefined,
-  field: "ttlSeconds",
-): number | undefined {
-  const value = options?.[field];
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
-}
-
-export function resolveKvDataAdapterConfig(
-  cache: VinextCacheConfig | null | undefined,
-): ResolvedKvDataAdapterConfig | null {
-  const data = cache?.data;
-  if (!data?.adapter || !isCloudflareKvDataAdapterPath(data.adapter)) return null;
-
-  const options = data.options as KvDataAdapterOptions | undefined;
-  return {
-    binding:
-      typeof options?.binding === "string" && options.binding.length > 0
-        ? options.binding
-        : DEFAULT_KV_DATA_CACHE_BINDING,
-    ...(typeof options?.appPrefix === "string" && options.appPrefix.length > 0
-      ? { appPrefix: options.appPrefix }
-      : {}),
-    ...(readPositiveNumberOption(options, "ttlSeconds") !== undefined
-      ? { ttlSeconds: readPositiveNumberOption(options, "ttlSeconds") }
-      : {}),
   };
 }
 
@@ -251,7 +209,10 @@ export function workerEntryHasCacheHandler(root: string): boolean {
  * persistent cache backend; vinext no longer scaffolds one into the Worker
  * entry, so it must be declared via `vinext({ cache })`.
  */
-export function formatMissingCacheAdapterError(options: { configFile?: string }): string {
+export function formatMissingCacheAdapterError(options: {
+  configFile?: string;
+  typedConfig?: boolean;
+}): string {
   const configRef = options.configFile ? options.configFile : "your Vite config";
   return (
     `[vinext] This app uses ISR / caching but no cache adapter is configured in ${configRef}.\n\n` +
@@ -268,13 +229,22 @@ export function formatMissingCacheAdapterError(options: { configFile?: string })
     `        cloudflare(),\n` +
     `      ],\n` +
     `    });\n\n` +
-    `  The VINEXT_KV_CACHE namespace binding is added to wrangler.jsonc for you.\n` +
-    `  Create the namespace with:\n\n` +
-    `    npx wrangler kv namespace create VINEXT_KV_CACHE`
+    (options.typedConfig
+      ? `  Configure the VINEXT_KV_CACHE namespace binding in cloudflare.config.ts.`
+      : `  The VINEXT_KV_CACHE namespace binding is added to wrangler.jsonc for you.\n` +
+        `  Create the namespace with:\n\n` +
+        `    npx wrangler kv namespace create VINEXT_KV_CACHE`)
   );
 }
 
-export function formatImageOptimizationHint(): string {
+export function formatImageOptimizationHint(typedConfig = false): string {
+  if (typedConfig) {
+    return (
+      `  [vinext] next/image is served unoptimized. To enable edge image\n` +
+      `  optimization via Cloudflare Images, configure imagesOptimizer() in your\n` +
+      `  Vite config and the IMAGES binding in cloudflare.config.ts.`
+    );
+  }
   return (
     `  [vinext] next/image is served unoptimized. To enable edge image\n` +
     `  optimization via Cloudflare Images, run:\n\n` +

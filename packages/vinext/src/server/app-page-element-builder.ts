@@ -1,6 +1,13 @@
-import { Suspense, createElement } from "react";
+import { Suspense, cache, createElement } from "react";
 import { makeThenableParams } from "vinext/shims/thenable-params";
 import {
+  withUseCachePageMarker,
+  withUseCacheLayoutMarker,
+} from "vinext/shims/internal/app-page-props-cache-key";
+import { ClientPageRoot } from "vinext/shims/client-page-root";
+import {
+  collectAppPageSearchParams,
+  hasAppPageDynamicMetadata,
   prepareAppPageHead,
   resolveActiveParallelRouteHeadInputs,
   type ApplyAppPageFileBasedMetadata,
@@ -17,15 +24,22 @@ import {
   resolveAppPageLoadingModuleAtOrAbove,
   type AppPageErrorModule,
   type AppPageModule,
+  type AppPageRouteHead,
   type AppPageRouteWiringRoute,
   type AppPageSlotOverride,
 } from "./app-page-route-wiring.js";
 import {
+  APP_PAGE_SEGMENT_KEY,
   isAppPageRouteGroupSegment,
   resolveAppPagePatternStateKey,
   resolveAppPageRouteStateKey,
   type AppPageSemanticSegment,
 } from "./app-page-segment-state.js";
+import {
+  resolveAppPageModuleTraceSegment,
+  traceCreateComponentTree,
+  traceGetLayoutOrPageModule,
+} from "./app-page-tracing.js";
 import { AppElementsWire, type AppElements } from "./app-elements.js";
 import { resolveAppPageParentHttpAccessBoundary, type AppPageParams } from "./app-page-boundary.js";
 import { resolveAppPageSpecialError } from "./app-page-execution.js";
@@ -45,6 +59,7 @@ import { resolveAppPageBranchParams, resolveAppPageSegmentParams } from "./app-p
 import {
   createAppPageRenderDependency,
   invokeAppComponent,
+  isAppClientReference,
   isAppRenderSuspension,
   isReactOwnedAppComponent,
   renderAfterAppDependencies,
@@ -58,6 +73,41 @@ function resolveInterceptLayoutParams(
   params: AppPageParams,
 ): AppPageParams {
   return resolveAppPageBranchParams(branchSegments, layoutSegments.length, params, layoutSegments);
+}
+
+function traceAppPageLayoutModules(
+  modules: readonly (AppPageModule | null | undefined)[],
+  routeSegments: readonly string[],
+  treePositions: readonly number[] | null | undefined,
+): void {
+  for (const [index, module] of modules.entries()) {
+    if (!module) continue;
+    traceGetLayoutOrPageModule(
+      resolveAppPageModuleTraceSegment(routeSegments, treePositions?.[index] ?? 0),
+      () => module,
+    );
+  }
+}
+
+function resolveInterceptLayoutTraceSegment(
+  branchSegments: readonly string[] | null | undefined,
+  layoutSegments: readonly string[],
+): string {
+  return resolveAppPageModuleTraceSegment(branchSegments ?? layoutSegments, layoutSegments.length);
+}
+
+function traceAppPageInterceptLayoutModules(
+  modules: readonly (AppPageModule | null | undefined)[] | null | undefined,
+  branchSegments: readonly string[] | null | undefined,
+  layoutSegments: readonly (readonly string[])[] | null | undefined,
+): void {
+  for (const [index, module] of (modules ?? []).entries()) {
+    if (!module) continue;
+    traceGetLayoutOrPageModule(
+      resolveInterceptLayoutTraceSegment(branchSegments, layoutSegments?.[index] ?? []),
+      () => module,
+    );
+  }
 }
 
 export type { AppPageErrorModule, AppPageRouteWiringRoute } from "./app-page-route-wiring.js";
@@ -116,10 +166,19 @@ export type AppPagePageRequest<TModule extends AppPageModule = AppPageModule> = 
   renderMode?: AppRscRenderMode;
   /** Observe page `searchParams` access for cache-safety classification. */
   observePageSearchParamsAccess?: boolean;
+  /** The route is `dynamic = "force-static"`, so pages read an empty query. */
+  isForceStatic?: boolean;
   /** Observe page metadata `searchParams` access for cache-safety classification. */
   observeMetadataSearchParamsAccess?: boolean;
   /** Whether generated metadata may stream into the response body. */
   serveStreamingMetadata?: boolean;
+  /**
+   * Wait for streamed metadata in `<head>`, for a document rendered whole
+   * before it's written, such as a background regeneration. Next.js does this
+   * for every static or ISR render. Its errors still reach the route's
+   * boundaries through the outlet.
+   */
+  placeStreamedMetadataInHead?: boolean;
   /** Whether streamed render errors must be sanitized for client transport. */
   isProduction?: boolean;
 };
@@ -220,7 +279,9 @@ export async function buildPageElements<
     renderMode = APP_RSC_RENDER_MODE_NAVIGATION,
     observeMetadataSearchParamsAccess = false,
     observePageSearchParamsAccess = false,
+    isForceStatic = false,
     serveStreamingMetadata,
+    placeStreamedMetadataInHead = false,
     isProduction = process.env.NODE_ENV === "production",
   } = pageRequest;
 
@@ -290,17 +351,32 @@ export async function buildPageElements<
       const treePosition = route.layoutTreePositions?.[0] ?? 0;
       noExportRootLayout = createAppPageTreePath(route.routeSegments, treePosition);
     }
-    return {
-      ...AppElementsWire.createMetadataEntries({
-        interception: renderIdentity.interception,
-        interceptionContext: renderIdentity.interceptionContext,
-        layoutIds: noExportLayoutIds,
-        rootLayoutTreePath: noExportRootLayout,
-        routeId: renderIdentity.routeId,
-        sourcePage: createAppPageSourcePage(sourcePageSegments),
-      }),
-      [renderIdentity.routeId]: createElement("div", null, "Page has no default export"),
-    };
+    return traceCreateComponentTree(() => {
+      traceGetLayoutOrPageModule(APP_PAGE_SEGMENT_KEY, () => effectivePageModule);
+      traceAppPageLayoutModules(
+        route.layouts,
+        route.routeSegments ?? [],
+        route.layoutTreePositions,
+      );
+      if (isSiblingIntercept) {
+        traceAppPageInterceptLayoutModules(
+          opts?.interceptLayouts,
+          opts?.interceptBranchSegments,
+          opts?.interceptLayoutSegments,
+        );
+      }
+      return {
+        ...AppElementsWire.createMetadataEntries({
+          interception: renderIdentity.interception,
+          interceptionContext: renderIdentity.interceptionContext,
+          layoutIds: noExportLayoutIds,
+          rootLayoutTreePath: noExportRootLayout,
+          routeId: renderIdentity.routeId,
+          sourcePage: createAppPageSourcePage(sourcePageSegments),
+        }),
+        [renderIdentity.routeId]: createElement("div", null, "Page has no default export"),
+      };
+    });
   }
 
   const activeParallelRouteHeadInputs = resolveActiveParallelRouteHeadInputs({
@@ -338,6 +414,12 @@ export async function buildPageElements<
         ...(opts?.interceptNotFound
           ? {
               notFoundModule: opts.interceptNotFound,
+              notFoundModuleRouteSegments: (
+                opts.interceptNotFoundBranchSegments ??
+                opts.interceptSourcePageSegments ??
+                route.routeSegments ??
+                []
+              ).slice(0, opts.interceptNotFoundTreePosition ?? 0),
               notFoundParams: resolveAppPageBranchParams(
                 opts.interceptNotFoundBranchSegments ??
                   opts.interceptBranchSegments ??
@@ -358,7 +440,7 @@ export async function buildPageElements<
   const metadataSearchParamsObserver = observeMetadataSearchParamsAccess
     ? createAppPageSearchParamsObserver()
     : undefined;
-  const preparedHead = prepareAppPageHead({
+  const headOptions = {
     applyFileBasedMetadata: options.applyFileBasedMetadata,
     basePath: options.basePath ?? "",
     layoutModules: route.layouts,
@@ -371,31 +453,17 @@ export async function buildPageElements<
     routeSegments: route.routeSegments ?? null,
     searchParams,
     searchParamsObserver: metadataSearchParamsObserver,
-  });
-  const { hasDynamicMetadata, pageSearchParams } = preparedHead;
+  };
+  const hasDynamicMetadata = hasAppPageDynamicMetadata(headOptions);
+  const { pageSearchParams } = collectAppPageSearchParams(searchParams);
   const streamGeneratedHead =
     serveStreamingMetadata ??
     shouldServeStreamingMetadata(
       pageRequest.request.headers.get("user-agent") ?? "",
       options.htmlLimitedBots,
     );
-  const metadataPlacement = hasDynamicMetadata && streamGeneratedHead ? "body" : "head";
-  // Streaming HTML and Flight responses share the unresolved promise between
-  // the Suspense tag branch and its in-boundary error outlet. Late navigation
-  // signals remain encoded in the Flight digest; response headers are only an
-  // early optimization and must not make generated metadata block navigation.
-  const shouldDeferMetadata = metadataPlacement === "body";
-  const streamingMetadata = shouldDeferMetadata
-    ? isProduction
-      ? preparedHead.metadata.catch((error) => {
-          throw sanitizeErrorForClient(error, "production");
-        })
-      : preparedHead.metadata
-    : null;
-  // Viewport resolution can keep us below from wiring the paired outlet for
-  // another event-loop turn. Observe an early metadata rejection immediately;
-  // the original promise remains rejected for the real outlet consumer.
-  void streamingMetadata?.catch(() => null);
+  const metadataPlacement =
+    hasDynamicMetadata && streamGeneratedHead && !placeStreamedMetadataInHead ? "body" : "head";
 
   const resolveNotFoundFallbackPlanOptions = () => {
     const routeBoundaryModule = route.notFound;
@@ -426,6 +494,8 @@ export async function buildPageElements<
     return {
       boundaryModule,
       boundaryParams,
+      boundaryRouteSegments: (route.routeSegments ?? []).slice(0, boundaryTreePosition ?? 0),
+      errorConvention: "not-found" as const,
       layoutModules: route.layouts,
       layoutTreePositions: route.layoutTreePositions,
       parallelBranches: activeParallelRouteHeadInputs,
@@ -435,8 +505,6 @@ export async function buildPageElements<
     };
   };
 
-  let viewportErrorOutlet: Promise<never> | null = null;
-  let metadataErrorOutlet: Promise<never> | null = null;
   const resolveMetadataErrorTags = async (error: unknown) => {
     const specialError = resolveAppPageSpecialError(error);
     if (specialError?.kind !== "http-access-fallback") return null;
@@ -452,46 +520,39 @@ export async function buildPageElements<
       routePath: route.pattern,
     }).catch(() => null);
   };
-  const [resolvedMetadata, resolvedViewport] = await Promise.all([
-    shouldDeferMetadata
-      ? Promise.resolve(null)
-      : preparedHead.metadata.catch((error) => {
-          metadataErrorOutlet = Promise.reject(
-            isProduction ? sanitizeErrorForClient(error, "production") : error,
-          );
-          void metadataErrorOutlet.catch(() => null);
-          return resolveMetadataErrorTags(error);
-        }),
-    preparedHead.viewport.catch(async (error) => {
-      const specialError = resolveAppPageSpecialError(error);
-
-      viewportErrorOutlet = Promise.reject(
-        isProduction ? sanitizeErrorForClient(error, "production") : error,
-      );
-      void viewportErrorOutlet.catch(() => null);
-      return specialError?.kind === "http-access-fallback"
-        ? resolveHttpAccessFallbackViewport(resolveNotFoundFallbackPlanOptions()).catch(() => ({}))
-        : {};
-    }),
-  ]);
-  const streamingMetadataTags = shouldDeferMetadata
-    ? preparedHead.metadata.catch(resolveMetadataErrorTags)
-    : null;
-  const streamingMetadataOutletInputs = [
-    streamingMetadata,
-    metadataErrorOutlet,
-    viewportErrorOutlet,
-  ]
-    .filter((promise) => promise !== null)
-    .map((promise) => Promise.resolve(promise));
-  const streamingMetadataOutlet =
-    streamingMetadataOutletInputs.length > 0
-      ? Promise.all(streamingMetadataOutletInputs).then(() => null)
-      : null;
-  void streamingMetadataOutlet?.catch(() => null);
+  const toClientError = (error: unknown) =>
+    isProduction ? sanitizeErrorForClient(error, "production") : error;
+  // generateMetadata() and generateViewport() run when Flight first renders the
+  // head, inside the render rather than before it, as in Next.js. React's
+  // cache() memoises a value per Flight request, so the head, its streamed body
+  // tags and its error outlet share one resolution, and the cache() loaders it
+  // calls share their values with the page. A separate render (a PPR warm-up,
+  // a revalidation) gets its own.
+  const resolveHead = cache((): AppPageRouteHead => {
+    const preparedHead = prepareAppPageHead(headOptions);
+    // Late navigation signals reach the client through the outlet's Flight
+    // digest, inside the route's boundaries.
+    const outlet = Promise.all([preparedHead.metadata, preparedHead.viewport]).then(
+      () => null,
+      (error: unknown) => {
+        throw toClientError(error);
+      },
+    );
+    void outlet.catch(() => null);
+    return {
+      metadata: preparedHead.metadata.catch(resolveMetadataErrorTags),
+      outlet,
+      viewport: preparedHead.viewport.catch((error: unknown) =>
+        resolveAppPageSpecialError(error)?.kind === "http-access-fallback"
+          ? resolveHttpAccessFallbackViewport(resolveNotFoundFallbackPlanOptions()).catch(
+              () => ({}),
+            )
+          : {},
+      ),
+    };
+  });
 
   const pageProps: Record<string, unknown> = { params: makeThenableParams(effectiveParams) };
-  const hasRequestSearchParams = Object.keys(pageSearchParams).length > 0;
   const pageTreePosition = (sourcePageSegments ?? route.routeSegments ?? []).length;
   const hasPageLoadingBoundary =
     resolveAppPageLoadingModuleAtOrAbove(route, pageTreePosition) !== null ||
@@ -504,6 +565,12 @@ export async function buildPageElements<
         },
         pageTreePosition,
       ) !== null);
+  // A client page reads an empty query in SSR and the browser alike when the
+  // server renders every page with one. A static export build renders each
+  // page once without a query, so a client page read must not make it dynamic,
+  // which would drop it from the export.
+  const hasEmptyClientPageSearchParams =
+    isForceStatic || (isProduction && process.env.__NEXT_CONFIG_OUTPUT === "export");
   const pageRenderDependency =
     EffectivePageComponent && !isReactOwnedAppComponent(EffectivePageComponent)
       ? createAppPageRenderDependency()
@@ -513,20 +580,37 @@ export async function buildPageElements<
     props: Readonly<Record<string, unknown>>,
     renderDependency?: AppPageRenderDependency | null,
   ) => {
+    if (searchParams && isAppClientReference(PageComponent)) {
+      // Like Next.js's ClientPageRoot, a client page gets `searchParams` where
+      // it renders, not through Flight. Flight would call `then` on the prop
+      // while serializing it, so every client page would count as reading the
+      // query, and its RSC payload would carry it. Slot props arrive with the
+      // route's searchParams attached, so drop them here.
+      const { searchParams: _slotSearchParams, ...pageProps } = props;
+      return createElement(ClientPageRoot, {
+        Component: PageComponent,
+        pageProps,
+        ...(hasEmptyClientPageSearchParams ? { emptySearchParams: true } : {}),
+      });
+    }
+
     if (isReactOwnedAppComponent(PageComponent)) {
-      const invocationProps = { ...props };
+      // Class components and other non-function exports, which React renders
+      // itself. A read marks the render dynamic only to keep this branch
+      // consistent with function component pages: React 19's Flight server
+      // calls any function that isn't a client reference as a function
+      // component, so an ES class page can't render in RSC at all.
+      const invocationProps: Record<string, unknown> = { ...props };
       if (searchParams) {
         invocationProps.searchParams = observePageSearchParamsAccess
-          ? makeObservedAppPageSearchParamsThenable(pageSearchParams, {
-              markDynamic: hasRequestSearchParams,
-            })
+          ? makeObservedAppPageSearchParamsThenable(pageSearchParams)
           : makeThenableParams(pageSearchParams);
       }
-      return createElement(PageComponent, invocationProps);
+      return createElement(PageComponent, withUseCachePageMarker(PageComponent, invocationProps));
     }
 
     const PageInvoker = () => {
-      const invocationProps = { ...props };
+      const invocationProps: Record<string, unknown> = { ...props };
       if (searchParams) {
         invocationProps.searchParams = observePageSearchParamsAccess
           ? makeObservedAppPageSearchParamsThenable(pageSearchParams)
@@ -534,7 +618,12 @@ export async function buildPageElements<
       }
 
       try {
-        const result = invokeAppComponent(PageComponent, invocationProps);
+        // Like Next.js (create-component-tree.tsx), a "use cache" page
+        // component receives `$$isPage` so its cache omits searchParams.
+        const result = invokeAppComponent(
+          PageComponent,
+          withUseCachePageMarker(PageComponent, invocationProps),
+        );
         if (isPromiseLike(result)) {
           if (renderDependency) {
             // A declared-async page reaches its first continuation before this
@@ -590,14 +679,16 @@ export async function buildPageElements<
   // slot-based path handles this inside buildSlotOverrides/app-page-route-wiring,
   // but sibling intercepts bypass that path entirely. We apply the wrapping here
   // so a layout.tsx adjacent to the (.) / (..) / (...) marker dir is respected.
-  let siblingInterceptElement: ReturnType<typeof createElement> | null =
-    isSiblingIntercept && EffectivePageComponent
-      ? createPageElement(EffectivePageComponent, pageProps, pageRenderDependency)
-      : null;
-  if (isSiblingIntercept && siblingInterceptElement !== null) {
+  const createSiblingInterceptElement = (): ReturnType<typeof createElement> | null => {
+    let element: ReturnType<typeof createElement> | null =
+      isSiblingIntercept && EffectivePageComponent
+        ? createPageElement(EffectivePageComponent, pageProps, pageRenderDependency)
+        : null;
+    if (!isSiblingIntercept || element === null) return element;
+
     const layoutIndexesByTreePosition = new Map<number, number[]>();
     for (const [index, layoutModule] of (opts?.interceptLayouts ?? []).entries()) {
-      if (!layoutModule?.default) continue;
+      if (!layoutModule) continue;
       const treePosition = opts?.interceptLayoutSegments?.[index]?.length ?? 0;
       const indexes = layoutIndexesByTreePosition.get(treePosition) ?? [];
       indexes.push(index);
@@ -619,75 +710,84 @@ export async function buildPageElements<
       const LoadingComponent =
         loadingIndex === undefined ? null : opts?.interceptLoadings?.[loadingIndex]?.default;
       if (LoadingComponent) {
-        siblingInterceptElement = createElement(
-          Suspense,
-          { fallback: createElement(LoadingComponent) },
-          siblingInterceptElement,
-        );
+        element = createElement(Suspense, { fallback: createElement(LoadingComponent) }, element);
       }
 
       const layoutIndexes = layoutIndexesByTreePosition.get(treePosition) ?? [];
       for (let layoutOffset = layoutIndexes.length - 1; layoutOffset >= 0; layoutOffset--) {
         const layoutIndex = layoutIndexes[layoutOffset];
-        const LayoutComponent = opts?.interceptLayouts?.[layoutIndex]?.default;
-        if (!LayoutComponent) continue;
+        const layoutModule = opts?.interceptLayouts?.[layoutIndex];
+        if (!layoutModule) continue;
         const interceptLayoutSegments = opts?.interceptLayoutSegments?.[layoutIndex] ?? [];
+        const LayoutComponent = traceGetLayoutOrPageModule(
+          resolveInterceptLayoutTraceSegment(
+            opts?.interceptBranchSegments,
+            interceptLayoutSegments,
+          ),
+          () => layoutModule.default,
+        );
+        if (!LayoutComponent) continue;
         const interceptLayoutParams = resolveInterceptLayoutParams(
           opts?.interceptBranchSegments ?? interceptLayoutSegments,
           interceptLayoutSegments,
           effectiveParams,
         );
-        siblingInterceptElement = createElement(
+        element = createElement(
           LayoutComponent,
-          { params: makeThenableParams(interceptLayoutParams) },
-          siblingInterceptElement,
+          withUseCacheLayoutMarker(LayoutComponent, {
+            params: makeThenableParams(interceptLayoutParams),
+          }),
+          element,
         );
       }
     }
-  }
+    return element;
+  };
 
-  return buildAppPageElements({
-    element: isSiblingIntercept
-      ? siblingInterceptElement
-      : EffectivePageComponent
-        ? createPageElement(EffectivePageComponent, pageProps, pageRenderDependency)
-        : null,
-    createPageElement,
-    // Fall back to vinext's built-in default global error module so that
-    // uncaught client render errors are caught by the route-level
-    // <ErrorBoundary> wrapper in app-page-route-wiring.tsx, mirroring
-    // Next.js's behavior when the user has not defined app/global-error.tsx.
-    globalErrorModule:
-      globalErrorModule ?? (DEFAULT_GLOBAL_ERROR_MODULE as unknown as TErrorModule),
-    isRscRequest,
-    interceptionId: opts?.interceptionId ?? null,
-    layoutParamAccess: options.layoutParamAccess,
-    mountedSlotIds,
-    makeThenableParams,
-    matchedParams: params,
-    pageRenderDependency,
-    metadataPlacement,
-    resolvedMetadata,
-    resolvedMetadataPathname: routePath,
-    resolvedViewport,
-    scriptNonce: options.scriptNonce,
-    streamingMetadata,
-    streamingMetadataOutlet,
-    streamingMetadataOutletSuspended: streamGeneratedHead,
-    streamingMetadataTags,
-    renderIdentity,
-    routePath,
-    semanticPageIdentity,
-    semanticInterceptionTargetRouteId: opts?.interceptTargetRouteGraphId ?? null,
-    sourcePageSegments,
-    rootNotFoundModule: rootNotFoundModule ?? null,
-    rootForbiddenModule: rootForbiddenModule ?? null,
-    rootUnauthorizedModule: rootUnauthorizedModule ?? null,
-    route,
-    searchParams: pageSearchParamsThenable,
-    slotOverrides,
-    renderMode,
-    trailingSlash: options.trailingSlash,
+  return traceCreateComponentTree(() => {
+    if (effectivePageModule) {
+      traceGetLayoutOrPageModule(APP_PAGE_SEGMENT_KEY, () => effectivePageModule);
+    }
+    const siblingInterceptElement = createSiblingInterceptElement();
+    return buildAppPageElements({
+      element: isSiblingIntercept
+        ? siblingInterceptElement
+        : EffectivePageComponent
+          ? createPageElement(EffectivePageComponent, pageProps, pageRenderDependency)
+          : null,
+      createPageElement,
+      // Fall back to vinext's built-in default global error module so that
+      // uncaught client render errors are caught by the route-level
+      // <ErrorBoundary> wrapper in app-page-route-wiring.tsx, mirroring
+      // Next.js's behavior when the user has not defined app/global-error.tsx.
+      globalErrorModule:
+        globalErrorModule ?? (DEFAULT_GLOBAL_ERROR_MODULE as unknown as TErrorModule),
+      isRscRequest,
+      interceptionId: opts?.interceptionId ?? null,
+      layoutParamAccess: options.layoutParamAccess,
+      mountedSlotIds,
+      makeThenableParams,
+      matchedParams: params,
+      pageRenderDependency,
+      metadataPlacement,
+      resolveHead,
+      resolvedMetadataPathname: routePath,
+      scriptNonce: options.scriptNonce,
+      streamingMetadataOutletSuspended: streamGeneratedHead,
+      renderIdentity,
+      routePath,
+      semanticPageIdentity,
+      semanticInterceptionTargetRouteId: opts?.interceptTargetRouteGraphId ?? null,
+      sourcePageSegments,
+      rootNotFoundModule: rootNotFoundModule ?? null,
+      rootForbiddenModule: rootForbiddenModule ?? null,
+      rootUnauthorizedModule: rootUnauthorizedModule ?? null,
+      route,
+      searchParams: pageSearchParamsThenable,
+      slotOverrides,
+      renderMode,
+      trailingSlash: options.trailingSlash,
+    });
   });
 }
 

@@ -8,6 +8,7 @@ import {
   type SerializedBoundaryError,
 } from "vinext/shims/error-boundary";
 import { LayoutSegmentProvider } from "vinext/shims/layout-segment-context";
+import { withUseCacheLayoutMarker } from "vinext/shims/internal/app-page-props-cache-key";
 import { MetadataHead, ViewportHead } from "vinext/shims/metadata";
 import type { NavigationContext } from "vinext/shims/navigation";
 import { isNavigationSignalError } from "../utils/navigation-signal.js";
@@ -20,6 +21,7 @@ import {
   type AppPageSpecialError,
 } from "./app-page-execution.js";
 import { buildRscRedirectFlightStream } from "./app-rsc-redirect-flight.js";
+import { createArtifactCompatibilityEnvelope } from "./artifact-compatibility.js";
 import { stripRscSuffix } from "./app-rsc-cache-busting.js";
 import type { AppPageMiddlewareContext } from "./app-page-response.js";
 import type { MetadataFileRoute } from "./metadata-routes.js";
@@ -49,6 +51,7 @@ import {
 import {
   createAppPageFontData,
   createAppPageRscErrorTracker,
+  createAppPageSsrErrorHandler,
   renderAppPageHtmlResponse,
   type AppPageSsrHandler,
 } from "./app-page-stream.js";
@@ -59,6 +62,7 @@ import {
   type AppPageRouteWiringRoute,
 } from "./app-page-route-wiring.js";
 import { applyCdnResponseHeaders, NEVER_CACHE_CONTROL } from "./cache-control.js";
+import type { AppRenderErrorContextOverrides } from "./app-rsc-error-handler.js";
 
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any
 type AppPageComponent = ComponentType<any>;
@@ -116,13 +120,22 @@ type AppPageBoundaryRenderCommonOptions<TModule extends AppPageModule = AppPageM
   applyFileBasedMetadata?: ApplyAppPageFileBasedMetadata;
   buildFontLinkHeader: (preloads: readonly AppPageFontPreload[] | null | undefined) => string;
   clearRequestContext: () => void;
-  createRscOnErrorHandler: (pathname: string, routePath: string) => AppPageBoundaryOnError;
+  createRscOnErrorHandler: (
+    pathname: string,
+    routePath: string,
+    overrides?: AppRenderErrorContextOverrides,
+  ) => AppPageBoundaryOnError;
   getAndClearPendingCookies?: () => string[];
   getFontLinks: () => string[];
   getFontPreloads: () => AppPageFontPreload[];
   getFontStyles: () => string[];
   getNavigationContext: () => NavigationContext | null;
   globalErrorModule?: TModule | null;
+  /**
+   * The document may be stored under a query-free key, so its SSR
+   * `useSearchParams()` waits as a cache candidate's does.
+   */
+  isCacheCandidate?: boolean;
   isEdgeRuntime?: boolean;
   isRscRequest: boolean;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
@@ -269,11 +282,14 @@ function wrapRenderedBoundaryElement<TModule extends AppPageModule>(
       });
     },
     renderLayout(LayoutComponent, children, asyncParams) {
-      return createElement(LayoutComponent as AppPageComponent, {
-        // oxlint-disable-next-line react/no-children-prop
-        children,
-        params: asyncParams,
-      });
+      return createElement(
+        LayoutComponent as AppPageComponent,
+        withUseCacheLayoutMarker(LayoutComponent, {
+          // oxlint-disable-next-line react/no-children-prop
+          children,
+          params: asyncParams,
+        }),
+      );
     },
     renderLayoutSegmentProvider(segmentMap, children) {
       return createElement(
@@ -343,13 +359,21 @@ function createAppPageBoundaryRscPayload<TModule extends AppPageModule>(
   const layoutEntries = createAppPageBoundaryLayoutEntries(options.route, options.layoutModules);
   const sourcePageSegments = options.sourcePageSegments ?? options.route?.routeSegments;
 
+  const rootLayoutTreePath = layoutEntries[0]?.treePath ?? null;
+
   return {
     ...AppElementsWire.createMetadataEntries({
       interceptionContext: null,
       layoutIds: layoutEntries.map((entry) => entry.id),
-      rootLayoutTreePath: layoutEntries[0]?.treePath ?? null,
+      rootLayoutTreePath,
       routeId,
       sourcePage: sourcePageSegments ? createAppPageSourcePage(sourcePageSegments) : null,
+    }),
+    // Like Next.js' build ID in every initial RSC payload, so a static export
+    // 404 page can compare later payloads against its own deployment.
+    [AppElementsWire.keys.artifactCompatibility]: createArtifactCompatibilityEnvelope({
+      deploymentVersion: process.env.__VINEXT_BUILD_ID ?? null,
+      rootBoundaryId: rootLayoutTreePath,
     }),
     [routeId]: options.element,
   };
@@ -437,10 +461,16 @@ async function renderAppPageBoundaryElementResponse<TModule extends AppPageModul
           getStyles: options.getFontStyles,
         });
         const ssrHandler = await options.loadSsrHandler();
+        const onSsrError = options.createRscOnErrorHandler(
+          pathname,
+          options.routePattern ?? pathname,
+          { renderSource: "server-rendering" },
+        );
         return renderAppPageHtmlResponse({
           clearRequestContext: options.clearRequestContext,
           fontData,
           fontLinkHeader: options.buildFontLinkHeader(fontData.preloads),
+          isCacheCandidate: options.isCacheCandidate,
           isEdgeRuntime: options.isEdgeRuntime,
           middlewareHeaders: options.middlewareContext.headers,
           navigationContext: options.getNavigationContext() ?? {
@@ -454,6 +484,7 @@ async function renderAppPageBoundaryElementResponse<TModule extends AppPageModul
           ssrHandler,
           status: responseStatus,
           initialDevServerError: options.initialDevServerError,
+          onSsrError: createAppPageSsrErrorHandler(onSsrError, rscErrorTracker.isCapturedError),
         });
       },
       createRscOnErrorHandler() {
@@ -613,6 +644,11 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
             ...(intercept?.interceptNotFound
               ? {
                   notFoundModule: intercept.interceptNotFound,
+                  notFoundModuleRouteSegments: (
+                    intercept.interceptNotFoundBranchSegments ??
+                    intercept.interceptSourcePageSegments ??
+                    fallbackRouteSegments
+                  ).slice(0, intercept.interceptNotFoundTreePosition ?? 0),
                   notFoundParams: resolveAppPageBranchParams(
                     intercept.interceptNotFoundBranchSegments ??
                       intercept.interceptBranchSegments ??
@@ -628,7 +664,14 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
       const fallbackHeadOptions = {
         boundaryModule,
         boundaryParams,
+        boundaryRouteSegments: fallbackRouteSegments.slice(0, boundaryTreePosition ?? 0),
         branchNotFoundConventions: options.statusCode === 404,
+        errorConvention:
+          options.statusCode === 403
+            ? ("forbidden" as const)
+            : options.statusCode === 401
+              ? ("unauthorized" as const)
+              : ("not-found" as const),
         layoutModules,
         layoutTreePositions: resolveHttpAccessFallbackHeadLayoutTreePositions(
           options.route,

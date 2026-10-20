@@ -1,5 +1,5 @@
 import { createContext, runInContext } from "node:vm";
-import { describe, it, expect } from "vite-plus/test";
+import { describe, it, expect, vi } from "vite-plus/test";
 import { createElement, Suspense, use } from "react";
 import { renderToReadableStream } from "react-dom/server.edge";
 import {
@@ -8,6 +8,7 @@ import {
   type RscEmbeddedChunk,
 } from "../packages/vinext/src/server/app-rsc-embedded-chunks.js";
 import {
+  createNavigationRuntimeRscCompatibilityScript,
   createNavigationRuntimeRscMetadataScript,
   createRscEmbedTransform,
   createTickBufferedTransform,
@@ -34,6 +35,23 @@ it("serializes browser search-param ownership into the early hydration bootstrap
       true,
     ),
   ).toContain("searchParamsFromBrowser:true");
+});
+
+it("sends the server's RSC compatibility ID with the page, except for static export", () => {
+  vi.stubEnv("__VINEXT_RSC_COMPATIBILITY_ID", "compat-a");
+  try {
+    expect(createNavigationRuntimeRscCompatibilityScript()).toBe(
+      'Object.assign(((self[Symbol.for("vinext.navigationRuntime")]??={bootstrap:{routeManifest:null},functions:{}}).bootstrap.rsc??={rsc:[]}),{compatibilityId:"compat-a"})',
+    );
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("__NEXT_CONFIG_OUTPUT", "export");
+    expect(createNavigationRuntimeRscCompatibilityScript()).toBe("");
+    vi.stubEnv("__NEXT_CONFIG_OUTPUT", "");
+    vi.stubEnv("__VINEXT_RSC_COMPATIBILITY_ID", "");
+    expect(createNavigationRuntimeRscCompatibilityScript()).toBe("");
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });
 
 describe("App SSR stream helpers", () => {
@@ -116,8 +134,17 @@ describe("createRscEmbedTransform raw buffer (#981)", () => {
     const finalScripts = await transform.finalize();
     expect(finalScripts).toContain('Symbol.for("vinext.navigationRuntime")');
     expect(finalScripts).toContain(".done=true");
-    expect(finalScripts).toContain('.rsc.push("chunk1")');
-    expect(finalScripts).toContain('.rsc.push("chunk2")');
+    expect(finalScripts).toContain('.rsc.push("chunk1chunk2")');
+  });
+
+  it("coalesces adjacent text chunks into one inline Flight script", async () => {
+    const transform = createRscEmbedTransform(createTextStream(Array(1_000).fill("chunk")));
+
+    const finalScripts = await transform.finalize();
+
+    expect(finalScripts.match(/\.rsc\.push\(/g)).toHaveLength(1);
+    expect(finalScripts.match(/<script/g)).toHaveLength(2);
+    expect(finalScripts).toContain(`.rsc.push("${"chunk".repeat(1_000)}")`);
   });
 
   it("optionally mirrors text chunks into the Next.js inline Flight transport", async () => {
@@ -132,15 +159,78 @@ describe("createRscEmbedTransform raw buffer (#981)", () => {
       '<script nonce="test-nonce">(self.__next_f=self.__next_f||[]).push([0])</script>',
     );
     expect(finalScripts).toContain(
-      '<script nonce="test-nonce">self.__next_f.push([1,"chunk1"])</script>',
-    );
-    expect(finalScripts).toContain(
-      '<script nonce="test-nonce">self.__next_f.push([1,"chunk2"])</script>',
+      '<script nonce="test-nonce">self.__next_f.push([1,"chunk1chunk2"])</script>',
     );
     expect(finalScripts).toContain(
       '<script nonce="test-nonce">self.addEventListener("DOMContentLoaded",()=>{if(self.__next_f?.push===Array.prototype.push)self.__next_f.length=0},{once:true})</script>',
     );
     expect(finalScripts.match(/self\.__next_f=self\.__next_f\|\|\[\]/g)).toHaveLength(1);
+  });
+
+  it("starts mirroring mid-stream once asked, replaying the chunks already embedded", async () => {
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        controller.enqueue(new TextEncoder().encode("first"));
+      },
+    });
+    let mirror = false;
+    const transform = createRscEmbedTransform(stream, { mirrorNextFlight: () => mirror });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const firstScripts = transform.flush();
+    expect(firstScripts).not.toContain("self.__next_f");
+
+    mirror = true;
+    streamController.enqueue(new TextEncoder().encode("second"));
+    streamController.close();
+    const finalScripts = await transform.finalize();
+
+    expect(finalScripts.match(/self\.__next_f=self\.__next_f\|\|\[\]/g)).toHaveLength(1);
+    expect(finalScripts).toContain('self.addEventListener("DOMContentLoaded"');
+    const firstIndex = finalScripts.indexOf('self.__next_f.push([1,"first"])');
+    const secondIndex = finalScripts.indexOf('self.__next_f.push([1,"second"])');
+    expect(firstIndex).toBeGreaterThan(-1);
+    expect(secondIndex).toBeGreaterThan(firstIndex);
+  });
+
+  it("replays the embedded chunks into a late mirror after the raw buffer was captured", async () => {
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        controller.enqueue(new TextEncoder().encode("first"));
+      },
+    });
+    let mirror = false;
+    const transform = createRscEmbedTransform(stream, { mirrorNextFlight: () => mirror });
+    // Cache capture claims the raw buffer as the SSR entry does, which clears
+    // the raw chunks once the stream completes.
+    const rawBuffer = transform.getRawBuffer();
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(transform.flush()).not.toContain("self.__next_f");
+    streamController.enqueue(new TextEncoder().encode("second"));
+    streamController.close();
+    expect(new TextDecoder().decode(await rawBuffer)).toBe("firstsecond");
+
+    mirror = true;
+    const finalScripts = await transform.finalize();
+
+    const firstIndex = finalScripts.indexOf('self.__next_f.push([1,"first"])');
+    expect(firstIndex).toBeGreaterThan(-1);
+    expect(finalScripts.indexOf('self.__next_f.push([1,"second"])')).toBeGreaterThan(firstIndex);
+  });
+
+  it("does not mirror when its predicate stays false", async () => {
+    const transform = createRscEmbedTransform(createTextStream(["chunk"]), {
+      mirrorNextFlight: () => false,
+    });
+
+    const finalScripts = await transform.finalize();
+
+    expect(finalScripts).not.toContain("self.__next_f");
   });
 
   it("does not mirror Next.js inline Flight chunks by default", async () => {
@@ -321,6 +411,26 @@ describe("createRscEmbedTransform raw buffer (#981)", () => {
     const embeddedBytes = concatUint8Arrays(embeddedChunks);
 
     expect(embeddedBytes).toEqual(expectedBytes);
+  });
+
+  it("preserves binary boundaries while coalescing adjacent text chunks", async () => {
+    const transform = createRscEmbedTransform(
+      createByteStream([
+        new TextEncoder().encode("first"),
+        new Uint8Array([0xff]),
+        new TextEncoder().encode("second"),
+        new TextEncoder().encode("third"),
+      ]),
+    );
+
+    const finalScripts = await transform.finalize();
+    const firstIndex = finalScripts.indexOf('.rsc.push("first")');
+    const binaryIndex = finalScripts.indexOf('.rsc.push([3,"/w=="])');
+    const remainingTextIndex = finalScripts.indexOf('.rsc.push("secondthird")');
+
+    expect(firstIndex).toBeGreaterThanOrEqual(0);
+    expect(binaryIndex).toBeGreaterThan(firstIndex);
+    expect(remainingTextIndex).toBeGreaterThan(binaryIndex);
   });
 
   it("embeds non-UTF-8 RSC chunks as base64 binary chunks", async () => {

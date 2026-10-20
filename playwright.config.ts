@@ -1,4 +1,4 @@
-import { defineConfig } from "@playwright/test";
+import { defineConfig, type Project } from "@playwright/test";
 
 const appRouterBrowserSpecificTests = "**/app-router/**/*.browser.spec.ts";
 const appRouterServer = {
@@ -21,6 +21,25 @@ const appRouterBfcacheServer = {
   timeout: 30_000,
 };
 
+// Port of next-intl's App Router playground, built for Workers and served
+// through Miniflare. Like upstream, each NEXT_PUBLIC_USE_CASE gets its own build
+// and runs only its own spec file. Preview binds IPv4 because the domain specs
+// map their hostnames to 127.0.0.1.
+function cloudflareNextIntlProject(useCase: string, port: number) {
+  return {
+    testDir: "./tests/e2e",
+    testMatch: [`**/cloudflare-next-intl/${useCase}.spec.ts`],
+    use: { baseURL: `http://localhost:${port}` },
+    server: {
+      command: `NEXT_PUBLIC_USE_CASE=${useCase} npx vp build && NEXT_PUBLIC_USE_CASE=${useCase} npx vp preview --host 127.0.0.1 --port ${port}`,
+      cwd: "./tests/fixtures/cf-next-intl",
+      port,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  };
+}
+
 /**
  * Each project maps to a single webServer. Some browser-specific projects share
  * a server with the base project, and shared servers are de-duped by port.
@@ -29,10 +48,16 @@ const appRouterBfcacheServer = {
  * When PLAYWRIGHT_PROJECT is set
  * (e.g. in CI matrix jobs), only that project and its server are configured,
  * so each CI runner only starts the one server it needs.
+ * Specs matched by isolatedTestMatch run in a separate `<name>-isolated`
+ * project after the rest of the project finishes, whether it passed or not.
  */
 const projectServers = {
   "pages-router": {
     testDir: "./tests/e2e/pages-router",
+    // Fast Refresh specs write syntax errors into fixture pages on the shared
+    // dev server. Vite broadcasts those errors and vinext sends full reloads to
+    // every open page, so they must not run alongside other specs.
+    isolatedTestMatch: ["**/pages-router/hmr.spec.ts"],
     use: { baseURL: "http://localhost:4173" },
     server: {
       command: "npx vp run vinext#build && npx vp dev --port 4173",
@@ -48,6 +73,7 @@ const projectServers = {
     testIgnore: [
       appRouterBrowserSpecificTests,
       "**/app-router/nextjs-compat/client-cache.spec.ts",
+      "**/app-router/nextjs-compat/prefetch-redirect.spec.ts",
       "**/app-router/nextjs-compat/route-handler-draft-cache.spec.ts",
       "**/app-router/nextjs-compat/segment-cache-client-params.spec.ts",
       "**/app-router/isr.spec.ts",
@@ -58,9 +84,26 @@ const projectServers = {
   "app-router-isr-prod": {
     testDir: "./tests/e2e",
     testMatch: [
+      "app-router/action-bound-args.spec.ts",
       "app-router/isr.spec.ts",
+      "app-router/metadata-react-cache.spec.ts",
+      "app-router-prod/action-error-sanitization.spec.ts",
+      "app-router-prod/special-error-navigation.spec.ts",
+      "app-router-prod/rsc-compatibility-id.spec.ts",
       "app-router-prod/static-hydration.spec.ts",
       "app-router-prod/use-cache.spec.ts",
+      "app-router-prod/public-file-encoding.spec.ts",
+      "app-router-prod/multipart-late-routing.spec.ts",
+      "app-router-prod/server-action-late-routing.spec.ts",
+      "app-router-prod/image-middleware.spec.ts",
+      "app-router-prod/image-get-image-props.spec.ts",
+      "app-router-prod/pages-res-revalidate.spec.ts",
+      "app-router-prod/client-reference-groups.spec.ts",
+      "app-router-prod/route-manifest-chunk.spec.ts",
+      "app-router-prod/same-origin-absolute-href-prefetch.spec.ts",
+      "app-router-prod/middleware-external-rewrite-host.spec.ts",
+      "app-router/preload-rejection.spec.ts",
+      "app-router/external-rewrite-host-capture.spec.ts",
     ],
     use: { baseURL: "http://localhost:4198" },
     server: {
@@ -76,6 +119,7 @@ const projectServers = {
     testDir: "./tests/e2e/app-router/nextjs-compat",
     testMatch: [
       "client-cache.spec.ts",
+      "prefetch-redirect.spec.ts",
       "route-handler-draft-cache.spec.ts",
       "segment-cache-client-params.spec.ts",
     ],
@@ -166,6 +210,7 @@ const projectServers = {
     testDir: "./tests/e2e",
     testMatch: [
       "**/cloudflare-workers/**/*.spec.ts",
+      "**/cloudflare-response-store.spec.ts",
       "**/app-router/instrumentation.spec.ts",
       "**/og-image.spec.ts",
     ],
@@ -175,7 +220,7 @@ const projectServers = {
       : {
           // Build app-router-cloudflare with Vite, then serve with wrangler dev (miniflare)
           command:
-            "npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4176",
+            "VINEXT_RESPONSE_STORE_E2E=1 npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4176",
           cwd: "./examples/app-router-cloudflare",
           port: 4176,
           reuseExistingServer: !process.env.CI,
@@ -187,10 +232,55 @@ const projectServers = {
     testMatch: ["**/cloudflare-sentry-app/**/*.spec.ts"],
     use: { baseURL: "http://localhost:4193" },
     server: {
+      // Exercise the built Worker through Miniflare without Wrangler's extra
+      // development proxy, which can exit when a browser connection resets.
       command:
-        "NEXT_PUBLIC_VINEXT_TEST_SENTRY_DSN=http://public@localhost:4193/1 npx vp build && npx wrangler dev --port 4193",
+        "NEXT_PUBLIC_VINEXT_TEST_SENTRY_DSN=http://public@localhost:4193/1 npx vp build && npx vp preview --port 4193",
       cwd: "./tests/fixtures/cf-sentry-app",
       port: 4193,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+  },
+  "cloudflare-next-intl": cloudflareNextIntlProject("main", 4223),
+  "cloudflare-next-intl-locale-prefix-never": cloudflareNextIntlProject(
+    "locale-prefix-never",
+    4231,
+  ),
+  "cloudflare-next-intl-trailing-slash": cloudflareNextIntlProject("trailing-slash", 4232),
+  "cloudflare-next-intl-base-path": cloudflareNextIntlProject("base-path", 4233),
+  "cloudflare-next-intl-domains": cloudflareNextIntlProject("domains", 4234),
+  "cloudflare-next-intl-domains-locale-prefix": cloudflareNextIntlProject(
+    "domains-locale-prefix",
+    4235,
+  ),
+  "cloudflare-next-intl-locale-cookie-false": cloudflareNextIntlProject(
+    "locale-cookie-false",
+    4236,
+  ),
+  // Port of next-intl's canonical App Router example (static rendering with
+  // `setRequestLocale`), built for Workers and served through Miniflare.
+  "cloudflare-next-intl-example": {
+    testDir: "./tests/e2e/cloudflare-next-intl-example",
+    use: { baseURL: "http://localhost:4237" },
+    server: {
+      command: "npx vp build && npx vp preview --port 4237",
+      cwd: "./tests/fixtures/cf-next-intl-example",
+      port: 4237,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  },
+  "cloudflare-sentry-app-workers-cache": {
+    testDir: "./tests/e2e",
+    testMatch: ["**/cloudflare-sentry-app/**/*.spec.ts"],
+    grep: /cached RSC payload|response start for an App Page cache hit|trace metadata from static HTML/,
+    use: { baseURL: "http://localhost:4210" },
+    server: {
+      command:
+        "VINEXT_SENTRY_CACHE=workers NEXT_PUBLIC_VINEXT_TEST_SENTRY_DSN=http://public@localhost:4210/1 npx vp build && npx wrangler dev --config .vinext/workers-cache/server/wrangler.json --port 4210",
+      cwd: "./tests/fixtures/cf-sentry-app",
+      port: 4210,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
@@ -208,10 +298,37 @@ const projectServers = {
       timeout: 60_000,
     },
   },
+  "sentry-nextjs-16-static": {
+    testDir: "./tests/e2e/sentry-nextjs-16-static/fixture/tests",
+    use: { baseURL: "http://localhost:3030" },
+    server: {
+      command:
+        "test -e node_modules && npx vp run vinext#build && node ../../../../packages/vinext/dist/cli.js build && node ../../../../packages/vinext/dist/cli.js start --port 3030 --hostname ::",
+      cwd: "./tests/e2e/sentry-nextjs-16-static/fixture",
+      port: 3030,
+      reuseExistingServer: false,
+      timeout: 120_000,
+      env: {
+        NEXT_PUBLIC_E2E_TEST_DSN: "http://public@localhost:3031/1",
+        PORT: "3030",
+        TEST_ENV: "production",
+      },
+    },
+    additionalServers: [
+      {
+        command: "node event-proxy.mjs",
+        cwd: "./tests/e2e/sentry-nextjs-16-static/fixture",
+        port: 3031,
+        reuseExistingServer: false,
+        timeout: 30_000,
+      },
+    ],
+  },
   "cloudflare-dev": {
     testDir: "./tests/e2e",
     testMatch: [
       "**/cloudflare-dev/**/*.spec.ts",
+      "**/cloudflare-response-store.spec.ts",
       "**/app-router/instrumentation.spec.ts",
       "**/og-image.spec.ts",
     ],
@@ -219,7 +336,7 @@ const projectServers = {
     server: {
       // Run vite dev (not wrangler) against the cloudflare example so that
       // configureServer() is exercised with @cloudflare/vite-plugin loaded.
-      command: "npx vp dev --port 4178",
+      command: "VINEXT_RESPONSE_STORE_E2E=1 npx vp dev --port 4178",
       cwd: "./examples/app-router-cloudflare",
       port: 4178,
       reuseExistingServer: !process.env.CI,
@@ -230,11 +347,14 @@ const projectServers = {
     testDir: "./tests/e2e",
     testMatch: [
       "**/cloudflare-pages-router-dev/**/*.spec.ts",
+      "**/cloudflare-pages-router/middleware-data-guard.spec.ts",
       "**/pages-router/instrumentation-startup.spec.ts",
     ],
     use: { baseURL: "http://localhost:4179" },
     server: {
-      command: "npx vp dev --port 4179",
+      // Cover the Worker request stage with raw `_next/data` URLs reaching
+      // middleware; the production project keeps the default config.
+      command: "VINEXT_E2E_SKIP_PROXY_URL_NORMALIZE=1 npx vp dev --force --port 4179",
       cwd: "./examples/pages-router-cloudflare",
       port: 4179,
       reuseExistingServer: !process.env.CI,
@@ -256,6 +376,61 @@ const projectServers = {
       timeout: 60_000,
     },
   },
+  "cloudflare-static-assets": {
+    testDir: "./tests/e2e/cloudflare-static-assets",
+    use: { baseURL: process.env.VINEXT_E2E_BASE_URL ?? "http://localhost:4214" },
+    server: process.env.VINEXT_E2E_BASE_URL
+      ? null
+      : {
+          // Vite's build lifecycle prerenders and packages the Static Assets cache.
+          command:
+            "npx vp run vinext#build && npx vp run @vinext/cloudflare#build && npx vp run build && npx vite preview --port 4214",
+          cwd: "./examples/static-assets-cache",
+          port: 4214,
+          reuseExistingServer: !process.env.CI,
+          timeout: 180_000,
+        },
+  },
+  "cloudflare-static-assets-pages": {
+    testDir: "./tests/e2e/cloudflare-static-assets-pages",
+    use: { baseURL: process.env.VINEXT_E2E_BASE_URL ?? "http://localhost:4218" },
+    // Deployed runs set VINEXT_E2E_I18N_BASE_URL for the companion example.
+    server: process.env.VINEXT_E2E_BASE_URL
+      ? null
+      : {
+          // Local builds enable the preview/revalidation test controls.
+          command:
+            "npx vp run vinext#build && npx vp run @vinext/cloudflare#build && VINEXT_E2E_CONTROLS=1 npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4218",
+          cwd: "./examples/static-assets-pages",
+          port: 4218,
+          reuseExistingServer: !process.env.CI,
+          timeout: 180_000,
+        },
+    additionalServers: process.env.VINEXT_E2E_BASE_URL
+      ? []
+      : [
+          {
+            command:
+              "npx vp run vinext#build && npx vp run @vinext/cloudflare#build && npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4219",
+            cwd: "./examples/static-assets-pages-i18n",
+            port: 4219,
+            reuseExistingServer: !process.env.CI,
+            timeout: 180_000,
+          },
+        ],
+  },
+  "cloudflare-static-export": {
+    testDir: "./tests/e2e/cloudflare-static-export",
+    use: { baseURL: "http://localhost:4215" },
+    server: {
+      command:
+        "(test -e node_modules || test -L node_modules || ln -s ../../../../examples/app-router-cloudflare/node_modules node_modules) && npx vp run vinext#build && npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4215",
+      cwd: "./tests/e2e/cloudflare-static-export/fixture",
+      port: 4215,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  },
   "static-export-basepath": {
     testDir: "./tests/e2e/static-export-basepath",
     use: { baseURL: "http://localhost:4203/docs" },
@@ -266,6 +441,57 @@ const projectServers = {
       port: 4203,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
+    },
+  },
+  "app-router-nitro": {
+    testDir: "./tests/e2e/app-router-nitro",
+    testMatch: ["preview.spec.ts"],
+    use: { baseURL: "http://localhost:4216" },
+    server: {
+      // `vite preview` serves Nitro's own build output. vinext must turn off
+      // @vitejs/plugin-rsc's preview handler, which would otherwise import an
+      // RSC build from dist/server that Nitro never writes.
+      command: "npx vp run vinext#build && npx vp build && npx vp preview --port 4216 --strictPort",
+      cwd: "./examples/app-router-nitro",
+      port: 4216,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  },
+  "app-router-nitro-dev": {
+    testDir: "./tests/e2e/app-router-nitro",
+    testMatch: ["dev.spec.ts"],
+    use: { baseURL: "http://localhost:4217" },
+    server: {
+      command: "npx vp dev --port 4217 --strictPort",
+      cwd: "./examples/app-router-nitro",
+      port: 4217,
+      reuseExistingServer: !process.env.CI,
+      timeout: 30_000,
+    },
+  },
+  "pages-router-nitro": {
+    testDir: "./tests/e2e/pages-router-nitro",
+    use: { baseURL: "http://localhost:4225" },
+    server: {
+      // Runs Nitro's own Node server, as a node-server deployment does.
+      command: "npx vp run vinext#build && npx vp build && PORT=4225 node .output/server/index.mjs",
+      cwd: "./tests/fixtures/pages-router-nitro",
+      port: 4225,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  },
+  "app-router-nitro-server": {
+    testDir: "./tests/e2e/app-router-nitro-server",
+    use: { baseURL: "http://localhost:4226" },
+    server: {
+      // Runs Nitro's own Node server, as a node-server deployment does.
+      command: "npx vp run vinext#build && npx vp build && PORT=4226 node .output/server/index.mjs",
+      cwd: "./tests/fixtures/app-router-nitro-server",
+      port: 4226,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
     },
   },
   "app-with-src": {
@@ -442,11 +668,24 @@ const projectServers = {
     testDir: "./tests/e2e/cloudflare-encoded-paths",
     use: { baseURL: "http://localhost:4197" },
     server: {
-      command: "npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4197",
+      command:
+        "CF_APP_BASIC_RUN_WORKER_FIRST=1 npx vp build && npx wrangler dev --config dist/server/wrangler.json --port 4197",
       cwd: "./tests/fixtures/cf-app-basic",
       port: 4197,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
+    },
+  },
+  "cloudflare-dev-run-worker-first": {
+    testDir: "./tests/e2e/cloudflare-dev-run-worker-first",
+    use: { baseURL: "http://localhost:4204" },
+    server: {
+      // Dev with the runWorkerFirst pattern that `vinext init` generates
+      command: "CF_APP_BASIC_RUN_WORKER_FIRST=1 npx vp dev --port 4204",
+      cwd: "./tests/fixtures/cf-app-basic",
+      port: 4204,
+      reuseExistingServer: !process.env.CI,
+      timeout: 30_000,
     },
   },
   "web-worker-vinext": {
@@ -472,6 +711,49 @@ const projectServers = {
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
+  },
+  "module-federation": {
+    testDir: "./tests/e2e/module-federation",
+    use: { baseURL: "http://localhost:4220" },
+    server: {
+      command: "npx vp run vinext#build && npx vp build && npx vp preview --port 4220 --strictPort",
+      cwd: "./tests/fixtures/module-federation-host",
+      port: 4220,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    // Playwright starts web servers in order, so vinext is built before the
+    // remote imports vinext/client.
+    additionalServers: [
+      {
+        command: "npx vp build && npx vp preview --port 4221 --strictPort",
+        cwd: "./tests/fixtures/module-federation-remote",
+        port: 4221,
+        reuseExistingServer: !process.env.CI,
+        timeout: 60_000,
+      },
+    ],
+  },
+  "module-federation-cloudflare": {
+    testDir: "./tests/e2e/module-federation",
+    use: { baseURL: "http://localhost:4222" },
+    server: {
+      command:
+        "npx vp run vinext#build && npx vp build --config vite.cloudflare.config.ts && npx wrangler dev --config dist/server/wrangler.json --port 4222",
+      cwd: "./tests/fixtures/module-federation-host",
+      port: 4222,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    additionalServers: [
+      {
+        command: "npx vp build && npx vp preview --port 4221 --strictPort",
+        cwd: "./tests/fixtures/module-federation-remote",
+        port: 4221,
+        reuseExistingServer: !process.env.CI,
+        timeout: 60_000,
+      },
+    ],
   },
   "nextjs-worker-cloudflare": {
     testDir: "./tests/e2e/nextjs-worker",
@@ -502,6 +784,10 @@ const activeProjects: ProjectName[] = selected
   ? [selected as ProjectName]
   : (Object.keys(projectServers) as ProjectName[]);
 
+if (activeProjects.includes("sentry-nextjs-16-static")) {
+  process.env.TEST_ENV = "production";
+}
+
 export default defineConfig({
   testDir: "./tests/e2e",
   timeout: 30_000,
@@ -513,20 +799,42 @@ export default defineConfig({
     // Most projects use Chromium by default. Browser-specific projects override this.
     browserName: "chromium",
   },
-  projects: activeProjects.map((name) => {
+  projects: activeProjects.flatMap((name): Project[] => {
     const p = projectServers[name];
-    return {
+    const isolatedTestMatch = "isolatedTestMatch" in p ? p.isolatedTestMatch : [];
+    const testIgnore = [...("testIgnore" in p ? p.testIgnore : []), ...isolatedTestMatch];
+    const project = {
       name,
       testDir: p.testDir,
       ...("testMatch" in p ? { testMatch: p.testMatch } : {}),
-      ...("testIgnore" in p ? { testIgnore: p.testIgnore } : {}),
+      ...(testIgnore.length > 0 ? { testIgnore } : {}),
+      ...("grep" in p ? { grep: p.grep } : {}),
       ...("use" in p ? { use: p.use } : {}),
     };
+    if (isolatedTestMatch.length === 0) return [project];
+    // A teardown project runs once its setup project and all of that project's
+    // dependents finish, even when they fail, unlike a dependent project.
+    const isolatedName = `${name}-isolated`;
+    return [
+      { ...project, teardown: isolatedName },
+      {
+        name: isolatedName,
+        testDir: p.testDir,
+        testMatch: isolatedTestMatch,
+        ...("use" in p ? { use: p.use } : {}),
+      },
+    ];
   }),
   webServer: [
     ...new Map(
       activeProjects
-        .map((name) => projectServers[name].server)
+        .flatMap((name) => {
+          const project = projectServers[name];
+          return [
+            project.server,
+            ...("additionalServers" in project ? project.additionalServers : []),
+          ];
+        })
         .filter(
           (server): server is NonNullable<(typeof projectServers)[ProjectName]["server"]> =>
             server != null,

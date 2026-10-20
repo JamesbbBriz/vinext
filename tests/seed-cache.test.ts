@@ -18,7 +18,7 @@ import {
   type CacheHandlerValue,
   type IncrementalCacheValue,
 } from "../packages/vinext/src/shims/cache.js";
-import { appIsrCacheKey, isrCacheKey } from "../packages/vinext/src/server/isr-cache.js";
+import { appIsrCacheKey, appIsrFallbackShellKey } from "../packages/vinext/src/server/isr-cache.js";
 import { getRenderedConcreteUrlPathsForRoute } from "../packages/vinext/src/server/pregenerated-concrete-paths.js";
 import { seedMemoryCacheFromPrerender } from "../packages/vinext/src/server/seed-cache.js";
 
@@ -90,7 +90,7 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const htmlKey = isrCacheKey("app", "/about", buildId) + ":html";
+    const htmlKey = appIsrCacheKey("/about", "html", buildId);
     const htmlEntry = await getCacheHandler().get(htmlKey);
     expect(htmlEntry).not.toBeNull();
     const htmlValue = htmlEntry?.value;
@@ -100,7 +100,7 @@ describe("seedMemoryCacheFromPrerender", () => {
       expect(htmlValue.html).toBe("<html><body>About page</body></html>");
     }
 
-    const rscKey = isrCacheKey("app", "/about", buildId) + ":rsc";
+    const rscKey = appIsrCacheKey("/about", "rsc", buildId);
     const rscEntry = await getCacheHandler().get(rscKey);
     expect(rscEntry).not.toBeNull();
     const rscValue = rscEntry?.value;
@@ -280,12 +280,48 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const htmlKey = isrCacheKey("app", "/preloads", buildId) + ":html";
+    const htmlKey = appIsrCacheKey("/preloads", "html", buildId);
     const htmlEntry = await getCacheHandler().get(htmlKey);
     expect(htmlEntry?.value).toMatchObject({
       kind: "APP_PAGE",
       headers: { link: "</font.woff2>; rel=preload; as=font" },
     });
+  });
+
+  // As in Next.js, a page's special error that escaped the shell is seeded
+  // with its status, and a redirect with its location, on both entries.
+  it.each([
+    { status: 404, headers: undefined },
+    { status: 307, headers: { location: "/target" } },
+  ])("seeds a prerendered $status special error on both entries", async ({ status, headers }) => {
+    const buildId = `test-build-special-error-${status}`;
+    setupPrerenderFixture(
+      serverDir,
+      {
+        buildId,
+        routes: [
+          {
+            route: "/special-error",
+            status: "rendered",
+            revalidate: 60,
+            router: "app",
+            responseStatus: status,
+            ...(headers ? { headers } : {}),
+          },
+        ],
+      },
+      {
+        "special-error.html": headers ? "" : "<html><body>not found</body></html>",
+        "special-error.rsc": "RSC payload with digest",
+      },
+    );
+
+    await seedMemoryCacheFromPrerender(serverDir);
+
+    for (const kind of ["html", "rsc"] as const) {
+      const entry = await getCacheHandler().get(appIsrCacheKey("/special-error", kind, buildId));
+      expect(entry?.value).toMatchObject({ kind: "APP_PAGE", status, headers });
+    }
   });
 
   it("seeds the index route correctly", async () => {
@@ -304,7 +340,7 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const htmlKey = isrCacheKey("app", "/", buildId) + ":html";
+    const htmlKey = appIsrCacheKey("/", "html", buildId);
     const htmlEntry = await getCacheHandler().get(htmlKey);
     expect(htmlEntry).not.toBeNull();
     expect(htmlEntry?.value?.kind).toBe("APP_PAGE");
@@ -334,7 +370,7 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const htmlKey = isrCacheKey("app", "/blog/hello-world", buildId) + ":html";
+    const htmlKey = appIsrCacheKey("/blog/hello-world", "html", buildId);
     const htmlEntry = await getCacheHandler().get(htmlKey);
     expect(htmlEntry).not.toBeNull();
     expect(htmlEntry?.value?.kind).toBe("APP_PAGE");
@@ -365,7 +401,7 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const htmlKey = isrCacheKey("app", "/sticks & stones", buildId) + ":html";
+    const htmlKey = appIsrCacheKey("/sticks & stones", "html", buildId);
     const htmlEntry = await getCacheHandler().get(htmlKey);
     expect(htmlEntry).not.toBeNull();
     if (htmlEntry?.value?.kind === "APP_PAGE") {
@@ -374,7 +410,7 @@ describe("seedMemoryCacheFromPrerender", () => {
       );
     }
 
-    const staleEncodedKey = isrCacheKey("app", "/sticks%20%26%20stones", buildId) + ":html";
+    const staleEncodedKey = appIsrCacheKey("/sticks%20%26%20stones", "html", buildId);
     expect(await getCacheHandler().get(staleEncodedKey)).toBeNull();
   });
 
@@ -481,7 +517,6 @@ describe("seedMemoryCacheFromPrerender", () => {
       },
     });
 
-    const baseKey = isrCacheKey("app", "/isr", "seed-injected-writer-test");
     // Path-derived implicit tags so revalidatePath('/isr') can invalidate
     // these entries — see #1486.
     const expectedTags = [
@@ -493,12 +528,12 @@ describe("seedMemoryCacheFromPrerender", () => {
     ];
     expect(writes).toEqual([
       {
-        key: baseKey + ":html",
+        key: appIsrCacheKey("/isr", "html", "seed-injected-writer-test"),
         metadata: { expireSeconds: 300, revalidateSeconds: 60, tags: expectedTags },
         valueKind: "APP_PAGE",
       },
       {
-        key: baseKey + ":rsc",
+        key: appIsrCacheKey("/isr", "rsc", "seed-injected-writer-test"),
         metadata: { expireSeconds: 300, revalidateSeconds: 60, tags: expectedTags },
         valueKind: "APP_PAGE",
       },
@@ -539,10 +574,9 @@ describe("seedMemoryCacheFromPrerender", () => {
       },
     });
 
-    const baseKey = isrCacheKey("app", "/isr", "seed-stale-test");
     expect(writes).toEqual([
-      { key: baseKey + ":html", staleSeconds: 30 },
-      { key: baseKey + ":rsc", staleSeconds: 30 },
+      { key: appIsrCacheKey("/isr", "html", "seed-stale-test"), staleSeconds: 30 },
+      { key: appIsrCacheKey("/isr", "rsc", "seed-stale-test"), staleSeconds: 30 },
     ]);
   });
 
@@ -594,9 +628,8 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const baseKey = isrCacheKey("app", "/posts", buildId);
-    const htmlKey = baseKey + ":html";
-    const rscKey = baseKey + ":rsc";
+    const htmlKey = appIsrCacheKey("/posts", "html", buildId);
+    const rscKey = appIsrCacheKey("/posts", "rsc", buildId);
 
     // Sanity: both seeded entries are present before revalidation.
     expect(await getCacheHandler().get(htmlKey)).not.toBeNull();
@@ -633,9 +666,8 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const baseKey = isrCacheKey("app", "/update-tag-test", buildId);
-    const htmlKey = baseKey + ":html";
-    const rscKey = baseKey + ":rsc";
+    const htmlKey = appIsrCacheKey("/update-tag-test", "html", buildId);
+    const rscKey = appIsrCacheKey("/update-tag-test", "rsc", buildId);
     expect(await getCacheHandler().get(htmlKey)).not.toBeNull();
     expect(await getCacheHandler().get(rscKey)).not.toBeNull();
 
@@ -663,7 +695,7 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const htmlKey = isrCacheKey("app", "/static", buildId) + ":html";
+    const htmlKey = appIsrCacheKey("/static", "html", buildId);
     const htmlEntry = await getCacheHandler().get(htmlKey);
     expect(htmlEntry).not.toBeNull();
     expect(htmlEntry?.cacheState).toBeUndefined();
@@ -690,10 +722,10 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const skippedKey = isrCacheKey("app", "/ssr-page", buildId) + ":html";
+    const skippedKey = appIsrCacheKey("/ssr-page", "html", buildId);
     expect(await getCacheHandler().get(skippedKey)).toBeNull();
 
-    const aboutKey = isrCacheKey("app", "/about", buildId) + ":html";
+    const aboutKey = appIsrCacheKey("/about", "html", buildId);
     expect(await getCacheHandler().get(aboutKey)).not.toBeNull();
   });
 
@@ -746,7 +778,7 @@ describe("seedMemoryCacheFromPrerender", () => {
     expect(count).toBe(3);
 
     for (const pathname of ["/", "/about", "/blog/post-1"]) {
-      const htmlKey = isrCacheKey("app", pathname, buildId) + ":html";
+      const htmlKey = appIsrCacheKey(pathname, "html", buildId);
       expect(
         await getCacheHandler().get(htmlKey),
         `expected cache entry for ${pathname}`,
@@ -809,7 +841,7 @@ describe("seedMemoryCacheFromPrerender", () => {
 
     await seedMemoryCacheFromPrerender(serverDir);
 
-    const htmlKey = isrCacheKey("app", "/about", buildId) + ":html";
+    const htmlKey = appIsrCacheKey("/about", "html", buildId);
     const htmlEntry = await getCacheHandler().get(htmlKey);
     expect(htmlEntry).not.toBeNull();
     if (htmlEntry?.value?.kind === "APP_PAGE") {
@@ -835,10 +867,10 @@ describe("seedMemoryCacheFromPrerender", () => {
     const count = await seedMemoryCacheFromPrerender(serverDir);
     expect(count).toBe(1);
 
-    const htmlKey = isrCacheKey("app", "/html-only", buildId) + ":html";
+    const htmlKey = appIsrCacheKey("/html-only", "html", buildId);
     expect(await getCacheHandler().get(htmlKey)).not.toBeNull();
 
-    const rscKey = isrCacheKey("app", "/html-only", buildId) + ":rsc";
+    const rscKey = appIsrCacheKey("/html-only", "rsc", buildId);
     expect(await getCacheHandler().get(rscKey)).toBeNull();
   });
 
@@ -871,8 +903,8 @@ describe("seedMemoryCacheFromPrerender", () => {
     const count = await seedMemoryCacheFromPrerender(serverDir);
     expect(count).toBe(1);
 
-    // Verify the hashed key matches what isrCacheKey produces
-    const htmlKey = isrCacheKey("app", longPath, buildId) + ":html";
+    // Verify the hashed key matches what appIsrCacheKey produces.
+    const htmlKey = appIsrCacheKey(longPath, "html", buildId);
     expect(htmlKey).toContain("__hash:");
     expect(await getCacheHandler().get(htmlKey)).not.toBeNull();
   });
@@ -967,6 +999,68 @@ describe("seedMemoryCacheFromPrerender", () => {
     expect(paths!.has("/en/blog/known-post")).toBe(true);
     expect(paths!.has("/en/blog/[slug]")).toBe(false);
     expect(paths!.size).toBe(1);
+  });
+
+  it("seeds fallback shells apart from the page of their literal path", async () => {
+    const buildId = "fallback-shell-key-test";
+    setupPrerenderFixture(
+      serverDir,
+      {
+        buildId,
+        routes: [
+          {
+            route: "/en/blog/:slug",
+            status: "rendered",
+            router: "app",
+            path: "/en/blog/[slug]",
+            revalidate: 60,
+            fallback: true,
+          },
+        ],
+      },
+      {
+        "en/blog/[slug].html": "<html>shell</html>",
+        "en/blog/[slug].rsc": "shell-flight-data",
+      },
+    );
+    await seedMemoryCacheFromPrerender(serverDir);
+
+    // The shell is seeded apart from the page a literal `/en/blog/%5Bslug%5D`
+    // request renders, which decodes to the same pathname.
+    const shellEntry = await getCacheHandler().get(
+      appIsrFallbackShellKey("/en/blog/[slug]", "html", buildId),
+    );
+    expect(shellEntry?.value).toMatchObject({ kind: "APP_PAGE", html: "<html>shell</html>" });
+    const shellRscEntry = await getCacheHandler().get(
+      appIsrFallbackShellKey("/en/blog/[slug]", "rsc", buildId),
+    );
+    expect(shellRscEntry?.value).toMatchObject({ kind: "APP_PAGE" });
+    await expect(
+      getCacheHandler().get(appIsrCacheKey("/en/blog/[slug]", "html", buildId)),
+    ).resolves.toBeNull();
+    await expect(
+      getCacheHandler().get(appIsrCacheKey("/en/blog/[slug]", "rsc", buildId)),
+    ).resolves.toBeNull();
+  });
+
+  it("retains empty static-param route markers without seeding an artifact", async () => {
+    setupPrerenderFixture(
+      serverDir,
+      {
+        buildId: "empty-static-params",
+        routes: [
+          {
+            route: "/blog/:slug",
+            status: "skipped",
+            reason: "empty-static-params",
+          },
+        ],
+      },
+      {},
+    );
+
+    await expect(seedMemoryCacheFromPrerender(serverDir)).resolves.toBe(0);
+    expect(getRenderedConcreteUrlPathsForRoute("/blog/:slug")).toEqual(new Set());
   });
 
   it("clears pregenerated concrete paths when manifest is absent from a subsequent build", async () => {

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import { createAppPrerenderStaticParamsResolver } from "../packages/vinext/src/server/app-prerender-static-params.js";
+import { runWithExecutionContext } from "../packages/vinext/src/shims/request-context.js";
 
 describe("createAppPrerenderStaticParamsResolver", () => {
   it("returns null when there are no sources at all", () => {
@@ -31,6 +32,33 @@ describe("createAppPrerenderStaticParamsResolver", () => {
     // Memoized: a second call does not re-import.
     await resolver!({ params: {} });
     expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the request that starts lazy source resolution alive until it settles", async () => {
+    // The resolution is memoized for the isolate, and workerd drops a canceled
+    // request's pending I/O, so a timed-out discovery request must not strand it.
+    let release: () => void = () => {};
+    const loaded = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const resolver = createAppPrerenderStaticParamsResolver([
+      {
+        load: async () => {
+          await loaded;
+          return { generateStaticParams: () => [{ slug: "x" }] };
+        },
+      },
+    ]);
+    const creator = { waitUntil: vi.fn() };
+    const joiner = { waitUntil: vi.fn() };
+
+    const first = runWithExecutionContext(creator, () => resolver!({ params: {} }));
+    const second = runWithExecutionContext(joiner, () => resolver!({ params: {} }));
+
+    expect(creator.waitUntil).toHaveBeenCalledOnce();
+    expect(joiner.waitUntil).not.toHaveBeenCalled();
+    release();
+    await expect(Promise.all([first, second])).resolves.toEqual([[{ slug: "x" }], [{ slug: "x" }]]);
   });
 
   it("returns the null sentinel when a lazy page has no generateStaticParams", async () => {
@@ -69,27 +97,22 @@ describe("createAppPrerenderStaticParamsResolver", () => {
     ]);
   });
 
-  it("surfaces malformed results during CDN warm path discovery", async () => {
-    const previous = process.env.__VINEXT_PRERENDER_PATH_DISCOVERY;
-    process.env.__VINEXT_PRERENDER_PATH_DISCOVERY = "1";
-    try {
-      const nonArray = createAppPrerenderStaticParamsResolver([() => null]);
-      await expect(nonArray!({ params: {} })).rejects.toThrow(
-        "generateStaticParams must return an array",
-      );
+  // Next.js rejects malformed output in every mode, not only during CDN warm
+  // path discovery (build/static-paths/app.ts callGenerateStaticParams).
+  it("surfaces malformed results", async () => {
+    const nonArray = createAppPrerenderStaticParamsResolver([() => null]);
+    await expect(nonArray!({ params: {} })).rejects.toThrow(
+      "generateStaticParams must return an array",
+    );
 
-      const nonObjectEntry = createAppPrerenderStaticParamsResolver([() => ["slug"]]);
-      await expect(nonObjectEntry!({ params: {} })).rejects.toThrow(
-        "generateStaticParams must return an array of objects",
-      );
+    const nonObjectEntry = createAppPrerenderStaticParamsResolver([() => ["slug"]]);
+    await expect(nonObjectEntry!({ params: {} })).rejects.toThrow(
+      "generateStaticParams must return an array of objects",
+    );
 
-      const nonPlainEntry = createAppPrerenderStaticParamsResolver([() => [new Date(0)]]);
-      await expect(nonPlainEntry!({ params: {} })).rejects.toThrow(
-        "generateStaticParams must return an array of objects",
-      );
-    } finally {
-      if (previous === undefined) delete process.env.__VINEXT_PRERENDER_PATH_DISCOVERY;
-      else process.env.__VINEXT_PRERENDER_PATH_DISCOVERY = previous;
-    }
+    const nonPlainEntry = createAppPrerenderStaticParamsResolver([() => [new Date(0)]]);
+    await expect(nonPlainEntry!({ params: {} })).rejects.toThrow(
+      "generateStaticParams must return an array of objects",
+    );
   });
 });

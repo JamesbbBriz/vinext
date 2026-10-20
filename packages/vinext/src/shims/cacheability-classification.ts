@@ -8,8 +8,17 @@ export type RouteCacheabilityOutcome = {
   classificationFailure?: boolean;
   dynamicUsage?: boolean;
   reason?: string;
+  /** App pages: the render proved it left searchParams unread, so its response holds for every query. */
+  searchParamsUnread?: true;
   /** A transient classification failure that may succeed on another bounded attempt. */
   retryable?: true;
+  /**
+   * App page RSC: the status and headers that replace the streamed 200 of a
+   * render whose special error rejected its document's shell, once the
+   * response is complete.
+   */
+  status?: number;
+  headers?: Readonly<Record<string, string>>;
   tags?: readonly string[];
 };
 
@@ -28,9 +37,13 @@ export type RouteCacheabilityState = {
   completion?: Promise<RouteCacheabilityOutcome>;
   /** Canonical framework tags most recently handed to the active CDN adapter. */
   cdnCacheTags?: readonly string[];
+  /** Private marker surrounding this render's injected client trace metadata. */
+  clientTraceMetadataMarker?: string;
   completedResponseBody?: boolean;
   /** Whether admission must translate a completed response through the active adapter. */
   applyCompletedResponsePolicy?: boolean;
+  /** Core- or adapter-owned cache policy headers set by next.config, by lowercased name. */
+  configCdnCachePolicy?: Map<string, string>;
   explicitConfigCachePolicy?: boolean;
   explicitResponseCachePolicy?: boolean;
   finalResponseVetoReason?: string;
@@ -41,6 +54,8 @@ export type RouteCacheabilityState = {
   mode: "admit" | "identity" | "probe";
   outcome?: RouteCacheabilityOutcome;
   preserveResponseCachePolicy?: boolean;
+  /** Whether an API request carried credentials that must not enter shared caching. */
+  credentialedRequest?: boolean;
   /** Cache-key behavior declared by the active CDN adapter. */
   responseVary?: "verbatim";
   /** Concrete pathname resolved by the trusted request stage before rendering. */
@@ -61,6 +76,13 @@ export function recordRouteCacheabilityCdnTags(tags: readonly string[] | undefin
   const state = readRouteCacheabilityState();
   if (state?.mode !== "admit") return;
   state.cdnCacheTags = [...tags];
+}
+
+/** Retain the exact trace metadata marker for completed shared-response admission. */
+export function recordRouteCacheabilityClientTraceMetadataMarker(marker: string): void {
+  const state = readRouteCacheabilityState();
+  if (state?.mode !== "admit") return;
+  state.clientTraceMetadataMarker = marker;
 }
 
 /** Preserve the existing policy when hybrid routing hands the request to Pages Router. */
@@ -139,10 +161,29 @@ export function markRouteCacheabilityExplicitConfigPolicy(): void {
   state.explicitConfigCachePolicy = true;
 }
 
-/** Record a public cache policy supplied by the Route Handler itself. */
+/** Record a cache policy header, not just Vary, that a next.config rule set. */
+export function markRouteCacheabilityConfigCdnCachePolicy(name: string, value: string): void {
+  const state = readRouteCacheabilityState();
+  if (!state) return;
+  recordConfigCdnCachePolicyHeader(state, name, value);
+}
+
+/** Record a next.config cache policy header with the value a response carries. */
+export function recordConfigCdnCachePolicyHeader(
+  state: RouteCacheabilityState,
+  name: string,
+  value: string,
+): void {
+  state.explicitConfigCachePolicy = true;
+  // Headers.set trims HTTP whitespace, so compare against what it applies.
+  const applied = new Headers([[name, value]]).get(name) ?? value;
+  (state.configCdnCachePolicy ??= new Map()).set(name.toLowerCase(), applied);
+}
+
+/** Record an explicit cache policy supplied by the Route Handler itself. */
 export function markRouteCacheabilityExplicitResponsePolicy(): void {
   const state = readRouteCacheabilityState();
-  if (!state || state.mode !== "admit") return;
+  if (!state) return;
   state.explicitResponseCachePolicy = true;
 }
 

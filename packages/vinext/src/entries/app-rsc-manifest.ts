@@ -1,5 +1,7 @@
 import { toSlash } from "pathslash";
 import {
+  appRouteHasMainTreeLoadingBoundary,
+  appRouteLayoutStaticParamsGroups,
   computeAppRouteStaticSiblings,
   convertSegmentsToRouteParts,
   type AppRoute,
@@ -9,6 +11,7 @@ import type { MetadataFileRoute } from "../server/metadata-routes.js";
 
 type AppRscManifestCode = {
   imports: string[];
+  importInitializers: string[];
   routeEntries: string[];
   metaRouteEntries: string[];
   generateStaticParamsEntries: string[];
@@ -42,6 +45,7 @@ type AppRscManifestCode = {
 };
 
 type BuildAppRscManifestCodeOptions = {
+  deferEagerImports?: boolean;
   routes: AppRoute[];
   metadataRoutes?: MetadataFileRoute[];
   globalErrorPath?: string | null;
@@ -93,10 +97,12 @@ type ImportAllocator = {
   getLazyLoaderVar(filePath: string): string;
   importMap: ReadonlyMap<string, string>;
   imports: string[];
+  importInitializers: string[];
 };
 
-function createImportAllocator(): ImportAllocator {
+function createImportAllocator(deferEagerImports: boolean): ImportAllocator {
   const imports: string[] = [];
+  const importInitializers: string[] = [];
   const importMap = new Map<string, string>();
   const lazyMap = new Map<string, string>();
   let importIdx = 0;
@@ -105,13 +111,19 @@ function createImportAllocator(): ImportAllocator {
   return {
     importMap,
     imports,
+    importInitializers,
     getImportVar(filePath) {
       const existing = importMap.get(filePath);
       if (existing) return existing;
 
       const varName = `mod_${importIdx++}`;
       const absPath = toSlash(filePath);
-      imports.push(`import * as ${varName} from ${JSON.stringify(absPath)};`);
+      if (deferEagerImports) {
+        imports.push(`let ${varName};`);
+        importInitializers.push(`${varName} = await import(${JSON.stringify(absPath)});`);
+      } else {
+        imports.push(`import * as ${varName} from ${JSON.stringify(absPath)};`);
+      }
       importMap.set(filePath, varName);
       return varName;
     },
@@ -346,6 +358,7 @@ ${interceptEntries.join(",\n")}
     return `  {
     __buildTimeClassifications: __VINEXT_CLASS(${routeIdx}), // evaluated once at module load
     __buildTimeReasons: __classDebug ? __VINEXT_CLASS_REASONS(${routeIdx}) : null,
+    canUseCanonicalLoadingShell: ${appRouteHasMainTreeLoadingBoundary(route)},
     ids: ${JSON.stringify(route.ids ?? null)},
     pattern: ${JSON.stringify(route.pattern)},
     patternParts: ${JSON.stringify(route.patternParts)},
@@ -474,17 +487,25 @@ function buildGenerateStaticParamsEntries(
   namesByPattern: Map<string, string[]>,
 ): string[] {
   const sourcesByPattern = new Map<string, string[]>();
+  // A route's params come only from its own tree: never from the page at a
+  // prefix, which belongs to a sibling route, nor from another route group's
+  // layout there. Key each layout alone, by its directory, for deeper routes.
+  const layoutGroupsByKey = new Map<string, { pattern: string; sources: string[] }>();
+  const layoutSource = (layoutPath: string) => `{ load: ${imports.getLazyLoaderVar(layoutPath)} }`;
 
   for (const route of routes) {
     if (!route.isDynamic) continue;
 
-    for (const [index, layoutPath] of route.layouts.entries()) {
-      appendStaticParamSource(
-        sourcesByPattern,
-        createRoutePatternPrefix(route.routeSegments, route.layoutTreePositions[index] ?? 0)
-          ?.pattern ?? null,
-        `{ load: ${imports.getLazyLoaderVar(layoutPath)} }`,
-      );
+    const layoutGroups = appRouteLayoutStaticParamsGroups(route);
+    for (const group of layoutGroups) {
+      if (group.pattern === route.pattern) {
+        appendStaticParamSource(sourcesByPattern, route.pattern, layoutSource(group.layoutPath));
+      }
+      if (layoutGroupsByKey.has(group.key)) continue;
+      layoutGroupsByKey.set(group.key, {
+        pattern: group.pattern,
+        sources: [layoutSource(group.layoutPath)],
+      });
     }
 
     if (route.pagePath) {
@@ -508,12 +529,16 @@ function buildGenerateStaticParamsEntries(
     }
   }
 
-  return Array.from(sourcesByPattern.entries()).map(([pattern, sources]) => {
+  const entry = (key: string, pattern: string, sources: string[]): string => {
     const rootParamNames = namesByPattern.get(pattern) ?? [];
-    return `  ${JSON.stringify(pattern)}: __createAppPrerenderStaticParamsResolver([${sources.join(
+    return `  ${JSON.stringify(key)}: __createAppPrerenderStaticParamsResolver([${sources.join(
       ", ",
     )}], ${JSON.stringify(rootParamNames)}),`;
-  });
+  };
+  return [
+    ...Array.from(sourcesByPattern, ([pattern, sources]) => entry(pattern, pattern, sources)),
+    ...Array.from(layoutGroupsByKey, ([key, group]) => entry(key, group.pattern, group.sources)),
+  ];
 }
 
 function buildRootParamNameEntries(namesByPattern: Map<string, string[]>): string[] {
@@ -525,7 +550,7 @@ function buildRootParamNameEntries(namesByPattern: Map<string, string[]>): strin
 export function buildAppRscManifestCode(
   options: BuildAppRscManifestCodeOptions,
 ): AppRscManifestCode {
-  const imports = createImportAllocator();
+  const imports = createImportAllocator(options.deferEagerImports === true);
   const metadataRoutes = options.metadataRoutes ?? [];
 
   registerRouteModules(options.routes, imports);
@@ -574,6 +599,7 @@ export function buildAppRscManifestCode(
 
   return {
     imports: imports.imports,
+    importInitializers: imports.importInitializers,
     routeEntries,
     metaRouteEntries: createMetadataRouteEntriesSource(metadataRoutes, imports.importMap),
     generateStaticParamsEntries: buildGenerateStaticParamsEntries(

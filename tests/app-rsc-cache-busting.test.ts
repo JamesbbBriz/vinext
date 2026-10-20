@@ -15,6 +15,7 @@ import {
   isRscCompatibilityIdCompatible,
   resolveInvalidRscCacheBustingRequest,
   setRscCacheBustingSearchParam,
+  keepOnlyValidatedRscCacheBustingSearchParam,
   stripRscCacheBustingSearchParam,
   VINEXT_RSC_BUILD_ID_HEADER,
   VINEXT_RSC_COMPATIBILITY_ID_HEADER,
@@ -163,6 +164,9 @@ describe("App Router RSC cache-busting", () => {
           await expect(createRscRequestUrl("/docs?tab=api", headers)).resolves.toBe(
             "/docs.txt?tab=api",
           );
+          await expect(createRscRequestUrl("//a//attacker.example/z", headers)).resolves.toBe(
+            "/.//a//attacker.example/z.txt",
+          );
           await withEnvVar("__NEXT_ROUTER_BASEPATH", "/docs", async () => {
             await expect(createRscRequestUrl("/docs", headers)).resolves.toBe("/docs/index.txt");
             await expect(createRscRequestUrl("/docs?tab=api", headers)).resolves.toBe(
@@ -268,6 +272,42 @@ describe("App Router RSC cache-busting", () => {
     expect(headers.get("next-router-prefetch")).toBeNull();
     expect(headers.get("next-router-state-tree")).toBeTruthy();
     expect(headers.get("next-url")).toBe("/current");
+  });
+
+  it("keeps request URLs for pathnames that start with // on the app origin", async () => {
+    // A pathname such as "//a//attacker.example/z" (from the local href
+    // "/.//a//attacker.example/z") must stay a path. Next.js fetches the full
+    // same-origin URL, so the request never treats "a" as a host.
+    const origin = "https://app.example";
+    const headers = createRscRequestHeaders();
+    const resolve = (requestUrl: string) => new URL(requestUrl, `${origin}/current`);
+
+    for (const requestUrl of [
+      await createRscRequestUrl("//a//attacker.example/z?tab=1#hash", headers),
+      createCanonicalRscRequestUrl("//a//attacker.example/z?tab=1"),
+      createServerActionRequestUrl("//a//attacker.example/z?tab=1#hash"),
+    ]) {
+      expect(requestUrl.startsWith("//")).toBe(false);
+      expect(resolve(requestUrl).origin).toBe(origin);
+      expect(resolve(requestUrl).pathname).toBe("//a//attacker.example/z");
+      expect(resolve(requestUrl).searchParams.get("tab")).toBe("1");
+    }
+
+    // Backslashes are path separators in special-scheme URLs.
+    expect(resolve(createServerActionRequestUrl("\\\\a\\attacker.example")).href).toBe(
+      `${origin}//a/attacker.example`,
+    );
+    // Absolute URLs keep their path in full.
+    expect(
+      resolve(createServerActionRequestUrl("https://app.example//a//attacker.example/z")).href,
+    ).toBe(`${origin}//a//attacker.example/z`);
+
+    await expect(
+      createRscRedirectLocation(
+        "/.//a//attacker.example/z",
+        new Request(`${origin}/photos?_rsc`, { headers: createCanonicalRscRequestHeaders() }),
+      ),
+    ).resolves.toBe(`${origin}/.//a//attacker.example/z?_rsc`);
   });
 
   it("keeps server action POSTs on the visible route URL", () => {
@@ -421,74 +461,68 @@ describe("App Router RSC cache-busting", () => {
 
   // Ported from Next.js: test/e2e/app-dir/segment-cache/cdn-cache-busting/cdn-cache-busting.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/segment-cache/cdn-cache-busting/cdn-cache-busting.test.ts
-  it("accepts only definitive canonical request identities for strict-Vary adapters", async () => {
-    await withEnvVar("__VINEXT_CANONICAL_RSC_REQUESTS", "1", async () => {
-      const fullHeaders = createCanonicalRscRequestHeaders();
-      const fullRequest = new Request("https://example.com/photos/42?_rsc", {
-        headers: fullHeaders,
-      });
-      await expect(
-        resolveInvalidRscCacheBustingRequest({ isRscRequest: true, request: fullRequest }),
-      ).resolves.toBeNull();
-
-      const loadingHeaders = createCanonicalLoadingShellRscRequestHeaders();
-      const loadingPath = await createRscRequestUrl("/photos/42", loadingHeaders);
-      expect(loadingPath).toBe("/photos/42?_rsc=9qLBDIU2NgN178cB");
-      const loadingRequest = new Request(`https://example.com${loadingPath}`, {
-        headers: loadingHeaders,
-      });
-      await expect(
-        resolveInvalidRscCacheBustingRequest({ isRscRequest: true, request: loadingRequest }),
-      ).resolves.toBeNull();
-
-      const bareLoadingResponse = await resolveInvalidRscCacheBustingRequest({
-        isRscRequest: true,
-        request: new Request("https://example.com/photos/42?_rsc", { headers: loadingHeaders }),
-      });
-      expect(bareLoadingResponse?.status).toBe(307);
-      expect(bareLoadingResponse?.headers.get("location")).toBe(loadingPath);
-
-      const contextual = createCanonicalLoadingShellRscRequestHeaders();
-      contextual.set("next-url", "/source");
-      const response = await resolveInvalidRscCacheBustingRequest({
-        isRscRequest: true,
-        request: new Request("https://example.com/photos/42?_rsc", { headers: contextual }),
-      });
-      expect(response?.status).toBe(307);
-      expect(response?.headers.get("location")).toMatch(/_rsc=.+/);
+  it("accepts only definitive canonical request identities", async () => {
+    const fullHeaders = createCanonicalRscRequestHeaders();
+    const fullRequest = new Request("https://example.com/photos/42?_rsc", {
+      headers: fullHeaders,
     });
+    await expect(
+      resolveInvalidRscCacheBustingRequest({ isRscRequest: true, request: fullRequest }),
+    ).resolves.toBeNull();
+
+    const loadingHeaders = createCanonicalLoadingShellRscRequestHeaders();
+    const loadingPath = await createRscRequestUrl("/photos/42", loadingHeaders);
+    expect(loadingPath).toBe("/photos/42?_rsc=9qLBDIU2NgN178cB");
+    const loadingRequest = new Request(`https://example.com${loadingPath}`, {
+      headers: loadingHeaders,
+    });
+    await expect(
+      resolveInvalidRscCacheBustingRequest({ isRscRequest: true, request: loadingRequest }),
+    ).resolves.toBeNull();
+
+    const bareLoadingResponse = await resolveInvalidRscCacheBustingRequest({
+      isRscRequest: true,
+      request: new Request("https://example.com/photos/42?_rsc", { headers: loadingHeaders }),
+    });
+    expect(bareLoadingResponse?.status).toBe(307);
+    expect(bareLoadingResponse?.headers.get("location")).toBe(loadingPath);
+
+    const contextual = createCanonicalLoadingShellRscRequestHeaders();
+    contextual.set("next-url", "/source");
+    const response = await resolveInvalidRscCacheBustingRequest({
+      isRscRequest: true,
+      request: new Request("https://example.com/photos/42?_rsc", { headers: contextual }),
+    });
+    expect(response?.status).toBe(307);
+    expect(response?.headers.get("location")).toMatch(/_rsc=.+/);
   });
 
   it("preserves full and loading-shell identities across same-origin RSC redirects", async () => {
-    await withEnvVar("__VINEXT_CANONICAL_RSC_REQUESTS", "1", async () => {
-      const fullHeaders = createCanonicalRscRequestHeaders();
-      await expect(
-        createRscRedirectLocation(
-          "/redirected?tab=1",
-          new Request("https://example.com/photos/42?_rsc", { headers: fullHeaders }),
-        ),
-      ).resolves.toBe("https://example.com/redirected?tab=1&_rsc");
+    const fullHeaders = createCanonicalRscRequestHeaders();
+    await expect(
+      createRscRedirectLocation(
+        "/redirected?tab=1",
+        new Request("https://example.com/photos/42?_rsc", { headers: fullHeaders }),
+      ),
+    ).resolves.toBe("https://example.com/redirected?tab=1&_rsc");
 
-      const loadingHeaders = createCanonicalLoadingShellRscRequestHeaders();
-      await expect(
-        createRscRedirectLocation(
-          "/redirected?tab=1",
-          new Request("https://example.com/photos/42?_rsc", { headers: loadingHeaders }),
-        ),
-      ).resolves.toBe("https://example.com/redirected?tab=1&_rsc=9qLBDIU2NgN178cB");
-    });
+    const loadingHeaders = createCanonicalLoadingShellRscRequestHeaders();
+    await expect(
+      createRscRedirectLocation(
+        "/redirected?tab=1",
+        new Request("https://example.com/photos/42?_rsc", { headers: loadingHeaders }),
+      ),
+    ).resolves.toBe("https://example.com/redirected?tab=1&_rsc=9qLBDIU2NgN178cB");
   });
 
-  it("redirects bare loading-shell requests for adapters without strict Vary", async () => {
-    await withEnvVar("__VINEXT_CANONICAL_RSC_REQUESTS", undefined, async () => {
-      const headers = createCanonicalLoadingShellRscRequestHeaders();
-      const response = await resolveInvalidRscCacheBustingRequest({
-        isRscRequest: true,
-        request: new Request("https://example.com/photos/42?_rsc", { headers }),
-      });
-      expect(response?.status).toBe(307);
-      expect(response?.headers.get("location")).toMatch(/_rsc=.+/);
+  it("redirects bare loading-shell requests to their varying identity", async () => {
+    const headers = createCanonicalLoadingShellRscRequestHeaders();
+    const response = await resolveInvalidRscCacheBustingRequest({
+      isRscRequest: true,
+      request: new Request("https://example.com/photos/42?_rsc", { headers }),
     });
+    expect(response?.status).toBe(307);
+    expect(response?.headers.get("location")).toMatch(/_rsc=.+/);
   });
 
   it("accepts legacy FNV cache-busting params during rolling upgrades", async () => {
@@ -656,5 +690,19 @@ describe("App Router RSC cache-busting", () => {
 
   it("treats missing response compatibility IDs as compatible only when the client has none", () => {
     expect(isRscCompatibilityIdCompatible("compat-a", null)).toBe(true);
+  });
+});
+
+describe("keepOnlyValidatedRscCacheBustingSearchParam", () => {
+  it.each([
+    ["?tab=1&_rsc=abc&_rsc=ignored&%5Frsc=encoded", true, "?_rsc=abc"],
+    ["?%5Frsc=abc&tab=1", true, "?_rsc=abc"],
+    ["?tab=1&_rsc=", true, "?_rsc"],
+    ["?tab=1", true, ""],
+    ["?tab=1&_rsc=abc", false, ""],
+  ])("reduces %s (RSC: %s) to %j", (search, isRscRequest, expected) => {
+    const url = new URL(`https://example.test/page${search}`);
+    keepOnlyValidatedRscCacheBustingSearchParam(url, isRscRequest);
+    expect(url.search).toBe(expected);
   });
 });

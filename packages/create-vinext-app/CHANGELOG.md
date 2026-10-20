@@ -1,5 +1,49 @@
 # create-vinext-app
 
+## 1.1.0
+
+Read the [Vinext 1.2 release post](https://vinext.dev/blog/vinext-1-2) for the highlights.
+
+### Features
+
+- **Init:** add --name to set the Cloudflare Worker name (#3863)
+
+### Contributors
+
+- @MattieTK
+
+## 1.0.0
+
+### Features
+
+- **Init:** default Cloudflare projects to cf (#3504)
+- **Cloudflare:** add read-only Static Assets prerender cache (#3344)
+- **CLI:** stabilize cache warming flags (#3502)
+
+### Contributors
+
+- @james-elicx
+
+## 1.0.0-beta.4
+
+### Features
+
+- **Cloudflare:** support cf Build Output deployments (#3230)
+
+### Contributors
+
+- @james-elicx
+
+## 1.0.0-beta.3
+
+### Features
+
+- **Cloudflare:** scaffold Response Store Wrangler config (#3249)
+
+### Contributors
+
+- @james-elicx
+
 ## 1.0.0-beta.2
 
 ### Bug Fixes

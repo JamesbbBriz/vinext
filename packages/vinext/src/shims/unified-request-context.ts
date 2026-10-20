@@ -12,6 +12,12 @@
 
 import type { AsyncLocalStorage } from "node:async_hooks";
 import { getOrCreateAls } from "./internal/als-registry.js";
+import {
+  isFullyBufferedBody,
+  markFullyBufferedBody,
+  preserveFullyBufferedBodyMetadata,
+} from "../server/fully-buffered-response.js";
+
 import type {
   CacheState,
   ExecutionContextLike,
@@ -24,6 +30,8 @@ import type {
   RootParamsState,
   VinextHeadersShimState,
 } from "./request-state-types.js";
+
+export { markFullyBufferedBody, preserveFullyBufferedBodyMetadata };
 
 // ---------------------------------------------------------------------------
 // Unified context shape
@@ -40,6 +48,11 @@ export type UnifiedRequestContext = {
   // ── request-context.ts ─────────────────────────────────────────────
   /** Cloudflare Workers ExecutionContext, or null on Node.js dev. */
   executionContext: ExecutionContextLike | null;
+  /**
+   * The host's client-connection signal for the incoming request, before any
+   * clone follows it. Null for requests vinext creates itself (regeneration).
+   */
+  requestSignal: AbortSignal | null;
 
   // ── cache-for-request.ts ──────────────────────────────────────────
   /** Per-request cache for cacheForRequest(). Keyed by factory function reference. */
@@ -99,9 +112,14 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
   return {
     headersContext: null,
     actionRevalidationKind: 0,
+    cacheLifeSink: null,
+    pendingCdnTagInvalidations: [],
     pendingRevalidatedTags: new Set<string>(),
     pendingRevalidations: new Set<Promise<void>>(),
     dynamicUsageDetected: false,
+    // Seed from a pre-populated dynamicUsageDetected, since `...opts` below only
+    // overrides the flag; an explicitly passed latch still wins.
+    renderDynamicLatch: { dynamic: opts?.dynamicUsageDetected === true, listeners: new Set() },
     renderRequestApiUsage: new Set(),
     connectionProbe: null,
     invalidDynamicUsageError: null,
@@ -125,7 +143,9 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
     refreshStaleFetchesInForeground: false,
     isFetchDedupeActive: false,
     currentFetchDedupeEntries: new Map(),
+    nextFetchId: 1,
     executionContext: _getInheritedExecutionContext(), // inherits from standalone ALS if present
+    requestSignal: null,
     requestCache: new WeakMap(),
     afterContext: {
       callbacks: [],
@@ -258,36 +278,6 @@ export function requiresResponseCloseTracking(ctx: UnifiedRequestContext): boole
   );
 }
 
-type ResponseWithFullyBufferedBodyMetadata = Response & {
-  __vinextFullyBufferedBody?: boolean;
-};
-
-/**
- * Mark a response whose body vinext constructed from a fully in-memory string
- * or byte array, as opposed to a body handed back by user code, which could
- * still be producing. With no producer left, no `after()` call can originate
- * from this body — the one signal that makes it safe for
- * `closeAfterResponseWithBody()` to skip close tracking.
- *
- * Not set for a metadata route's `result instanceof Response` passthrough (a
- * user `icon.tsx`/`opengraph-image.tsx` can return a streaming
- * `ImageResponse`) or any handler-returned `new Response(stream)` — those
- * bodies can still be producing and must keep close tracking.
- */
-export function markFullyBufferedBody(response: Response): Response {
-  (response as ResponseWithFullyBufferedBodyMetadata).__vinextFullyBufferedBody = true;
-  return response;
-}
-
-function isFullyBufferedBody(response: Response): boolean {
-  return (response as ResponseWithFullyBufferedBodyMetadata).__vinextFullyBufferedBody === true;
-}
-
-/** Preserve the internal buffered-body signal when response metadata is rebuilt. */
-export function preserveFullyBufferedBodyMetadata(source: Response, target: Response): Response {
-  return isFullyBufferedBody(source) ? markFullyBufferedBody(target) : target;
-}
-
 /**
  * Wrap a response so deferred `after()` callbacks start on stream completion
  * or cancellation. Skipped only when the body is marked fully buffered (see
@@ -352,6 +342,25 @@ export function runWithRequestContext<T>(
 }
 
 /**
+ * Return the state's render dynamic latch. A state created before an HMR update
+ * (a unified context, or the headers shim's fallback state, which persists on
+ * globalThis) may predate the latch, so create it on first access, starting it
+ * latched if the state has already recorded dynamic usage so that usage isn't
+ * lost. Scopes cloned from a state must call this on the parent first so the
+ * child shares the latch.
+ *
+ * @internal
+ */
+export function ensureRenderDynamicLatch(
+  state: Pick<VinextHeadersShimState, "dynamicUsageDetected" | "renderDynamicLatch">,
+): VinextHeadersShimState["renderDynamicLatch"] {
+  return (state.renderDynamicLatch ??= {
+    dynamic: state.dynamicUsageDetected,
+    listeners: new Set(),
+  });
+}
+
+/**
  * Run `fn` in a nested unified scope derived from the current request context.
  * Used by legacy runWith* wrappers to reset or override one sub-state while
  * preserving proper async isolation for continuations created inside `fn`.
@@ -375,17 +384,23 @@ export function runWithUnifiedStateMutation<T>(
   const parentCtx = _als.getStore();
   if (!parentCtx) return fn();
 
+  // A context created before an HMR update may predate the latch. Create it on
+  // the parent so the child shares it instead of latching a copy of its own.
+  ensureRenderDynamicLatch(parentCtx);
   const childCtx = { ...parentCtx };
   // NOTE: This is a shallow clone. Object/array fields (afterContext, pendingSetCookies,
-  // serverInsertedHTMLCallbacks, currentRequestTags, ssrHeadChildren), Set
+  // serverInsertedHTMLCallbacks, currentRequestTags, ssrHeadChildren,
+  // pendingCdnTagInvalidations), Set
   // fields (renderRequestApiUsage, pendingRevalidatedTags, pendingRevalidations,
   // cacheableFetchUrls, dynamicFetchUrls),
   // Map fields (unstableCacheObservations, _privateCache),
   // requestCache WeakMap, and object fields (headersContext,
   // i18nContext, serverContext, ssrContext, executionContext,
-  // requestScopedCacheLife) still share references with the parent until
-  // replaced. requestCache is intentionally shared — nested scopes within
-  // the same request should see the same cached values. The mutate
+  // requestScopedCacheLife, renderDynamicLatch, cacheLifeSink) still share references with
+  // the parent until replaced. requestCache is intentionally shared — nested
+  // scopes within the same request should see the same cached values.
+  // renderDynamicLatch must stay shared: dynamic usage in an isolated child
+  // scope has to reach gates issued later in the same render. The mutate
   // callback must replace those reference-typed slices (for example
   // `ctx.currentRequestTags = []` or `ctx.renderRequestApiUsage = new Set()`)
   // rather than mutating them in-place (for
@@ -395,6 +410,17 @@ export function runWithUnifiedStateMutation<T>(
   // here too and verify callers still follow the replace-not-mutate rule.
   mutate(childCtx);
   return _als.run(childCtx, fn);
+}
+
+/**
+ * Bind `fn` to the current request context, so it reads this request's state
+ * even when it's called from another async context, such as a response
+ * stream's pull.
+ */
+export function bindRequestContext<T>(fn: () => T): () => T {
+  const ctx = _als.getStore();
+  if (!ctx) return fn;
+  return () => _als.run(ctx, fn);
 }
 
 /**

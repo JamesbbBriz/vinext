@@ -7,12 +7,12 @@ import {
   urlQueryToSearchParams,
 } from "../utils/query.js";
 import {
-  createPagesReqRes,
+  createPagesApiReqRes,
   markVinextStreamedApiResponse,
   parsePagesApiBody,
   type PagesRequestQuery,
   type PagesReqResRequest,
-  type PagesReqResResponse,
+  type PagesApiReqResResponse,
   PagesApiBodyParseError,
 } from "./pages-node-compat.js";
 import { resolveBodyParserConfig } from "./pages-body-parser-config.js";
@@ -29,6 +29,9 @@ import {
   type ExecutionContextLike,
 } from "vinext/shims/request-context";
 import { NextRequest } from "vinext/shims/server";
+import { markRouteCacheabilityExplicitResponsePolicy } from "vinext/shims/cacheability-classification";
+import { hasCdnResponsePolicy } from "./cache-control.js";
+import { tracePagesApiHandler } from "./pages-execution-tracing.js";
 
 type PagesApiRouteConfig = {
   runtime?: string;
@@ -61,7 +64,7 @@ type PagesApiRouteConfig = {
   };
 };
 
-type PagesNodeApiRouteHandler = (req: PagesReqResRequest, res: PagesReqResResponse) => unknown;
+type PagesNodeApiRouteHandler = (req: PagesReqResRequest, res: PagesApiReqResResponse) => unknown;
 
 type PagesEdgeApiRouteHandler = (request: Request) => Response | Promise<Response>;
 
@@ -113,6 +116,7 @@ type HandlePagesApiRouteOptions = {
     allowedRevalidateHeaderKeys?: readonly string[];
     i18n?: NextI18nConfig | null;
     trailingSlash?: boolean;
+    skipTrailingSlashRedirect?: boolean;
   };
   trustedRevalidateOrigin?: string;
 };
@@ -143,10 +147,12 @@ function isNodeApiRouteModule(
 }
 
 export async function handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promise<Response> {
-  if (options.ctx) {
-    return runWithExecutionContext(options.ctx, () => _handlePagesApiRoute(options));
-  }
-  return _handlePagesApiRoute(options);
+  const run = async () => {
+    const response = await _handlePagesApiRoute(options);
+    if (hasCdnResponsePolicy(response.headers)) markRouteCacheabilityExplicitResponsePolicy();
+    return response;
+  };
+  return options.ctx ? runWithExecutionContext(options.ctx, run) : run();
 }
 
 async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promise<Response> {
@@ -158,6 +164,7 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
 
   try {
     if (isEdgeApiRouteModule(route.module)) {
+      const handler = route.module.default;
       // Next.js wraps the incoming Request in a NextRequest before invoking
       // edge API handlers, so handlers can use `req.nextUrl.searchParams`,
       // `req.cookies`, etc. (Cf. NextRequestHint in next/src/server/web/adapter.ts.)
@@ -169,11 +176,12 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
                 basePath: options.nextConfig.basePath,
                 i18n: options.nextConfig.i18n ?? undefined,
                 trailingSlash: options.nextConfig.trailingSlash,
+                skipTrailingSlashRedirect: options.nextConfig.skipTrailingSlashRedirect,
               },
             }
           : undefined,
       );
-      const response = await route.module.default(nextRequest);
+      const response = await tracePagesApiHandler(route.pattern, () => handler(nextRequest));
       if (response instanceof Response) {
         const finalized = finalizeEdgeApiResponse(response, options.edgeRuntime ?? "worker");
         if (
@@ -220,7 +228,7 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
       ? await parsePagesApiBody(options.request, bodyParserConfig.sizeLimit)
       : undefined;
 
-    const { req, res, responsePromise } = createPagesReqRes({
+    const { req, res, responsePromise } = createPagesApiReqRes({
       allowedRevalidateHeaderKeys: options.nextConfig?.allowedRevalidateHeaderKeys,
       body,
       initialResponseHeaders: options.initialResponseHeaders,
@@ -284,7 +292,11 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
     // handlers attached. A synchronous throw may destroy the response bridge,
     // which rejects responsePromise as well as the handler completion.
     const handlerCompletion = Promise.resolve()
-      .then(() => handler(req, res))
+      .then(() =>
+        tracePagesApiHandler(route.pattern, () => handler(req, res), {
+          recordErrors: options.edgeRuntime !== "node",
+        }),
+      )
       .then(() => ({ type: "handler" as const }), destroyAfterHandlerError);
 
     // A real Node ServerResponse is consumed by the socket while the API
@@ -294,9 +306,9 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
     // the handler to finish first.
     const firstSettled = await Promise.race([responseReady, handlerCompletion]);
     if (firstSettled.type === "response") {
-      const handlerLifecycle = handlerCompletion.then(completeHandler, (error) => {
-        void options.reportRequestError?.(error, route.pattern);
-      });
+      const handlerLifecycle = handlerCompletion.then(completeHandler, (error) =>
+        options.reportRequestError?.(error, route.pattern),
+      );
       // The body may already be complete (for example, res.end() followed by
       // awaited cleanup), so keeping only a floating promise is not enough on
       // Workers. Register the remaining handler lifecycle before returning;
@@ -317,7 +329,7 @@ async function _handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promis
       });
     }
 
-    void options.reportRequestError?.(
+    await options.reportRequestError?.(
       error instanceof Error ? error : new Error(String(error)),
       route.pattern,
     );

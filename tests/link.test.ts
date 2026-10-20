@@ -149,6 +149,63 @@ describe("Link rendering", () => {
   });
 });
 
+describe("Pages Router Link URL resolution", () => {
+  function renderPagesLink(
+    props: React.ComponentProps<typeof Link>,
+    router = { pathname: "/dir/current", asPath: "/dir/current?old=1" },
+  ): string {
+    const previousWindow = (globalThis as any).window;
+    (globalThis as any).window = {
+      location: {
+        href: "http://example.com/dir/current?old=1",
+        origin: "http://example.com",
+        protocol: "http:",
+        hostname: "example.com",
+        port: "",
+      },
+    };
+    try {
+      return ReactDOMServer.renderToString(
+        React.createElement(
+          RouterContext.Provider,
+          { value: router as never },
+          React.createElement(Link, props),
+        ),
+      );
+    } finally {
+      if (previousWindow === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = previousWindow;
+    }
+  }
+
+  it.each([
+    ["sibling", "/dir/sibling"],
+    [{ protocol: "http:", pathname: "sibling" }, "/dir/sibling"],
+    [{ protocol: "HtTp:", hash: "#frag" }, "/dir/current#frag"],
+    [
+      { protocol: "HTTP:", hostname: "EXAMPLE.COM", pathname: "/target" },
+      "/dir/EXAMPLE.COM/target",
+    ],
+  ])("resolves object href %j against the current route", (href, expected) => {
+    const html = renderPagesLink({ href, children: "target" });
+    expect(html).toContain(`href="${expected}"`);
+  });
+
+  it("resolves an object as value against the current route", () => {
+    const html = renderPagesLink({
+      href: "/target",
+      as: { protocol: "http:", pathname: "mask" },
+      children: "target",
+    });
+    expect(html).toContain('href="/dir/mask"');
+  });
+
+  it("resolves a relative string as value against the current route", () => {
+    const html = renderPagesLink({ href: "/target", as: "mask", children: "target" });
+    expect(html).toContain('href="/dir/mask"');
+  });
+});
+
 // ─── Repeated-slash warning (parity with Next.js) ───────────────────────
 //
 // Ported from Next.js: test/e2e/repeated-forward-slashes-error/repeated-forward-slashes-error.test.ts
@@ -161,6 +218,19 @@ describe("Link rendering", () => {
 describe("Link repeated-slash warning", () => {
   let consoleSpy: ReturnType<typeof vi.spyOn>;
 
+  function renderPagesLink(
+    href: React.ComponentProps<typeof Link>["href"],
+    as?: React.ComponentProps<typeof Link>["as"],
+  ): string {
+    return ReactDOMServer.renderToString(
+      React.createElement(
+        RouterContext.Provider,
+        { value: {} as never },
+        React.createElement(Link, { href, as }, "Link"),
+      ),
+    );
+  }
+
   beforeEach(() => {
     consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   });
@@ -170,7 +240,7 @@ describe("Link repeated-slash warning", () => {
   });
 
   it("logs a console.error when href contains repeated forward slashes", () => {
-    ReactDOMServer.renderToString(React.createElement(Link, { href: "/hello//world" }, "Hello"));
+    renderPagesLink("/hello//world");
     expect(consoleSpy).toHaveBeenCalled();
     const message = consoleSpy.mock.calls[0]?.[0] as string;
     expect(message).toContain("Invalid href '/hello//world'");
@@ -180,28 +250,26 @@ describe("Link repeated-slash warning", () => {
   });
 
   it("logs a console.error when href contains a backslash", () => {
-    ReactDOMServer.renderToString(React.createElement(Link, { href: "/foo\\bar" }, "Bad"));
+    renderPagesLink("/foo\\bar");
     expect(consoleSpy).toHaveBeenCalled();
     const message = consoleSpy.mock.calls[0]?.[0] as string;
     expect(message).toContain("Invalid href '/foo\\bar'");
   });
 
   it("does not warn for absolute URLs whose only '//' is the protocol separator", () => {
-    ReactDOMServer.renderToString(
-      React.createElement(Link, { href: "https://example.com/path" }, "Ext"),
-    );
+    renderPagesLink("https://example.com/path");
     expect(consoleSpy).not.toHaveBeenCalled();
   });
 
   it("does not warn for hrefs without repeated slashes", () => {
-    ReactDOMServer.renderToString(React.createElement(Link, { href: "/normal/path" }, "Normal"));
+    renderPagesLink("/normal/path");
     expect(consoleSpy).not.toHaveBeenCalled();
   });
 
   it("ignores repeated slashes inside the query string", () => {
     // Next.js only checks the path portion (everything before '?'), so a
     // query string containing '//' must not trigger the warning.
-    ReactDOMServer.renderToString(React.createElement(Link, { href: "/ok?next=//foo//bar" }, "Q"));
+    renderPagesLink("/ok?next=//foo//bar");
     expect(consoleSpy).not.toHaveBeenCalled();
   });
 
@@ -209,44 +277,88 @@ describe("Link repeated-slash warning", () => {
     // Next.js's resolve-href.ts does NOT dedupe these warnings — every call
     // emits a console.error. Confirm we do the same so repeated renders
     // surface every offending href.
-    const el = React.createElement(Link, { href: "/dup//slash" }, "Dup");
-    ReactDOMServer.renderToString(el);
-    ReactDOMServer.renderToString(el);
+    renderPagesLink("/dup//slash");
+    renderPagesLink("/dup//slash");
     expect(consoleSpy).toHaveBeenCalledTimes(2);
   });
 
   it("normalises repeated forward slashes in the rendered href", () => {
     // Next.js mirrors Vercel's gateway behaviour: after warning, the href is
     // collapsed so the browser navigates to the canonical path.
-    const html = ReactDOMServer.renderToString(
-      React.createElement(Link, { href: "/hello//world" }, "Hello"),
-    );
+    const html = renderPagesLink("/hello//world");
     expect(html).toContain('href="/hello/world"');
     expect(html).not.toContain("//world");
   });
 
   it("normalises backslashes to forward slashes in the rendered href", () => {
-    const html = ReactDOMServer.renderToString(
-      React.createElement(Link, { href: "/foo\\bar" }, "Bad"),
-    );
+    const html = renderPagesLink("/foo\\bar");
     expect(html).toContain('href="/foo/bar"');
     expect(html).not.toContain("\\");
   });
 
   it("preserves the query string when normalising repeated slashes", () => {
-    const html = ReactDOMServer.renderToString(
-      React.createElement(Link, { href: "/a//b?x=1&y=2" }, "Q"),
-    );
+    const html = renderPagesLink("/a//b?x=1&y=2");
     expect(html).toContain('href="/a/b?x=1&amp;y=2"');
+  });
+
+  it("normalises and warns for the route href behind an explicit as", () => {
+    const html = renderPagesLink("/foo//bar", "/display");
+
+    expect(html).toContain('href="/display"');
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Invalid href '/foo//bar'"));
+  });
+
+  it("preserves literal delimiters in a masked object pathname", () => {
+    const html = renderPagesLink({ pathname: "/foo//bar?literal#hash" }, "/display");
+
+    expect(html).toContain('href="/display"');
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Invalid href '/foo//bar%3Fliteral%23hash'"),
+    );
+  });
+
+  it("warns separately for identical explicit href and as values", () => {
+    renderPagesLink("/a//b", "/a//b");
+
+    expect(consoleSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("warns for href before an explicit as value", () => {
+    renderPagesLink("/route//path", "/display//path");
+
+    expect(consoleSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining("Invalid href '/route//path'"),
+    );
+    expect(consoleSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("Invalid href '/display//path'"),
+    );
+  });
+
+  it("normalises a dynamic href before resolving its explicit as value", () => {
+    const html = renderPagesLink("/posts//[id]", "/posts/1");
+
+    expect(html).toContain('href="/posts/1"');
+    expect(consoleSpy).toHaveBeenCalledTimes(1);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Invalid href '/posts//[id]'"));
   });
 
   it("preserves the protocol when normalising absolute URLs", () => {
     // The "//" between scheme and authority must survive normalisation, but
     // a duplicate slash in the *path* portion must still collapse.
-    const html = ReactDOMServer.renderToString(
-      React.createElement(Link, { href: "https://example.com//foo//bar" }, "Ext"),
-    );
+    const html = renderPagesLink("https://example.com//foo//bar");
     expect(html).toContain('href="https://example.com/foo/bar"');
+  });
+
+  it.each([
+    [{ href: "/docs//intro" }, "/docs//intro"],
+    [{ href: "/docs", as: "/display//intro" }, "/display//intro"],
+  ])("leaves App Router Link separators unchanged in %j", (props, expectedHref) => {
+    const html = ReactDOMServer.renderToString(React.createElement(Link, props, "Link"));
+
+    expect(html).toContain(`href="${expectedHref}"`);
+    expect(consoleSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -254,13 +366,11 @@ describe("Link repeated-slash warning", () => {
 
 describe("useLinkStatus", () => {
   it("returns { pending: false } by default", () => {
-    let status: { pending: boolean } | undefined;
     function TestComponent() {
-      status = useLinkStatus();
+      expect(useLinkStatus()).toEqual({ pending: false });
       return null;
     }
     ReactDOMServer.renderToString(React.createElement(TestComponent));
-    expect(status).toEqual({ pending: false });
   });
 });
 
@@ -583,6 +693,36 @@ describe("Link resolveHref", () => {
     expect(html).toContain('href="/posts/[id]?id=42"');
   });
 
+  it("warns for unknown object keys only in the Pages Router", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubEnv("NODE_ENV", "development");
+    const invalidHref = { pathname: "/target", hrefTypo: true } as any;
+    const invalidAs = { pathname: "/display", asTypo: true } as any;
+
+    try {
+      ReactDOMServer.renderToString(
+        React.createElement(
+          RouterContext.Provider,
+          { value: {} as never },
+          React.createElement(Link, { href: invalidHref, as: invalidAs }, "Pages"),
+        ),
+      );
+      expect(warn).toHaveBeenCalledWith(
+        "Unknown key passed via urlObject into url.format: hrefTypo",
+      );
+      expect(warn).toHaveBeenCalledWith("Unknown key passed via urlObject into url.format: asTypo");
+
+      warn.mockClear();
+      ReactDOMServer.renderToString(
+        React.createElement(Link, { href: invalidHref, as: invalidAs }, "App"),
+      );
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("does not interpolate dynamic-looking external hrefs in the Pages Router", () => {
     const html = ReactDOMServer.renderToString(
       React.createElement(
@@ -654,7 +794,7 @@ describe("Link resolveHref", () => {
     );
   });
 
-  it("object href preserves an existing query string in pathname", () => {
+  it("object href encodes a query delimiter inside pathname", () => {
     const html = ReactDOMServer.renderToString(
       React.createElement(
         Link,
@@ -662,10 +802,10 @@ describe("Link resolveHref", () => {
         "x",
       ),
     );
-    expect(html).toMatch(/href="\/items\?lang=en&(?:amp;)?page=2&(?:amp;)?sort=name"/);
+    expect(html).toContain('href="/items%3Flang=en?page=2&amp;sort=name"');
   });
 
-  it("object href preserves hash fragments when pathname already has a query string", () => {
+  it("object href encodes query and hash delimiters inside pathname", () => {
     const html = ReactDOMServer.renderToString(
       React.createElement(
         Link,
@@ -673,7 +813,7 @@ describe("Link resolveHref", () => {
         "x",
       ),
     );
-    expect(html).toContain('href="/items?lang=en&amp;page=2#results"');
+    expect(html).toContain('href="/items%3Flang=en%23results?page=2"');
   });
 
   it("object href with only pathname", () => {
@@ -955,12 +1095,34 @@ describe("Link locale handling", () => {
     expect(html).toContain('href="https://example.com/about"');
   });
 
-  it("locale does not mangle protocol-relative URLs", () => {
-    // //example.com/about should not become /fr///example.com/about
-    const html = ReactDOMServer.renderToString(
-      React.createElement(Link, { href: "//example.com/about", locale: "fr" } as any, "x"),
-    );
-    expect(html).toContain('href="//example.com/about"');
+  it("preserves protocol-relative URLs outside the Pages Router context", () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const html = ReactDOMServer.renderToString(
+        React.createElement(Link, { href: "//example.com/about", locale: "fr" } as any, "x"),
+      );
+      expect(html).toContain('href="//example.com/about"');
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("normalizes protocol-relative URLs in the Pages Router before applying locale", () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const html = ReactDOMServer.renderToString(
+        React.createElement(
+          RouterContext.Provider,
+          { value: {} as never },
+          React.createElement(Link, { href: "//example.com/about", locale: "fr" } as any, "x"),
+        ),
+      );
+      expect(html).toContain('href="/fr/example.com/about"');
+      expect(consoleError).toHaveBeenCalledTimes(1);
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it("locale does not mangle http:// URLs", () => {
@@ -1004,6 +1166,35 @@ describe("Link locale handling", () => {
     );
 
     expect(html).toContain('href="http://example.fr/about"');
+  });
+
+  it("keeps relative hrefs on the configured locale domain", () => {
+    (globalThis as any).window = {
+      __VINEXT_DEFAULT_LOCALE__: "en",
+      __NEXT_DATA__: {
+        domainLocales: [
+          { domain: "example.com", defaultLocale: "en" },
+          { domain: "example.fr", defaultLocale: "fr", http: true },
+        ],
+        locale: "en",
+        defaultLocale: "en",
+      },
+      location: {
+        protocol: "https:",
+        hostname: "example.com",
+        host: "example.com",
+      },
+    };
+
+    for (const [href, expected] of [
+      ["@evil.com", "http://example.fr/@evil.com"],
+      [".evil.com/x", "http://example.fr/.evil.com/x"],
+    ]) {
+      const html = ReactDOMServer.renderToString(
+        React.createElement(Link, { href, locale: "fr" } as any, "x"),
+      );
+      expect(html).toContain(`href="${expected}"`);
+    }
   });
 
   it("uses configured locale domains during SSR output", () => {
@@ -1342,6 +1533,17 @@ describe("toSameOriginPath", () => {
     it("returns null for same host but different scheme (different origin)", () => {
       expect(toSameOriginPath("https://localhost:3000/about")).toBe(null);
     });
+
+    it("never returns a protocol-relative path for a same-origin // pathname", () => {
+      // The pathname "//evil.com/x" as a local path would point at evil.com.
+      expect(toSameOriginPath("http://localhost:3000//evil.com/x?q=1#h")).toBe("/evil.com/x?q=1#h");
+      expect(toSameOriginPath("http://localhost:3000///evil.com/x")).toBe("/evil.com/x");
+      expect(toSameOriginPath("http://localhost:3000/\\evil.com/x")).toBe("/evil.com/x");
+      expect(toSameOriginPath("http://localhost:3000/.//evil.com/x")).toBe("/evil.com/x");
+      expect(toSameOriginPath("//localhost:3000//evil.com/x")).toBe("/evil.com/x");
+      // Repeated slashes after the first segment are not a host reference.
+      expect(toSameOriginPath("http://localhost:3000/a//b")).toBe("/a//b");
+    });
   });
 });
 
@@ -1541,6 +1743,38 @@ describe("toSameOriginAppPath", () => {
     }
   });
 
+  it("never returns a protocol-relative app path", () => {
+    const originalWindow = globalThis.window;
+    (globalThis as any).window = {
+      location: {
+        origin: "http://localhost:3000",
+        href: "http://localhost:3000/base/posts/1",
+      },
+    };
+
+    try {
+      expect(toSameOriginAppPath("http://localhost:3000//evil.com/x", "")).toBe("/evil.com/x");
+      // "/base//evil.com/x" has a single leading slash, but stripping the
+      // basePath leaves "//evil.com/x".
+      expect(toSameOriginAppPath("http://localhost:3000/base//evil.com/x?q=1", "/base")).toBe(
+        "/evil.com/x?q=1",
+      );
+      // Collapsing comes first, so "//base/x" is inside basePath, as it is
+      // after Next.js's repeated-slash 308.
+      expect(toSameOriginAppPath("http://localhost:3000//base/x", "/base")).toBe("/x");
+      // Encoded slashes are not path separators and stay encoded.
+      expect(toSameOriginAppPath("http://localhost:3000/base/%2F%2Fevil.com/x", "/base")).toBe(
+        "/%2F%2Fevil.com/x",
+      );
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = originalWindow;
+      }
+    }
+  });
+
   it("treats same-origin URLs outside the configured basePath as external", () => {
     const originalWindow = globalThis.window;
     (globalThis as any).window = {
@@ -1644,6 +1878,44 @@ describe("normalizePathTrailingSlash", () => {
       expect(normalizePathTrailingSlash("https://nextjs.org/", false)).toBe("https://nextjs.org/");
       expect(normalizePathTrailingSlash("https://nextjs.org", false)).toBe("https://nextjs.org");
     });
+  });
+});
+
+// `skipTrailingSlashRedirect` defines __NEXT_MANUAL_TRAILING_SLASH in Next.js,
+// which makes `normalizePathTrailingSlash` return every path as written.
+// Ported from Next.js: test/e2e/skip-trailing-slash-redirect/index.test.ts
+// https://github.com/vercel/next.js/blob/canary/test/e2e/skip-trailing-slash-redirect/index.test.ts
+describe("normalizePathTrailingSlash with skipTrailingSlashRedirect", () => {
+  beforeEach(() => {
+    vi.stubEnv("__VINEXT_MANUAL_TRAILING_SLASH", "true");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each([true, false])("keeps paths as written with trailingSlash: %s", (trailingSlash) => {
+    for (const path of [
+      "/another",
+      "/another/",
+      "/another/?x=1#y",
+      "/another?x=1#y",
+      "/file.txt/",
+      "/",
+    ]) {
+      expect(normalizePathTrailingSlash(path, trailingSlash)).toBe(path);
+    }
+  });
+
+  it("renders Link hrefs with their original trailing slash", () => {
+    const withoutSlash = ReactDOMServer.renderToString(
+      React.createElement(Link, { href: "/another" }, "x"),
+    );
+    const withSlash = ReactDOMServer.renderToString(
+      React.createElement(Link, { href: "/another/" }, "x"),
+    );
+    expect(withoutSlash).toContain('href="/another"');
+    expect(withSlash).toContain('href="/another/"');
   });
 });
 

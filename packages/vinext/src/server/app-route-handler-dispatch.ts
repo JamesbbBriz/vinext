@@ -8,6 +8,7 @@ import {
   setCurrentForceDynamicFetchDefault,
   type FetchCacheMode,
 } from "vinext/shims/fetch-cache";
+import { runInWorkStoreScope } from "vinext/shims/internal/work-store-scope";
 import { _drainPendingRevalidations } from "vinext/shims/cache-request-state";
 import {
   consumeDynamicUsage,
@@ -23,6 +24,7 @@ import { getRequestExecutionContext } from "vinext/shims/request-context";
 import {
   closeAfterResponse,
   createRequestContext,
+  getRequestContext,
   runWithRequestContext,
 } from "vinext/shims/unified-request-context";
 import type { ISRCacheEntry } from "./isr-cache.js";
@@ -59,6 +61,11 @@ import { buildPageCacheTags } from "./implicit-tags.js";
 import { makeThenableParams } from "vinext/shims/thenable-params";
 import { reportRequestError } from "./instrumentation.js";
 import { applyCdnResponseBuildIdentityHeaders } from "./cache-control.js";
+import {
+  isOnDemandRevalidateRequest,
+  PRERENDER_REVALIDATE_HEADER,
+} from "./revalidation-request.js";
+import { traceResponseStart } from "./response-start-tracing.js";
 
 type AppRouteHandlerDispatchRoute = {
   pattern: string;
@@ -80,6 +87,7 @@ type RouteHandlerBackgroundRegenerator = (
 
 type DispatchAppRouteHandlerOptions = {
   basePath?: string;
+  bypassSharedCache?: boolean;
   cleanPathname: string;
   clearRequestContext: () => void;
   draftModeSecret: string;
@@ -92,6 +100,7 @@ type DispatchAppRouteHandlerOptions = {
   isrRouteKey: (pathname: string) => string;
   isrSet: RouteHandlerCacheSetter;
   trailingSlash?: boolean;
+  skipTrailingSlashRedirect?: boolean;
   middlewareContext: RouteHandlerMiddlewareContext;
   middlewareRequestHeaders?: Headers | null;
   /**
@@ -140,28 +149,33 @@ async function runInRouteHandlerRevalidationContext(
   const requestContext = createRequestContext({
     headersContext,
     executionContext: getRequestExecutionContext(),
+    // Regeneration runs the handler directly, so it needs the phase that
+    // executeAppRouteHandler() would have set for a live request.
+    phase: "route-handler",
     unstableCacheRevalidation: "foreground",
   });
 
-  const revalidation = runWithRequestContext(requestContext, async () => {
-    ensureFetchPatch();
-    setCurrentFetchSoftTags(
-      buildRouteHandlerPageCacheTags(options.cleanPathname, [], options.routeSegments),
-    );
-    // The revalidation render runs in a fresh request context, so the fetch
-    // defaults applied by `dispatchAppRouteHandler` must be re-applied here.
-    setCurrentFetchCacheMode(options.fetchCacheMode);
-    setCurrentFetchRevalidate(options.revalidateSeconds);
-    setCurrentForceDynamicFetchDefault(options.dynamicConfig === "force-dynamic");
-    try {
-      await renderFn();
-    } finally {
-      // Stale ISR regeneration invokes the route handler directly instead of
-      // going through executeAppRouteHandler(), so its fresh request context
-      // owns and drains any synchronous next/cache invalidations here.
-      await _drainPendingRevalidations();
-    }
-  });
+  const revalidation = runWithRequestContext(requestContext, () =>
+    runInWorkStoreScope(async () => {
+      ensureFetchPatch();
+      setCurrentFetchSoftTags(
+        buildRouteHandlerPageCacheTags(options.cleanPathname, [], options.routeSegments),
+      );
+      // The revalidation render runs in a fresh request context, so the fetch
+      // defaults applied by `dispatchAppRouteHandler` must be re-applied here.
+      setCurrentFetchCacheMode(options.fetchCacheMode);
+      setCurrentFetchRevalidate(options.revalidateSeconds);
+      setCurrentForceDynamicFetchDefault(options.dynamicConfig === "force-dynamic");
+      try {
+        await renderFn();
+      } finally {
+        // Stale ISR regeneration invokes the route handler directly instead of
+        // going through executeAppRouteHandler(), so its fresh request context
+        // owns and drains any synchronous next/cache invalidations here.
+        await _drainPendingRevalidations();
+      }
+    }),
+  );
   try {
     await revalidation;
   } finally {
@@ -170,6 +184,12 @@ async function runInRouteHandlerRevalidationContext(
 }
 
 export async function dispatchAppRouteHandler(
+  options: DispatchAppRouteHandlerOptions,
+): Promise<Response> {
+  return traceResponseStart(await dispatchAppRouteHandlerImpl(options));
+}
+
+async function dispatchAppRouteHandlerImpl(
   options: DispatchAppRouteHandlerOptions,
 ): Promise<Response> {
   const { route } = options;
@@ -242,6 +262,27 @@ export async function dispatchAppRouteHandler(
   }
 
   const resolvedHandlerFn = isAppRouteHandlerFunction(handlerFn) ? handlerFn : undefined;
+  const shouldReadRouteCache =
+    options.bypassSharedCache !== true &&
+    revalidateSeconds !== null &&
+    !getRouteCacheabilityDynamicReason() &&
+    shouldReadAppRouteHandlerCache({
+      dynamicConfig: handler.dynamic,
+      handlerFn: resolvedHandlerFn,
+      isAutoHead,
+      isKnownDynamic: isKnownDynamicAppRoute(route.pattern),
+      isDraftMode: isDraftMode || hasDraftModeTransition,
+      isProduction,
+      method,
+      revalidateSeconds,
+    });
+  const revalidateReason = isOnDemandRevalidateRequest(
+    options.request.headers.get(PRERENDER_REVALIDATE_HEADER),
+  )
+    ? "on-demand"
+    : shouldReadRouteCache && revalidateSeconds !== Infinity
+      ? "stale"
+      : undefined;
 
   // Route handler fetches observe the handler's segment config the same way
   // page fetches do: upstream's app-route module copies `userland.fetchCache`
@@ -255,21 +296,8 @@ export async function dispatchAppRouteHandler(
   setCurrentFetchRevalidate(configuredRevalidateSeconds);
   setCurrentForceDynamicFetchDefault(handler.dynamic === "force-dynamic");
 
-  if (
-    revalidateSeconds !== null &&
-    !getRouteCacheabilityDynamicReason() &&
-    shouldReadAppRouteHandlerCache({
-      dynamicConfig: handler.dynamic,
-      handlerFn: resolvedHandlerFn,
-      isAutoHead,
-      isKnownDynamic: isKnownDynamicAppRoute(route.pattern),
-      isDraftMode: isDraftMode || hasDraftModeTransition,
-      isProduction,
-      method,
-      revalidateSeconds,
-    }) &&
-    resolvedHandlerFn
-  ) {
+  let isRevalidation = false;
+  if (shouldReadRouteCache && resolvedHandlerFn) {
     const cachedRouteResponse = await readAppRouteHandlerCacheResponse({
       basePath: options.basePath,
       buildPageCacheTags(pathname, extraTags) {
@@ -283,10 +311,15 @@ export async function dispatchAppRouteHandler(
       handlerFn: resolvedHandlerFn,
       i18n: options.i18n,
       trailingSlash: options.trailingSlash,
+      skipTrailingSlashRedirect: options.skipTrailingSlashRedirect,
       isAutoHead,
       appendResponseLink,
       isrDebug: options.isrDebug,
-      isrGet: options.isrGet,
+      async isrGet(key) {
+        const entry = await options.isrGet(key);
+        isRevalidation = entry?.value.value?.kind === "APP_ROUTE";
+        return entry;
+      },
       isrRouteKey: options.isrRouteKey,
       isrSet: options.isrSet,
       markDynamicUsage,
@@ -328,7 +361,9 @@ export async function dispatchAppRouteHandler(
 
   if (resolvedHandlerFn) {
     const response = await executeAppRouteHandler({
+      isRevalidation,
       basePath: options.basePath,
+      bypassSharedCache: options.bypassSharedCache,
       buildPageCacheTags(pathname, extraTags) {
         return buildRouteHandlerPageCacheTags(pathname, extraTags, route.routeSegments);
       },
@@ -345,6 +380,7 @@ export async function dispatchAppRouteHandler(
       handlerFn: resolvedHandlerFn,
       i18n: options.i18n,
       trailingSlash: options.trailingSlash,
+      skipTrailingSlashRedirect: options.skipTrailingSlashRedirect,
       isAutoHead,
       initialDraftModeCookie,
       isDraftMode,
@@ -358,11 +394,13 @@ export async function dispatchAppRouteHandler(
       middlewareRequestHeaders: options.middlewareRequestHeaders,
       params: options.params === null ? null : makeThenableParams(options.params),
       reportRequestError(error, request, context) {
-        void reportRequestError(error, request, context);
+        return reportRequestError(error, request, context);
       },
       request: options.request,
+      requestSignal: getRequestContext().requestSignal ?? undefined,
       expireSeconds: options.expireSeconds,
       revalidateSeconds,
+      revalidateReason,
       routePattern: route.pattern,
       setHeadersAccessPhase,
     });

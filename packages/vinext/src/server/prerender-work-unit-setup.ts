@@ -1,6 +1,7 @@
 /**
- * Sets up the work unit async storage for prerendering.
+ * Sets up the work unit async storage for App Router rendering.
  *
+ * During ordinary Cache Components requests, wraps execution in a RequestStore.
  * During build prerendering and authenticated cacheability probes, wraps
  * execution in a PrerenderStore so dynamic APIs can suspend and the render
  * owner can interrupt the attempt without exposing catchable framework errors
@@ -8,14 +9,22 @@
  *
  * Used by: app-rsc-entry.ts handler template.
  *
- * TODO: If future dynamic APIs need request-scoped stores for normal (non-prerender)
- * requests, add a `{ type: "request" }` store during normal request handling.
  */
 import { workUnitAsyncStorage } from "vinext/shims/internal/work-unit-async-storage";
+import { runInWorkStoreScope } from "vinext/shims/internal/work-store-scope";
 import { isRouteCacheabilityProbe } from "vinext/shims/cacheability-classification";
 import { NO_STORE_CACHE_CONTROL } from "./cache-control.js";
 
 export function runWithPrerenderWorkUnit(
+  fn: () => Promise<Response>,
+  options?: { cacheComponents?: boolean; route?: string | (() => string) },
+): Promise<Response> {
+  // Like Next.js's work store, the scope covers App Router work and middleware.
+  // The Pages fallback leaves it.
+  return runInWorkStoreScope(() => runWithWorkUnit(fn, options));
+}
+
+function runWithWorkUnit(
   fn: () => Promise<Response>,
   options?: { cacheComponents?: boolean; route?: string | (() => string) },
 ): Promise<Response> {
@@ -24,6 +33,9 @@ export function runWithPrerenderWorkUnit(
       return workUnitAsyncStorage.run({ type: "prerender-legacy" }, fn);
     }
     return runWithPrerenderWorkUnitOwner(fn, options);
+  }
+  if (options?.cacheComponents === true) {
+    return workUnitAsyncStorage.run({ type: "request" }, fn);
   }
   return fn();
 }

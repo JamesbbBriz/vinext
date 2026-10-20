@@ -2,6 +2,7 @@
 
 import {
   handleRequestStageLocally,
+  isPagesClientBuildFileRequest,
   pagesRequestStageBuildId,
   pagesRequestStagePrerenderSecret,
   type PagesWorkerEnv,
@@ -20,6 +21,12 @@ import {
 } from "./headers.js";
 import { cloneRequestWithHeaders, cloneRequestWithUrl } from "./request-pipeline.js";
 import { validateCdnRequest } from "./cache-control.js";
+import { runWithExecutionContext, type ExecutionContextLike } from "vinext/shims/request-context";
+
+// @ts-expect-error -- virtual modules resolved by vinext at build time
+import { __ensureInstrumentation as ensureRequestStageInstrumentation } from "virtual:vinext-pages-request-entry";
+// @ts-expect-error -- virtual modules resolved by vinext at build time
+import { __ensureInstrumentation as ensureResponseStageInstrumentation } from "virtual:vinext-pages-response-entry";
 
 // @ts-expect-error -- virtual module resolved by vinext at build time
 import { registerConfiguredCacheAdapters } from "virtual:vinext-cache-adapters";
@@ -46,11 +53,24 @@ async function handleSingleStageRequest(
   );
   const readinessResponse = createWorkerPrerenderReadinessResponse(ctx, request);
   if (readinessResponse) {
+    if (readinessResponse.status === 204) {
+      await Promise.all([
+        ensureRequestStageInstrumentation(ctx),
+        ensureResponseStageInstrumentation(ctx),
+      ]);
+    }
     return (await validateCdnRequest(request)) ?? readinessResponse;
   }
 
+  // Client build files resolve no route, so they keep the ASSETS cache policy
+  // instead of passing through route cacheability admission.
+  const isClientBuildFile = isPagesClientBuildFileRequest(
+    request,
+    env,
+    ctx as PagesWorkerExecutionContext,
+  );
   let finalize: ((response: Response, context: typeof ctx) => Promise<Response>) | undefined;
-  if (request.headers.has(VINEXT_CACHEABILITY_PROBE_HEADER)) {
+  if (!isClientBuildFile && request.headers.has(VINEXT_CACHEABILITY_PROBE_HEADER)) {
     const cacheability = await import("./cacheability-request.js");
     const probeContext = cacheability.createWorkerCacheabilityContext(
       ctx,
@@ -72,7 +92,11 @@ async function handleSingleStageRequest(
   }
 
   const requiresCompletedResponseAdmission = adapter.requiresCompletedResponseAdmission === true;
-  if (!finalize && (__cacheabilityManifest || requiresCompletedResponseAdmission)) {
+  if (
+    !finalize &&
+    !isClientBuildFile &&
+    (__cacheabilityManifest || requiresCompletedResponseAdmission)
+  ) {
     const cacheability = await import("./cacheability-request.js");
     const admissionContext = cacheability.createWorkerCacheabilityAdmissionContext(
       ctx,
@@ -104,6 +128,9 @@ export default {
     env?: PagesWorkerEnv,
     ctx?: PagesWorkerExecutionContext,
   ): Promise<Response> {
-    return handleSingleStageRequest(request, env, ctx);
+    const handle = () => handleSingleStageRequest(request, env, ctx);
+    return ctx && typeof ctx.waitUntil === "function"
+      ? runWithExecutionContext(ctx as ExecutionContextLike, handle)
+      : handle();
   },
 };

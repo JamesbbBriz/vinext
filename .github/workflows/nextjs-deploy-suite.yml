@@ -35,6 +35,11 @@ on:
         required: false
         default: "2"
         type: string
+      backfill-date:
+        description: Optional historical date (YYYY-MM-DD) to reconstruct and publish from a full vinext commit SHA
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -53,11 +58,49 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.vinext-ref || github.ref }}
+          # Backfills retain the current workflow harness in the workspace and
+          # check out the historical vinext source separately below.
+          ref: ${{ inputs.backfill-date && github.sha || inputs.vinext-ref || github.ref }}
+
+      - name: Validate backfill inputs
+        if: inputs.backfill-date != ''
+        env:
+          BACKFILL_DATE: ${{ inputs.backfill-date }}
+          VINEXT_REF: ${{ inputs.vinext-ref }}
+        run: |
+          node <<'EOF'
+          const { BACKFILL_DATE, VINEXT_REF } = process.env
+          const createdAt = Date.parse(`${BACKFILL_DATE}T02:00:00Z`)
+          if (!/^[0-9a-f]{40}$/i.test(VINEXT_REF || '')) {
+            throw new Error('Backfills require a full 40-character vinext commit SHA')
+          }
+          if (
+            !/^\d{4}-\d{2}-\d{2}$/.test(BACKFILL_DATE || '') ||
+            !Number.isFinite(createdAt) ||
+            new Date(createdAt).toISOString() !== `${BACKFILL_DATE}T02:00:00.000Z` ||
+            createdAt > Date.now()
+          ) {
+            throw new Error('backfill-date must be a valid past YYYY-MM-DD date')
+          }
+          EOF
+
+      - name: Checkout historical vinext
+        if: inputs.backfill-date != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.vinext-ref }}
+          path: historical-vinext
 
       - uses: ./.github/actions/setup
         with:
-          node-version: "24"
+          node-version: ${{ inputs.backfill-date && '22' || '24' }}
+          run-install: ${{ inputs.backfill-date == '' }}
+
+      - name: Install historical vinext
+        if: inputs.backfill-date != ''
+        working-directory: historical-vinext
+        run: vp install --frozen-lockfile
 
       - name: Enable pnpm shim for Next.js scripts
         run: corepack enable pnpm
@@ -88,7 +131,13 @@ jobs:
           mode: restore
 
       - name: Build vinext
+        if: inputs.backfill-date == ''
         run: vp run vinext#build
+
+      - name: Build historical vinext
+        if: inputs.backfill-date != ''
+        working-directory: historical-vinext
+        run: corepack pnpm build
 
       - name: Prepare Next.js checkout
         timeout-minutes: 15
@@ -98,6 +147,9 @@ jobs:
           VINEXT_BUILD: "0"
           NEXTJS_PREPARE: "1"
           NEXTJS_PREPARE_ONLY: "1"
+          # The React-dependent test expectation updates follow the React
+          # installed in the vinext tree under test, including backfills.
+          VINEXT_DIR: ${{ inputs.backfill-date && format('{0}/historical-vinext', github.workspace) || github.workspace }}
           # The Next.js workspace pulls `playwright-chromium` as a transitive
           # dep, whose postinstall downloads Chrome via the Playwright CDN.
           # Since 2026-05-22 that postinstall has wedged on this runner after
@@ -199,7 +251,7 @@ jobs:
       # be re-submitted manually (e.g. if the live POST hiccupped) or
       # inspected when debugging misclassifications.
       - name: Upload suite router classification
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nextjs-suite-routers
           path: |
@@ -287,8 +339,11 @@ jobs:
           __NEXT_TEST_MODE: e2e
           NEXT_E2E_TEST_TIMEOUT: "240000"
           NEXT_EXTERNAL_TESTS_FILTERS: ${{ github.workspace }}/nextjs-deploy-manifest.json
-          VINEXT_DIR: ${{ github.workspace }}
-          ADAPTER_DIR: ${{ github.workspace }}
+          VINEXT_DIR: ${{ inputs.backfill-date && format('{0}/historical-vinext', github.workspace) || github.workspace }}
+          ADAPTER_DIR: ${{ inputs.backfill-date && format('{0}/historical-vinext', github.workspace) || github.workspace }}
+          VINEXT_HARNESS_DIR: ${{ github.workspace }}
+          VINEXT_DEPLOY_DEBUG_DIR: ${{ github.workspace }}/reports/nextjs-deploy-debug
+          VINEXT_FALLBACK_BUILD_ID: ${{ inputs.backfill-date && inputs.vinext-ref || '' }}
           # Required by the Next.js deploy test manifest — tests are keyed to
           # the turbopack variant, so this must be set even though vinext uses Vite.
           IS_TURBOPACK_TEST: "1"
@@ -303,7 +358,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-results-${{ strategy.job-index }}
           path: next.js/test/**/*.results.json
@@ -312,10 +367,12 @@ jobs:
 
       - name: Upload deploy debug logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: deploy-debug-${{ strategy.job-index }}
           path: reports/nextjs-deploy-debug/
+          # e2e-deploy.sh and e2e-cleanup.sh preserve .vinext-deploy-*.log files.
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
 
@@ -327,7 +384,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Download all test results
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: test-results-*
           path: results
@@ -345,6 +402,7 @@ jobs:
           VINEXT_REF: ${{ inputs.vinext-ref || github.ref }}
           NEXT_REF: ${{ inputs.next-ref || 'v16.2.6' }}
           SUITE_FILTER: ${{ inputs.suite-filter || 'all' }}
+          BACKFILL_DATE: ${{ inputs.backfill-date }}
         with:
           script: |
             const fs = require('node:fs');
@@ -381,6 +439,10 @@ jobs:
             // joins it onto each result row at query time. See the
             // "Submit suite classification" step earlier in this workflow.
             const fileCounts = new Map();
+            const backfillDate = process.env.BACKFILL_DATE;
+            const backfillCreatedAt = backfillDate
+              ? Date.parse(`${backfillDate}T02:00:00Z`)
+              : undefined;
             function bumpFile(suite, key) {
               let cur = fileCounts.get(suite);
               if (!cur) {
@@ -453,10 +515,13 @@ jobs:
               JSON.stringify(
                 {
                   kind: 'deploy',
-                  runKey: String(context.runId),
+                  runKey: backfillDate
+                    ? `backfill:${backfillDate}:${process.env.VINEXT_REF}`
+                    : String(context.runId),
                   vinextRef: process.env.VINEXT_REF,
                   nextRef: process.env.NEXT_REF,
-                  commitSha: context.sha,
+                  commitSha: backfillDate ? process.env.VINEXT_REF : context.sha,
+                  ...(backfillCreatedAt === undefined ? {} : { createdAt: backfillCreatedAt }),
                   files: Array.from(fileCounts.values()),
                 },
                 null,
@@ -528,7 +593,7 @@ jobs:
 
       - name: Upload report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: deploy-suite-report
           # Include both files: the human-readable report and the
@@ -559,6 +624,9 @@ jobs:
       #   - Only when testing the Next.js version used by the scheduled run.
       #     Manual runs against other refs are useful for investigation but
       #     should not replace the scheduled compatibility snapshot.
+      #   - Historical backfills are an explicit manual exception. They must
+      #     supply a full SHA and valid past date; the build job validates both,
+      #     while this main-ref gate lets PR branches exercise a dry run safely.
       - name: Submit results to /compatibility ingest
         if: |
           always()
@@ -568,6 +636,7 @@ jobs:
           && (
             (github.event_name == 'schedule' && github.ref == 'refs/heads/main')
             || (github.event_name == 'workflow_dispatch' && (inputs.vinext-ref == 'main' || inputs.vinext-ref == ''))
+            || (github.event_name == 'workflow_dispatch' && inputs.backfill-date != '' && github.ref == 'refs/heads/main')
           )
           && hashFiles('report/compat-ingest.json') != ''
         env:

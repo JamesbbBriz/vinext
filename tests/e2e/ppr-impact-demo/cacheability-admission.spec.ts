@@ -1,7 +1,8 @@
 import { expect, test, type APIResponse } from "@playwright/test";
 
-function expectGatewayCachePolicy(response: APIResponse): void {
-  expect(response.headers()["cache-control"]).toContain("must-revalidate");
+function expectGatewayCachePolicy(response: APIResponse, browserPolicy = "must-revalidate"): void {
+  expect(response.headers()["cache-control"]).toContain(browserPolicy);
+  expect(response.headers()["cache-control"]).not.toContain("no-store");
   expect(response.headers()["cdn-cache-control"]).toBeUndefined();
   expect(response.headers()["cloudflare-cdn-cache-control"]).toBeUndefined();
 }
@@ -47,15 +48,6 @@ test("admits pattern-backed App responses only after each clean EOF", async ({ r
   expect(runtimeCheck.status()).toBe(200);
   expectGatewayCachePolicy(runtimeCheck);
 
-  const lateCookie = await request.get("/cacheability/static?late-policy=set-cookie", {
-    headers: { Accept: "text/html" },
-  });
-  expect(lateCookie.status()).toBe(200);
-  expect(lateCookie.headers()["set-cookie"]).toContain("late-config=cookie");
-  expect(lateCookie.headers()["cache-control"]).toContain("no-store");
-  expect(lateCookie.headers()["cdn-cache-control"]).toBeUndefined();
-  expect(lateCookie.headers()["cloudflare-cdn-cache-control"]).toBeUndefined();
-
   for (const policy of ["cache-control", "cdn-cache-control", "cloudflare-cdn-cache-control"]) {
     const latePrivatePolicy = await request.get(`/cacheability/static?late-policy=${policy}`, {
       headers: { Accept: "text/html" },
@@ -83,7 +75,7 @@ test("admits pattern-backed App responses only after each clean EOF", async ({ r
     headers: { Accept: "text/html" },
   });
   expect(configPublicDynamic.status()).toBe(200);
-  expectGatewayCachePolicy(configPublicDynamic);
+  expectGatewayCachePolicy(configPublicDynamic, "s-maxage=32");
 
   const configPrivateDynamic = await request.get("/cacheability/config-public-dynamic?preview=1", {
     headers: { Accept: "text/html" },
@@ -103,14 +95,14 @@ test("admits pattern-backed App responses only after each clean EOF", async ({ r
     headers: { Accept: "text/html" },
   });
   expect(publicConfigPattern.status()).toBe(200);
-  expectGatewayCachePolicy(publicConfigPattern);
+  expectGatewayCachePolicy(publicConfigPattern, "s-maxage=33");
 
   const publicConfigRepresentation = await request.get(
     "/cacheability/config-public-representation",
     { headers: { Accept: "text/html" } },
   );
   expect(publicConfigRepresentation.status()).toBe(200);
-  expectGatewayCachePolicy(publicConfigRepresentation);
+  expectGatewayCachePolicy(publicConfigRepresentation, "s-maxage=34");
 
   const privateConfigRepresentation = await request.get(
     "/cacheability/config-public-representation?_rsc",
@@ -234,12 +226,26 @@ test("admits pattern-backed App responses only after each clean EOF", async ({ r
 
   // Next.js does not statically generate a GET+POST Route Handler, so this
   // route is intentionally absent from the probe manifest. Its handler-owned
-  // public policy still opts the completed response into runtime admission.
+  // public policy remains a browser header; it does not grant shared admission.
   const explicitMixedRouteHandler = await request.get("/cacheability/route-handler-mixed-explicit");
   await expect(explicitMixedRouteHandler.json()).resolves.toEqual({
     kind: "explicit-mixed-route-handler",
   });
-  expectGatewayCachePolicy(explicitMixedRouteHandler);
+  expectGatewayCachePolicy(explicitMixedRouteHandler, "public, s-maxage=60");
+
+  // Next.js compiles metadata files into Route Handlers. Static metadata may
+  // be stored, while its authored browser policy remains independent.
+  const explicitMetadataRoute = await request.get(
+    "/cacheability/metadata-route-explicit/london/opengraph-image",
+  );
+  expect(explicitMetadataRoute.status()).toBe(200);
+  expect(explicitMetadataRoute.headers()["content-type"]).toBe("image/png");
+  expect(await explicitMetadataRoute.text()).toBe("metadata-image");
+  // Its explicitly authored policy survives Workers Cache admission.
+  expectGatewayCachePolicy(
+    explicitMetadataRoute,
+    "public, immutable, no-transform, max-age=31536000",
+  );
 
   // `revalidate` alone is framework policy, not an explicit response-level
   // opt-in, and must not bypass the route's manifest absence.
@@ -266,12 +272,26 @@ test("admits pattern-backed App responses only after each clean EOF", async ({ r
   await expect(explicitDynamicRouteHandler.json()).resolves.toEqual({
     value: "explicitly-public",
   });
-  expectGatewayCachePolicy(explicitDynamicRouteHandler);
+  expectGatewayCachePolicy(explicitDynamicRouteHandler, "public, s-maxage=60");
 
+  // The embedded manifest selected this candidate for completed admission.
+  // vinext retains its 500-on-failed-EOF contract even though runtime storage
+  // is denied; Next 16.2.7 aborts the dynamic response connection instead.
   const lateConfigPublicFailure = await request.get(
     "/cacheability/route-handler-config-public-late-error",
   );
   expect(lateConfigPublicFailure.status()).toBe(500);
   expect(lateConfigPublicFailure.headers()["cache-control"]).toContain("no-store");
   expect(lateConfigPublicFailure.headers()["cdn-cache-control"]).toBeUndefined();
+
+  // Keep this last: APIRequestContext retains response cookies, and credentialed
+  // requests intentionally bypass shared response admission.
+  const lateCookie = await request.get("/cacheability/static?late-policy=set-cookie", {
+    headers: { Accept: "text/html" },
+  });
+  expect(lateCookie.status()).toBe(200);
+  expect(lateCookie.headers()["set-cookie"]).toContain("late-config=cookie");
+  expect(lateCookie.headers()["cache-control"]).toContain("no-store");
+  expect(lateCookie.headers()["cdn-cache-control"]).toBeUndefined();
+  expect(lateCookie.headers()["cloudflare-cdn-cache-control"]).toBeUndefined();
 });

@@ -5,7 +5,8 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { createBuilder } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
-import { cdnAdapter } from "../packages/cloudflare/src/cache/cdn-adapter.js";
+import { workersCacheCdnAdapter } from "../packages/cloudflare/src/cache/workers-cache-cdn-adapter.js";
+import { VINEXT_BUILD_LIFECYCLE_CONFIG } from "../packages/vinext/src/build/lifecycle.js";
 import vinext from "../packages/vinext/src/index.js";
 
 const CLOUDFLARE_NODE_MODULES = path.resolve(
@@ -17,8 +18,37 @@ const CLOUDFLARE_PLUGIN_PATH = path.join(
   "@cloudflare/vite-plugin/dist/index.mjs",
 );
 
+type ManifestChunk = { file: string; imports?: string[]; src?: string };
+
+async function readManifest(serverDir: string): Promise<Record<string, ManifestChunk>> {
+  return JSON.parse(await fs.readFile(path.join(serverDir, ".vite/manifest.json"), "utf8"));
+}
+
+async function readStaticClosure(
+  serverDir: string,
+  manifest: Record<string, ManifestChunk>,
+  entry: ManifestChunk,
+): Promise<string> {
+  const pending = [entry];
+  const seen = new Set<string>();
+  let source = "";
+  while (pending.length > 0) {
+    const chunk = pending.pop()!;
+    if (seen.has(chunk.file)) continue;
+    seen.add(chunk.file);
+    source += await fs.readFile(path.join(serverDir, chunk.file), "utf8");
+    for (const imported of chunk.imports ?? []) {
+      const importedChunk = manifest[imported];
+      if (!importedChunk) throw new Error(`missing manifest chunk ${imported}`);
+      pending.push(importedChunk);
+    }
+  }
+  return source;
+}
+
 describe("Cloudflare CDN adapter build output", () => {
   let root: string;
+  let buildCompleted = false;
 
   beforeAll(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-cdn-adapter-build-"));
@@ -62,15 +92,24 @@ describe("Cloudflare CDN adapter build output", () => {
       configFile: false,
       logLevel: "silent",
       plugins: [
-        vinext({ appDir: root, cache: { cdn: cdnAdapter() } }),
+        vinext({ appDir: root, cache: { cdn: workersCacheCdnAdapter() } }),
         cloudflare({ viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] } }),
       ],
-    });
+      [VINEXT_BUILD_LIFECYCLE_CONFIG]: {
+        onComplete() {
+          buildCompleted = true;
+        },
+      },
+    } as Parameters<typeof createBuilder>[0]);
     await builder.buildApp();
   }, 120_000);
 
   afterAll(async () => {
     await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it("reports lifecycle completion without prerendering before deploy policy is known", () => {
+    expect(buildCompleted).toBe(true);
   });
 
   it("makes the emitted Wrangler config directly deployable without changing source config", async () => {
@@ -83,31 +122,20 @@ describe("Cloudflare CDN adapter build output", () => {
     expect(generated.version_metadata).toEqual({ binding: "CF_VERSION_METADATA" });
   });
 
+  it("registers the native Workers tracing integration in the Worker entry", async () => {
+    const serverDir = path.join(root, "dist/server");
+    const manifest = await readManifest(serverDir);
+    const workerEntry = Object.values(manifest).find((chunk) => chunk.file === "index.js");
+    expect(workerEntry).toBeDefined();
+    const workerClosure = await readStaticClosure(serverDir, manifest, workerEntry!);
+    expect(workerClosure).toContain("cloudflare-workers");
+    expect(workerClosure).toContain("enterSpan");
+  });
+
   it("emits the pregenerated-paths sidecar only in the response-stage closure", async () => {
     const sidecarName = "__vinext_pregenerated_concrete_paths.js";
     const serverDir = path.join(root, "dist/server");
-    type ManifestChunk = { file: string; imports?: string[]; src?: string };
-    const manifest = JSON.parse(
-      await fs.readFile(path.join(serverDir, ".vite/manifest.json"), "utf8"),
-    ) as Record<string, ManifestChunk>;
-
-    const readStaticClosure = async (entry: ManifestChunk): Promise<string[]> => {
-      const pending = [entry];
-      const seen = new Set<string>();
-      const sources: string[] = [];
-      while (pending.length > 0) {
-        const chunk = pending.pop()!;
-        if (seen.has(chunk.file)) continue;
-        seen.add(chunk.file);
-        sources.push(await fs.readFile(path.join(serverDir, chunk.file), "utf8"));
-        for (const imported of chunk.imports ?? []) {
-          const importedChunk = manifest[imported];
-          if (!importedChunk) throw new Error(`missing manifest chunk ${imported}`);
-          pending.push(importedChunk);
-        }
-      }
-      return sources;
-    };
+    const manifest = await readManifest(serverDir);
 
     const workerEntry = Object.values(manifest).find((chunk) => chunk.file === "index.js");
     const responseStageEntry = Object.values(manifest).find((chunk) =>
@@ -117,11 +145,11 @@ describe("Cloudflare CDN adapter build output", () => {
     expect(responseStageEntry).toBeDefined();
 
     const sidecarImport = /import\s*["']\.\/__vinext_pregenerated_concrete_paths\.js["']/;
+    expect(sidecarImport.test(await readStaticClosure(serverDir, manifest, workerEntry!))).toBe(
+      false,
+    );
     expect(
-      (await readStaticClosure(workerEntry!)).some((source) => sidecarImport.test(source)),
-    ).toBe(false);
-    expect(
-      (await readStaticClosure(responseStageEntry!)).some((source) => sidecarImport.test(source)),
+      sidecarImport.test(await readStaticClosure(serverDir, manifest, responseStageEntry!)),
     ).toBe(true);
     expect(await fs.readFile(path.join(root, "dist/server", sidecarName), "utf8")).toBe(
       "delete globalThis.__VINEXT_PREGENERATED_CONCRETE_PATHS;\n",
@@ -191,7 +219,10 @@ describe("Cloudflare CDN adapter build output", () => {
         root: pagesRoot,
         configFile: false,
         logLevel: "silent",
-        plugins: [vinext({ appDir: pagesRoot, cache: { cdn: cdnAdapter() } }), cloudflare()],
+        plugins: [
+          vinext({ appDir: pagesRoot, cache: { cdn: workersCacheCdnAdapter() } }),
+          cloudflare(),
+        ],
       });
       await builder.buildApp();
 
@@ -201,6 +232,17 @@ describe("Cloudflare CDN adapter build output", () => {
       const generatedPath = path.resolve(pagesRoot, ".wrangler/deploy", redirect.configPath);
       const generated = JSON.parse(await fs.readFile(generatedPath, "utf8"));
       expect(generated.version_metadata).toEqual({ binding: "CF_VERSION_METADATA" });
+      const serverDir = path.dirname(generatedPath);
+      const manifest = await readManifest(serverDir);
+      const workerEntry = Object.values(manifest).find((chunk) => chunk.file === "index.js");
+      expect(workerEntry).toBeDefined();
+      const workerClosure = await readStaticClosure(serverDir, manifest, workerEntry!);
+      expect(workerClosure).toContain("cloudflare-workers");
+      expect(workerClosure).toContain("enterSpan");
+      const buildId = await fs.readFile(path.join(pagesRoot, "dist/server/BUILD_ID"), "utf8");
+      await expect(
+        fs.stat(path.join(pagesRoot, "dist/client/_next/static", buildId)),
+      ).resolves.toBeDefined();
       await expect(
         fs.readFile(path.join(pagesRoot, "dist/server/__vinext_pregenerated_concrete_paths.js")),
       ).rejects.toMatchObject({ code: "ENOENT" });

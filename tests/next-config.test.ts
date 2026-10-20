@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, vi, beforeEach } from "vite-plus/test"
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import {
   detectNextIntlConfig,
@@ -51,6 +52,85 @@ describe("invalid config files", () => {
     );
 
     await expect(loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD)).rejects.toThrow();
+  });
+});
+
+describe("Next package identity for config wrappers", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(path.join(tmpDir, "package.json"), JSON.stringify({ type: "module" }));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("exposes the vinext compatibility version while loading config without next", async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.mjs"),
+      `import fs from "node:fs";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const nextPackage = JSON.parse(fs.readFileSync(require.resolve("next/package.json"), "utf8"));
+export default {
+  env: { NEXT_PACKAGE_NAME: nextPackage.name, NEXT_PACKAGE_VERSION: nextPackage.version },
+  experimental: Number(nextPackage.version.split(".")[0]) >= 15
+    ? { clientTraceMetadata: ["baggage", "sentry-trace"] }
+    : {},
+};
+`,
+    );
+
+    const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
+
+    expect(config?.env).toEqual({
+      NEXT_PACKAGE_NAME: "next",
+      NEXT_PACKAGE_VERSION: "16.2.7",
+    });
+    expect(config?.experimental?.clientTraceMetadata).toEqual(["baggage", "sentry-trace"]);
+  });
+
+  it("prefers an installed Next package", async () => {
+    const nextDir = path.join(tmpDir, "node_modules", "next");
+    fs.mkdirSync(nextDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(nextDir, "package.json"),
+      JSON.stringify({ name: "next", version: "15.4.2" }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.mjs"),
+      `import fs from "node:fs";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const nextPackage = JSON.parse(fs.readFileSync(require.resolve("next/package.json"), "utf8"));
+export default { env: { NEXT_PACKAGE_VERSION: nextPackage.version } };
+`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+
+    expect(config?.env?.NEXT_PACKAGE_VERSION).toBe("15.4.2");
+  });
+
+  it("does not expose the fallback outside config evaluation", async () => {
+    fs.writeFileSync(path.join(tmpDir, "next.config.mjs"), "export default {};\n");
+    await loadNextConfig(tmpDir);
+
+    const require = createRequire(path.join(tmpDir, "package.json"));
+    expect(() => require.resolve("next/package.json")).toThrow();
+  });
+
+  it("tracks the repository's Next compatibility target", () => {
+    const installedNext = JSON.parse(
+      fs.readFileSync(createRequire(import.meta.url).resolve("next/package.json"), "utf8"),
+    ) as { version: string };
+    const vinextIdentity = JSON.parse(
+      fs.readFileSync(new URL("../packages/vinext/next-package.json", import.meta.url), "utf8"),
+    ) as { version: string };
+
+    expect(vinextIdentity.version).toBe(installedNext.version);
   });
 });
 
@@ -114,6 +194,60 @@ describe("deprecated config warnings", () => {
         "`skipMiddlewareUrlNormalize` is deprecated. Please use `skipProxyUrlNormalize` instead in next.config.mjs.",
         "`experimental.instrumentationHook` is no longer needed, because `instrumentation.js` is available by default. You can remove it from next.config.mjs.",
       ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves skipTrailingSlashRedirect", async () => {
+    await expect(resolveNextConfig({})).resolves.toMatchObject({
+      skipTrailingSlashRedirect: false,
+    });
+    await expect(resolveNextConfig(null)).resolves.toMatchObject({
+      skipTrailingSlashRedirect: false,
+    });
+    await expect(resolveNextConfig({ skipTrailingSlashRedirect: true })).resolves.toMatchObject({
+      skipTrailingSlashRedirect: true,
+    });
+  });
+
+  it("moves the legacy experimental.skipTrailingSlashRedirect over the top-level key", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(
+      resolveNextConfig({
+        skipTrailingSlashRedirect: false,
+        experimental: { skipTrailingSlashRedirect: true },
+      }),
+    ).resolves.toMatchObject({ skipTrailingSlashRedirect: true });
+
+    expect(warn.mock.calls.map(([message]) => message)).toEqual([
+      "`experimental.skipTrailingSlashRedirect` has been moved to `skipTrailingSlashRedirect`. Please update your next.config.js file accordingly.",
+    ]);
+  });
+
+  it("keeps the top-level skipTrailingSlashRedirect when the legacy key is nullish", async () => {
+    // A config file name no other test warns for, so warn-once cannot hide a warning.
+    const root = makeTempDir();
+    fs.writeFileSync(path.join(root, "next.config.ts"), "export default {}\n");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      // Next.js drops undefined/null nested config values before moving the
+      // legacy key (assignDefaults in packages/next/src/server/config.ts).
+      for (const legacy of [undefined, null]) {
+        await expect(
+          resolveNextConfig(
+            {
+              skipTrailingSlashRedirect: true,
+              experimental: { skipTrailingSlashRedirect: legacy } as never,
+            },
+            root,
+          ),
+        ).resolves.toMatchObject({ skipTrailingSlashRedirect: true });
+      }
+
+      expect(warn).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -311,6 +445,59 @@ describe("loadNextConfig phase argument", () => {
 
     const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
     expect(config?.env?.STATIC).toBe("yes");
+  });
+});
+
+describe("loadNextConfig function-form defaultConfig argument", () => {
+  // Ported from Next.js: test/e2e/custom-page-extension/next.config.js
+  //   https://github.com/vercel/next.js/blob/canary/test/e2e/custom-page-extension/next.config.js
+  let tmpDir: string;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (tmpDir) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("passes the real pageExtensions default, not an empty object, to a CJS function-form config", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.js"),
+      `module.exports = (phase, { defaultConfig }) => ({\n` +
+        `  pageExtensions: [...defaultConfig.pageExtensions, "page.js"],\n` +
+        `});\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
+    expect(config?.pageExtensions).toEqual(["tsx", "ts", "jsx", "js", "page.js"]);
+  });
+
+  it("passes the real pageExtensions default to a function-form next.config.ts", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `export default (phase: string, { defaultConfig }: { defaultConfig: { pageExtensions?: string[] } }) => ({\n` +
+        `  pageExtensions: [...(defaultConfig.pageExtensions ?? []), "page.ts"],\n` +
+        `});\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
+    expect(config?.pageExtensions).toEqual(["tsx", "ts", "jsx", "js", "page.ts"]);
+  });
+
+  it("passes the real compress default to a function-form config", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.js"),
+      `module.exports = (phase, { defaultConfig }) => ({\n` +
+        `  compress: defaultConfig.compress && false,\n` +
+        `});\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
+    expect(config?.compress).toBe(false);
+    expect((await resolveNextConfig(config)).compress).toBe(false);
   });
 });
 
@@ -1193,6 +1380,244 @@ module.exports = withPlugin({ basePath: "/wrapped" });`,
     expect(config.aliases["wrapped/config"]).toBe(canonical(tmpDir, "config/request.ts"));
   });
 
+  it("evaluates wrapped configs from the configured project root", async () => {
+    tmpDir = makeTempDir();
+    fs.mkdirSync(path.join(tmpDir, "app", "products"), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, "node_modules", "fake-manifest-wrapper"), {
+      recursive: true,
+    });
+    fs.writeFileSync(path.join(tmpDir, "app", "products", "page.tsx"), "export default null;\n");
+    fs.writeFileSync(
+      path.join(tmpDir, "node_modules", "fake-manifest-wrapper", "index.js"),
+      `const fs = require("node:fs");
+module.exports = function withManifest(config = {}) {
+  const manifest = JSON.stringify({ hasProducts: fs.existsSync("app/products/page.tsx") });
+  return {
+    ...config,
+    webpack(webpackConfig, options) {
+      if (!options.isServer) {
+        webpackConfig.module.rules.push({
+          use: {
+            loader: "/framework/valueInjectionLoader.js",
+            options: { values: { _sentryRouteManifest: manifest } },
+          },
+        });
+      }
+      return webpackConfig;
+    },
+  };
+};
+`,
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "node_modules", "fake-manifest-wrapper", "package.json"),
+      JSON.stringify({ name: "fake-manifest-wrapper", version: "1.0.0", main: "index.js" }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.js"),
+      'module.exports = require("fake-manifest-wrapper")({});\n',
+    );
+
+    const rawConfig = await loadNextConfig(tmpDir);
+    const config = await resolveNextConfig(rawConfig, tmpDir);
+
+    expect(JSON.parse(config.instrumentationClientRouteManifest!)).toEqual({
+      hasProducts: true,
+    });
+  });
+
+  it("serializes project roots across concurrent async config loads", async () => {
+    const originalCwd = process.cwd();
+    const firstRoot = makeTempDir();
+    const secondRoot = makeTempDir();
+    tmpDir = firstRoot;
+
+    for (const [root, delay] of [
+      [firstRoot, 20],
+      [secondRoot, 0],
+    ] as const) {
+      fs.writeFileSync(
+        path.join(root, "next.config.mjs"),
+        `export default async () => {
+  await new Promise(resolve => setTimeout(resolve, ${delay}));
+  return { assetPrefix: process.cwd() };
+};
+`,
+      );
+    }
+
+    try {
+      const [first, second] = await Promise.all([
+        loadNextConfig(firstRoot),
+        loadNextConfig(secondRoot),
+      ]);
+
+      expect(first?.assetPrefix).toBe(fs.realpathSync(firstRoot));
+      expect(second?.assetPrefix).toBe(fs.realpathSync(secondRoot));
+      expect(process.cwd()).toBe(originalCwd);
+    } finally {
+      fs.rmSync(secondRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes sibling config loads nested by a wrapper", async () => {
+    const originalCwd = process.cwd();
+    const outerRoot = makeTempDir();
+    const firstRoot = makeTempDir();
+    const secondRoot = makeTempDir();
+    tmpDir = outerRoot;
+    const processWithConfigLoader = process as NodeJS.Process & {
+      __vinextTestLoadNextConfig?: typeof loadNextConfig;
+    };
+    processWithConfigLoader.__vinextTestLoadNextConfig = loadNextConfig;
+
+    for (const [root, delay] of [
+      [firstRoot, 0],
+      [secondRoot, 20],
+    ] as const) {
+      fs.writeFileSync(
+        path.join(root, "next.config.mjs"),
+        `export default async () => {
+  await new Promise(resolve => setTimeout(resolve, ${delay}));
+  return { assetPrefix: process.cwd() };
+};
+`,
+      );
+    }
+    fs.writeFileSync(
+      path.join(outerRoot, "next.config.mjs"),
+      `export default async () => {
+  const [first, second] = await Promise.all([
+    process.__vinextTestLoadNextConfig(${JSON.stringify(firstRoot)}),
+    process.__vinextTestLoadNextConfig(${JSON.stringify(secondRoot)}),
+  ]);
+  return { env: { first: first.assetPrefix, second: second.assetPrefix, outer: process.cwd() } };
+};
+`,
+    );
+
+    try {
+      const config = await loadNextConfig(outerRoot);
+
+      expect(config?.env).toEqual({
+        first: fs.realpathSync(firstRoot),
+        second: fs.realpathSync(secondRoot),
+        outer: fs.realpathSync(outerRoot),
+      });
+      expect(process.cwd()).toBe(originalCwd);
+    } finally {
+      delete processWithConfigLoader.__vinextTestLoadNextConfig;
+      fs.rmSync(firstRoot, { recursive: true, force: true });
+      fs.rmSync(secondRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("requeues an escaped config load after its wrapper completes", async () => {
+    const originalCwd = process.cwd();
+    const outerRoot = makeTempDir();
+    const competingRoot = makeTempDir();
+    const escapedRoot = makeTempDir();
+    tmpDir = outerRoot;
+    const processWithEscapedLoad = process as NodeJS.Process & {
+      __vinextEscapedConfigLoad?: Promise<{ assetPrefix?: string } | null>;
+      __vinextTestLoadNextConfig?: typeof loadNextConfig;
+    };
+    processWithEscapedLoad.__vinextTestLoadNextConfig = loadNextConfig;
+
+    fs.writeFileSync(
+      path.join(outerRoot, "next.config.mjs"),
+      `export default () => {
+  process.__vinextEscapedConfigLoad = new Promise((resolve, reject) => {
+    setTimeout(() => process.__vinextTestLoadNextConfig(${JSON.stringify(escapedRoot)}).then(resolve, reject), 20);
+  });
+  return { assetPrefix: process.cwd() };
+};
+`,
+    );
+    for (const [root, delay] of [
+      [competingRoot, 50],
+      [escapedRoot, 0],
+    ] as const) {
+      fs.writeFileSync(
+        path.join(root, "next.config.mjs"),
+        `export default async () => {
+  await new Promise(resolve => setTimeout(resolve, ${delay}));
+  return { assetPrefix: process.cwd() };
+};
+`,
+      );
+    }
+
+    try {
+      const outer = await loadNextConfig(outerRoot);
+      const competingPromise = loadNextConfig(competingRoot);
+      const escapedPromise = processWithEscapedLoad.__vinextEscapedConfigLoad!;
+      const [competing, escaped] = await Promise.all([competingPromise, escapedPromise]);
+
+      expect(outer?.assetPrefix).toBe(fs.realpathSync(outerRoot));
+      expect(competing?.assetPrefix).toBe(fs.realpathSync(competingRoot));
+      expect(escaped?.assetPrefix).toBe(fs.realpathSync(escapedRoot));
+      expect(process.cwd()).toBe(originalCwd);
+    } finally {
+      delete processWithEscapedLoad.__vinextEscapedConfigLoad;
+      delete processWithEscapedLoad.__vinextTestLoadNextConfig;
+      fs.rmSync(competingRoot, { recursive: true, force: true });
+      fs.rmSync(escapedRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("drains unawaited nested config loads before releasing the root", async () => {
+    const originalCwd = process.cwd();
+    const outerRoot = makeTempDir();
+    const escapedRoot = makeTempDir();
+    const competingRoot = makeTempDir();
+    tmpDir = outerRoot;
+    const processWithEscapedLoad = process as NodeJS.Process & {
+      __vinextEscapedConfigLoad?: Promise<{ assetPrefix?: string } | null>;
+      __vinextTestLoadNextConfig?: typeof loadNextConfig;
+    };
+    processWithEscapedLoad.__vinextTestLoadNextConfig = loadNextConfig;
+
+    fs.writeFileSync(
+      path.join(outerRoot, "next.config.mjs"),
+      `export default () => {
+  process.__vinextEscapedConfigLoad = process.__vinextTestLoadNextConfig(${JSON.stringify(escapedRoot)});
+  return { assetPrefix: process.cwd() };
+};
+`,
+    );
+    for (const [root, delay] of [
+      [escapedRoot, 50],
+      [competingRoot, 0],
+    ] as const) {
+      fs.writeFileSync(
+        path.join(root, "next.config.mjs"),
+        `export default async () => {
+  await new Promise(resolve => setTimeout(resolve, ${delay}));
+  return { assetPrefix: process.cwd() };
+};
+`,
+      );
+    }
+
+    try {
+      const outer = await loadNextConfig(outerRoot);
+      const competingPromise = loadNextConfig(competingRoot);
+      const escapedPromise = processWithEscapedLoad.__vinextEscapedConfigLoad!;
+      const [competing, escaped] = await Promise.all([competingPromise, escapedPromise]);
+
+      expect(outer?.assetPrefix).toBe(fs.realpathSync(outerRoot));
+      expect(escaped?.assetPrefix).toBe(fs.realpathSync(escapedRoot));
+      expect(competing?.assetPrefix).toBe(fs.realpathSync(competingRoot));
+      expect(process.cwd()).toBe(originalCwd);
+    } finally {
+      delete processWithEscapedLoad.__vinextEscapedConfigLoad;
+      delete processWithEscapedLoad.__vinextTestLoadNextConfig;
+      fs.rmSync(escapedRoot, { recursive: true, force: true });
+      fs.rmSync(competingRoot, { recursive: true, force: true });
+    }
+  });
+
   it("captures turbopack aliases from wrapped config plugins", async () => {
     tmpDir = makeTempDir();
     fs.writeFileSync(
@@ -1443,6 +1868,108 @@ module.exports = withPlugin({ basePath: "/wrapped" });`,
     expect(config.aliases["wrapped/config"]).toBe(canonical(tmpDir, "config/request.ts"));
     expect(config.mdx?.remarkPlugins).toEqual([fakeRemarkPlugin]);
   });
+
+  it("preserves an instrumentation-client route manifest from a wrapped webpack config", async () => {
+    tmpDir = makeTempDir();
+    const manifest = JSON.stringify({
+      staticRoutes: ["/docs"],
+      dynamicRoutes: ["/docs/:slug", "/docs/:path*"],
+      isrRoutes: ["/docs/isr"],
+      excludedRoutes: ["/docs/private"],
+      basePath: "/base",
+    });
+
+    const config = await resolveNextConfig(
+      {
+        webpack: (webpackConfig: any, options: any) => {
+          if (!options.isServer) {
+            webpackConfig.module.rules.push({
+              use: [
+                {
+                  loader: "/framework/valueInjectionLoader.js",
+                  options: { values: { _sentryRouteManifest: manifest } },
+                },
+              ],
+            });
+          }
+          return webpackConfig;
+        },
+      },
+      tmpDir,
+    );
+
+    expect(config.instrumentationClientRouteManifest).toBe(manifest);
+  });
+
+  it("preserves generic server value injections targeting instrumentation.ts", async () => {
+    const config = await resolveNextConfig({
+      webpack: (webpackConfig: any, options: any) => {
+        webpackConfig.module.rules.push({
+          rules: [
+            {
+              test: options.isServer ? /(src[\\/])?instrumentation\.(js|ts)/ : /client-only/,
+              use: {
+                loader: "/framework/valueInjectionLoader.js",
+                options: {
+                  values: {
+                    fixtureObject: { enabled: true },
+                    fixtureString: "server-value",
+                    fixtureUndefined: undefined,
+                  },
+                },
+              },
+            },
+          ],
+        });
+        return webpackConfig;
+      },
+    });
+
+    expect(config.instrumentationServerValueInjections).toEqual({
+      fixtureObject: { enabled: true },
+      fixtureString: "server-value",
+      fixtureUndefined: undefined,
+    });
+  });
+
+  it("ignores values from unrelated instrumentation loaders", async () => {
+    const config = await resolveNextConfig({
+      webpack: (webpackConfig: any, options: any) => {
+        if (options.isServer) {
+          webpackConfig.module.rules.push({
+            test: /instrumentation\.ts/,
+            use: {
+              loader: "/framework/typescript-loader.js",
+              options: { values: { fetch: null } },
+            },
+          });
+        }
+        return webpackConfig;
+      },
+    });
+
+    expect(config.instrumentationServerValueInjections).toEqual({});
+  });
+
+  it("provides Next.js webpack plugin constructors to wrapped config callbacks", async () => {
+    const config = await resolveNextConfig({
+      webpack: (webpackConfig: any, options: any) => {
+        webpackConfig.resolve.alias["wrapped/config"] = "./config/request.ts";
+        webpackConfig.plugins.push(new options.webpack.DefinePlugin({ TEST: true }));
+        webpackConfig.plugins.push(new options.webpack.ProvidePlugin({ TEST: "test" }));
+        webpackConfig.plugins.push(new options.webpack.IgnorePlugin({ resourceRegExp: /test/ }));
+        return webpackConfig;
+      },
+    });
+    expect(config.aliases["wrapped/config"]).toBe(canonical(process.cwd(), "config/request.ts"));
+    expect(config.instrumentationClientRouteManifest).toBeUndefined();
+    expect(config.instrumentationServerValueInjections).toEqual({});
+  });
+
+  it("leaves instrumentation-client route manifest injection disabled when omitted", async () => {
+    const config = await resolveNextConfig({ webpack: (webpackConfig: any) => webpackConfig });
+    expect(config.instrumentationClientRouteManifest).toBeUndefined();
+  });
 });
 
 describe("parseBodySizeLimit", () => {
@@ -1662,6 +2189,17 @@ describe("resolveNextConfig serverActionsBodySizeLimit", () => {
       experimental: { serverActions: { bodySizeLimit: 5242880 } },
     });
     expect(numericLabel.serverActionsBodySizeLimitLabel).toBe("5242880");
+  });
+});
+
+describe("resolveNextConfig compress", () => {
+  // Next.js installs its compression middleware unless `compress` is exactly
+  // false (packages/next/src/server/lib/router-server.ts).
+  it("defaults to true and is disabled only by compress: false", async () => {
+    expect((await resolveNextConfig(null)).compress).toBe(true);
+    expect((await resolveNextConfig({})).compress).toBe(true);
+    expect((await resolveNextConfig({ compress: true })).compress).toBe(true);
+    expect((await resolveNextConfig({ compress: false })).compress).toBe(false);
   });
 });
 
@@ -2141,6 +2679,8 @@ describe("detectNextIntlConfig", () => {
       assetPrefix: "",
       basePath: "",
       trailingSlash: false,
+      skipTrailingSlashRedirect: false,
+      compress: true,
       skipProxyUrlNormalize: false,
       typescript: {},
       output: "",
@@ -2188,6 +2728,8 @@ describe("detectNextIntlConfig", () => {
       compilerDefine: {},
       compilerDefineServer: {},
       instrumentationClientInject: [],
+      instrumentationClientRouteManifest: undefined,
+      instrumentationServerValueInjections: {},
       clientTraceMetadata: undefined,
       staleTimes: { dynamic: 0, static: 300 },
       useLightningcss: false,
@@ -2566,6 +3108,61 @@ describe("resolveNextConfig external rewrite warning", () => {
       (call) => typeof call[0] === "string" && call[0].includes("external rewrite"),
     );
     expect(externalWarning).toBeUndefined();
+  });
+});
+
+// Ported from Next.js' checkCustomRoutes in packages/next/src/lib/load-custom-routes.ts.
+describe("resolveNextConfig basePath: false rewrite validation", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const outsideBasePathError = (source: string) =>
+    `The route ${source} rewrites urls outside of the basePath. Please use a destination that starts with \`http://\` or \`https://\` https://nextjs.org/docs/messages/invalid-external-rewrite`;
+
+  it("rejects basePath: false rewrites to internal destinations in every phase", async () => {
+    await expect(
+      resolveNextConfig({
+        basePath: "/docs",
+        rewrites: async () => ({
+          beforeFiles: [{ source: "/before", destination: "/open.txt", basePath: false }],
+          afterFiles: [{ source: "/after", destination: "/docs/page", basePath: false }],
+          fallback: [{ source: "/fallback", destination: "//cdn.example.com", basePath: false }],
+        }),
+      }),
+    ).rejects.toThrow(
+      [
+        outsideBasePathError("/before"),
+        outsideBasePathError("/after"),
+        outsideBasePathError("/fallback"),
+        "Invalid rewrites found",
+      ].join("\n"),
+    );
+  });
+
+  it("rejects an internal basePath: false rewrite without a configured basePath", async () => {
+    await expect(
+      resolveNextConfig({
+        rewrites: async () => [{ source: "/old", destination: "/new", basePath: false }],
+      }),
+    ).rejects.toThrow(`${outsideBasePathError("/old")}\nInvalid rewrite found`);
+  });
+
+  it("accepts basePath: false rewrites to http(s) destinations", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const config = await resolveNextConfig({
+      basePath: "/docs",
+      rewrites: async () => [
+        { source: "/http", destination: "http://example.com/a", basePath: false },
+        { source: "/https", destination: "https://example.com/b", basePath: false },
+        { source: "/internal", destination: "/new" },
+      ],
+    });
+    expect(config.rewrites.afterFiles.map((rewrite) => rewrite.source)).toEqual([
+      "/http",
+      "/https",
+      "/internal",
+    ]);
   });
 });
 

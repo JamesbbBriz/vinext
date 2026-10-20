@@ -15,6 +15,7 @@ import type { Params } from "@vinext/types/next/upstream/dist/server/request/par
 import {
   getNavigationRuntime,
   hasAppNavigationRuntime,
+  loadNavigationRuntimeRouteManifest,
   type NavigationRuntimeVisibleCommitMode,
 } from "../client/navigation-runtime.js";
 import { notifyAppRouterTransitionStart } from "../client/instrumentation-client-state.js";
@@ -33,6 +34,8 @@ import {
 import {
   createRscRequestHeaders,
   createRscRequestUrl,
+  formatRscRequestPath,
+  parseRscRequestPath,
   stripRscCacheBustingSearchParam,
   stripRscSuffix,
   VINEXT_RSC_COMPATIBILITY_ID_HEADER,
@@ -44,9 +47,12 @@ import {
   NEXT_ROUTER_SEGMENT_PREFETCH_HEADER,
   NEXT_ROUTER_STALE_TIME_HEADER,
   VINEXT_DYNAMIC_STALE_TIME_HEADER,
+  VINEXT_INTERCEPTION_CONTEXT_HEADER,
   VINEXT_MOUNTED_SLOTS_HEADER,
   VINEXT_PARAMS_HEADER,
   VINEXT_RENDERED_PATH_AND_SEARCH_HEADER,
+  VINEXT_RSC_REDIRECT_HEADER,
+  VINEXT_RSC_REDIRECT_TYPE_HEADER,
   VINEXT_RSC_RENDER_MODE_HEADER,
   VINEXT_RSC_COMPLETION_METADATA_HEADER,
   VINEXT_STALE_TIME_PENDING_HEADER,
@@ -80,7 +86,8 @@ import {
   resolveDirectHybridClientRouteOwner,
   type HybridClientOwner,
 } from "./internal/hybrid-client-route-owner-direct.js";
-import { retryScrollTo, scrollToHashTarget, scrollToHashTargetOnNextFrame } from "./hash-scroll.js";
+import { disableSmoothScrollDuringRouteTransition } from "./disable-smooth-scroll.js";
+import { retryScrollTo, scrollToHashTarget } from "./hash-scroll.js";
 import {
   beginAppRouterScrollIntent,
   clearAppRouterScrollIntent,
@@ -325,6 +332,13 @@ export type CachedRscResponse = {
   mountedSlotsHeader?: string | null;
   paramsHeader: string | null;
   preparedElements?: AppElements;
+  /**
+   * Streamed `redirect()` side-channel headers. A replayed snapshot must keep
+   * them so the navigation follows the redirect instead of decoding the
+   * redirect payload as a page.
+   */
+  redirectHeader?: string;
+  redirectTypeHeader?: string;
   renderedPathAndSearch: string | null;
   serverStaleTime?: ServerStaleTime;
   url: string;
@@ -366,7 +380,10 @@ export function getCurrentInterceptionContext(): string | null {
   return stripBasePath(window.location.pathname, __basePath);
 }
 
-export function getPrefetchInterceptionContext(targetHref: string): string | null {
+export function getPrefetchInterceptionContext(
+  targetHref: string,
+  currentPathname?: string,
+): string | null {
   if (isServer) {
     return null;
   }
@@ -380,7 +397,7 @@ export function getPrefetchInterceptionContext(targetHref: string): string | nul
 
   return resolveManifestNavigationInterceptionContext({
     basePath: __basePath,
-    currentPathname: window.location.pathname,
+    currentPathname: currentPathname ?? window.location.pathname,
     routeManifest: getNavigationRuntime()?.bootstrap.routeManifest ?? null,
     targetPathname: targetUrl.pathname,
   });
@@ -575,7 +592,7 @@ export function resolvePrefetchCacheEntryMountedSlotsHeader(
 
 function normalizeRscCacheLookupUrl(rscUrl: string): string | null {
   try {
-    const url = new URL(rscUrl, "http://vinext.local");
+    const url = parseRscRequestPath(rscUrl);
     stripRscCacheBustingSearchParam(url);
     return `${url.pathname}${url.search}`;
   } catch {
@@ -585,7 +602,7 @@ function normalizeRscCacheLookupUrl(rscUrl: string): string | null {
 
 function normalizeRscCacheLookupPathname(rscUrl: string): string | null {
   try {
-    const url = new URL(rscUrl, "http://vinext.local");
+    const url = parseRscRequestPath(rscUrl);
     return stripRscSuffix(url.pathname);
   } catch {
     return null;
@@ -908,8 +925,10 @@ function toAppPrefetchDestination(href: string): string | null {
     __trailingSlash,
   );
   try {
-    const url = new URL(browserHref, window.location.href);
-    return `${url.pathname}${url.search}`;
+    // A pathname that starts with "//" must not come back as a
+    // protocol-relative reference: the prefetch path resolves this value
+    // against the current URL again and would read its first segment as a host.
+    return formatRscRequestPath(new URL(browserHref, window.location.href));
   } catch {
     return browserHref.split("#", 1)[0];
   }
@@ -1276,6 +1295,8 @@ export function createCachedRscResponseSnapshot(
       ? undefined
       : { kind: "resolved" as const, seconds: extracted.metadata!.serverStaleTimeSeconds! }
     : parsedServerStaleTime;
+  const redirectHeader = response.headers.get(VINEXT_RSC_REDIRECT_HEADER);
+  const redirectTypeHeader = response.headers.get(VINEXT_RSC_REDIRECT_TYPE_HEADER);
   return {
     compatibilityIdHeader: response.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER),
     buffer: extracted.buffer,
@@ -1284,6 +1305,8 @@ export function createCachedRscResponseSnapshot(
     ...(dynamicStaleTimeSeconds !== undefined ? { dynamicStaleTimeSeconds } : {}),
     mountedSlotsHeader: response.headers.get(VINEXT_MOUNTED_SLOTS_HEADER),
     paramsHeader: response.headers.get(VINEXT_PARAMS_HEADER),
+    ...(redirectHeader === null ? {} : { redirectHeader }),
+    ...(redirectTypeHeader === null ? {} : { redirectTypeHeader }),
     renderedPathAndSearch: parseRenderedPathAndSearchHeader(
       response.headers.get(VINEXT_RENDERED_PATH_AND_SEARCH_HEADER),
     ),
@@ -1303,7 +1326,8 @@ function parseServerStaleTimeHeaders(headers: Headers): ServerStaleTime | undefi
   return seconds === undefined ? undefined : { kind: "resolved", seconds };
 }
 
-function parseRenderedPathAndSearchHeader(value: string | null): string | null {
+/** Decode an `X-Vinext-Rendered-Path-And-Search` header value. */
+export function parseRenderedPathAndSearchHeader(value: string | null): string | null {
   if (value === null || value === "") return null;
   try {
     const decoded = decodeURIComponent(value);
@@ -1365,6 +1389,12 @@ export function restoreRscResponse(cached: CachedRscResponse, copy = true): Resp
   }
   if (cached.paramsHeader != null) {
     headers.set(VINEXT_PARAMS_HEADER, cached.paramsHeader);
+  }
+  if (cached.redirectHeader !== undefined) {
+    headers.set(VINEXT_RSC_REDIRECT_HEADER, cached.redirectHeader);
+  }
+  if (cached.redirectTypeHeader !== undefined) {
+    headers.set(VINEXT_RSC_REDIRECT_TYPE_HEADER, cached.redirectTypeHeader);
   }
   if (cached.renderedPathAndSearch != null) {
     headers.set(
@@ -1461,6 +1491,28 @@ export async function fetchRouteTreeGatedPrefetch(options: {
 }
 
 /**
+ * Whether a prefetch response may be decoded as Flight. A successful response
+ * that is not Flight (e.g. a Route Handler's text download) is a miss: decoding
+ * its bytes would let text shaped like Flight resource hints insert scripts.
+ * Navigation then fetches it and falls back to a document navigation.
+ *
+ * Ported from Next.js: fetchPrefetchResponse in
+ * packages/next/src/client/components/segment-cache/cache.ts, which skips the
+ * check in `output: "export"` because a static host, not Next.js, chooses the
+ * MIME type of the exported `.txt` payloads.
+ */
+function isFlightPrefetchResponse(response: Response): boolean {
+  if (!response.ok) return false;
+  if (process.env.NODE_ENV === "production" && process.env.__NEXT_CONFIG_OUTPUT === "export") {
+    return true;
+  }
+  // MIME types are case-insensitive (RFC 9110 §8.3.1).
+  return (
+    response.headers.get("content-type")?.toLowerCase().startsWith(VINEXT_RSC_CONTENT_TYPE) === true
+  );
+}
+
+/**
  * Prefetch an RSC response and snapshot it for later consumption.
  * Stores the in-flight promise so immediate clicks can await it instead
  * of firing a duplicate fetch.
@@ -1510,7 +1562,7 @@ export function prefetchRscResponse(
 
   entry.pending = fetchPromise
     .then(async (response) => {
-      if (response.ok) {
+      if (isFlightPrefetchResponse(response)) {
         const snapshot = await snapshotRscResponse(response);
         if (cache.get(cacheKey) !== entry) return;
         const previousSize = getPrefetchCacheEntrySize(entry);
@@ -1530,7 +1582,9 @@ export function prefetchRscResponse(
             : (behavior.dynamicStaleTime ??
                 (behavior.optimisticRouteShell === true ? "ignore" : "verbatim")),
         );
-        if (behavior.prepareSnapshot) {
+        // A redirect payload never decodes into elements; navigation follows
+        // its redirect headers instead.
+        if (behavior.prepareSnapshot && snapshot.redirectHeader === undefined) {
           try {
             const preparedElements = await behavior.prepareSnapshot(snapshot);
             if (cache.get(cacheKey) !== entry) return;
@@ -1544,6 +1598,8 @@ export function prefetchRscResponse(
         evictPrefetchCacheIfNeeded();
       } else {
         releaseAppPrefetchFetchSlot(response);
+        // An unread body keeps the request, and its connection, open.
+        void response.body?.cancel().catch(() => {});
         deletePrefetchCacheEntry(cache, prefetched, cacheKey, entry, false);
       }
     })
@@ -2035,6 +2091,12 @@ export type ClientNavigationRenderSnapshot = {
   search: string;
   searchParams: ReadonlyURLSearchParams;
   params: Record<string, string | string[]>;
+  /**
+   * The query the server rendered this tree with, when it is known. A rewrite
+   * can change it (`/search/:q` -> `/search?q=:q`), so it can differ from
+   * `search`. Client page `searchParams` read it (see `client-page-root.tsx`).
+   */
+  renderedSearch?: string;
 };
 
 const _CLIENT_NAV_RENDER_CTX_KEY = Symbol.for("vinext.clientNavigationRenderContext");
@@ -2067,9 +2129,14 @@ export function useClientNavigationRenderSnapshot(): ClientNavigationRenderSnaps
 }
 /* oxlint-enable eslint-plugin-react-hooks/rules-of-hooks */
 
+/**
+ * @param renderedPathAndSearch The path and query the server rendered for this
+ * navigation (`X-Vinext-Rendered-Path-And-Search`), when known.
+ */
 export function createClientNavigationRenderSnapshot(
   href: string,
   params: Record<string, string | string[]>,
+  renderedPathAndSearch?: string | null,
 ): ClientNavigationRenderSnapshot {
   const origin = typeof window !== "undefined" ? window.location.origin : "http://localhost";
   const url = new URL(href, origin);
@@ -2079,6 +2146,9 @@ export function createClientNavigationRenderSnapshot(
     search: url.search,
     searchParams: new ReadonlyURLSearchParams(url.search),
     params,
+    ...(renderedPathAndSearch != null
+      ? { renderedSearch: new URL(renderedPathAndSearch, origin).search }
+      : {}),
   };
 }
 
@@ -2244,6 +2314,16 @@ export function useSearchParams(): ReadonlyURLSearchParams {
       // control-flow error lets React render the nearest Suspense fallback
       // into the static HTML while the browser fills in the real URL values.
       throw new NavigationBailoutToCSRError("useSearchParams()");
+    }
+    const gate = ctx?.searchParamsGate;
+    if (gate) {
+      // A cache-candidate render waits until it is known whether the render
+      // will be stored: real values once it is dynamic, otherwise the same
+      // client-render boundary as a static render.
+      React.use(gate.decided);
+      if (gate.decision === "bailout") {
+        throw new NavigationBailoutToCSRError("useSearchParams()");
+      }
     }
     markPprFallbackShellDynamicBoundary();
     // During SSR for "use client" components, the navigation context may not be set.
@@ -2426,7 +2506,13 @@ export function applyAppRouterScrollFallback(intent: AppRouterScrollIntent): voi
     // Browsers can apply their own scroll restoration after the navigation's
     // commit microtasks. Defer the fallback to the next frame so that native
     // work cannot immediately reset the requested fragment scroll.
-    scrollToHashTargetOnNextFrame(intent.hash, () => isLatestAppRouterScrollIntent(intent));
+    const hash = intent.hash;
+    requestAnimationFrame(() => {
+      if (!isLatestAppRouterScrollIntent(intent)) return;
+      disableSmoothScrollDuringRouteTransition(() => {
+        scrollToHashTarget(hash);
+      });
+    });
     return;
   }
 
@@ -2441,7 +2527,9 @@ export function applyAppRouterScrollFallback(intent: AppRouterScrollIntent): voi
     return;
   }
 
-  document.documentElement.scrollTop = 0;
+  disableSmoothScrollDuringRouteTransition(() => {
+    document.documentElement.scrollTop = 0;
+  });
 }
 
 function scheduleAppRouterScrollFallback(intent: AppRouterScrollIntent): void {
@@ -2598,6 +2686,13 @@ export async function navigateClientSide(
     notifyAppRouterTransitionStart(fullHref, mode);
     if (mode === "push") {
       saveScrollPosition();
+    }
+    // Suspend the tree like Next.js's MPA navigation, so a RedirectBoundary
+    // that started this navigation can't reset and follow its redirect again.
+    const mpaNavigate = getNavigationRuntime()?.functions.navigateExternal;
+    if (mpaNavigate) {
+      await mpaNavigate(fullHref, mode);
+      return;
     }
     hardNavigateTo(fullHref, mode);
     await new Promise<void>(() => {});
@@ -2846,7 +2941,8 @@ const _appRouter: AppRouterInstance = {
     // must not make this prefetch look as though it originated from the target
     // route, and an intervening route change must not change its interception
     // or mounted-slot key.
-    const interceptionContext = getPrefetchInterceptionContext(fullHref);
+    const currentPathname = window.location.pathname;
+    let interceptionContext = getPrefetchInterceptionContext(fullHref, currentPathname);
     const mountedSlotsHeader = getMountedSlotsHeader();
     const headers = createAppPrefetchRequestHeaders({
       fetchPriority: "low",
@@ -2855,6 +2951,18 @@ const _appRouter: AppRouterInstance = {
     });
     const setup = beginPrefetchSetup(fullHref);
     void (async () => {
+      // The interception context comes from the RouteManifest, which loads
+      // from its own chunk. A call before it arrives resolves the context from
+      // the call-time pathname once it does.
+      const routeManifestLoad = loadNavigationRuntimeRouteManifest();
+      if (routeManifestLoad !== null) {
+        // Without the manifest the prefetch would miss its interception context.
+        if (!(await routeManifestLoad) || setup.cancelled) return;
+        interceptionContext = getPrefetchInterceptionContext(fullHref, currentPathname);
+        if (interceptionContext !== null) {
+          headers.set(VINEXT_INTERCEPTION_CONTEXT_HEADER, interceptionContext);
+        }
+      }
       // Hybrid ownership: when a Pages route owns the URL, the App Router
       // cannot serve it (Pages produces HTML documents / `_next/data` JSON,
       // not RSC streams). Prefetching an RSC URL would either 404 or warm
@@ -2933,17 +3041,11 @@ const _appRouter: AppRouterInstance = {
             : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
         );
       }
-      const { additionalRscUrls, rscUrl, usesCanonicalPrewarmedRequest } =
-        await resolveAppPrefetchRscRequest({
-          canUseCanonicalLoadingShell: policy.canUseCanonicalLoadingShell === true,
-          fullHref,
-          headers,
-          interceptionContext,
-          mountedSlotsHeader,
-          prefetchInlining: __prefetchInlining,
-          requiresRouteTreePrefetch,
-          rewrittenPrefetchHref,
-        });
+      const { additionalRscUrls, rscUrl } = await resolveAppPrefetchRscRequest({
+        fullHref,
+        headers,
+        rewrittenPrefetchHref,
+      });
       // A navigation to this same href can start in the same task as this call
       // and win the race above (hybrid-route module load, policy import, RSC
       // URL generation). Nothing was registered in the cache during that
@@ -2985,7 +3087,7 @@ const _appRouter: AppRouterInstance = {
           "low",
         );
       const fetchPromise =
-        !usesCanonicalPrewarmedRequest && reusable && kind === "auto" && requiresRouteTreePrefetch
+        reusable && kind === "auto" && requiresRouteTreePrefetch
           ? fetchRouteTreeGatedPrefetch({
               fetchFullRscPayload,
               fetchRouteTree: (routeTreeRscUrl, routeTreeHeaders) =>
@@ -3267,6 +3369,9 @@ if (!isServer) {
       unused: string,
       url?: string | URL | null,
     ): void {
+      // A write from a layout effect of a committing navigation must land on
+      // top of the destination entry, as it does in Next.js.
+      getNavigationRuntime()?.functions.flushCommittingNavigationUrl?.();
       // Match Next.js' `data?.__NA` escape hatch. Reusing a captured internal
       // history entry must remain a real traversal target so back/forward can
       // fetch it (and follow redirects) instead of treating it as a copied
@@ -3296,6 +3401,10 @@ if (!isServer) {
         // but changes browser state only — it issues no RSC request, so it must
         // not cancel prefetch setup for the URL it moves to.
         resetStaleLinkStatus();
+        // Like Next.js' ACTION_RESTORE, the shallow URL keeps the visible tree,
+        // so a navigation still rendering must not commit over it later. Next
+        // only restores when a URL is given; a state-only write keeps it.
+        if (url) getNavigationRuntime()?.functions.discardPendingNavigation?.();
         commitClientNavigationState();
       }
     };
@@ -3305,6 +3414,7 @@ if (!isServer) {
       unused: string,
       url?: string | URL | null,
     ): void {
+      getNavigationRuntime()?.functions.flushCommittingNavigationUrl?.();
       if (isAppOwnedHistoryState(data)) {
         const previousHistoryState = window.history.state;
         state.originalReplaceState.call(window.history, data, unused, url);
@@ -3327,6 +3437,7 @@ if (!isServer) {
       );
       if (state.suppressUrlNotifyCount === 0) {
         resetStaleLinkStatus();
+        if (url) getNavigationRuntime()?.functions.discardPendingNavigation?.();
         commitClientNavigationState();
       }
     };

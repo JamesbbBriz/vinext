@@ -7,6 +7,7 @@ import {
   normalizePregeneratedPathname,
 } from "../packages/vinext/src/server/pregenerated-concrete-paths.js";
 import {
+  buildPregeneratedConcretePathTable,
   getPrerenderedConcretePaths,
   isFallbackShellArtifactPath,
 } from "../packages/vinext/src/server/prerender-manifest.js";
@@ -89,6 +90,28 @@ describe("pregenerated concrete paths", () => {
     ]);
   });
 
+  it("retains an empty route-level static params marker", () => {
+    globalThis.__VINEXT_PREGENERATED_CONCRETE_PATHS = [["/blog/:slug", []]];
+    initPregeneratedPathsFromGlobals();
+    delete globalThis.__VINEXT_PREGENERATED_CONCRETE_PATHS;
+
+    expect(getRenderedConcreteUrlPathsForRoute("/blog/:slug")).toEqual(new Set());
+  });
+
+  it("builds an empty route marker for on-demand static params", () => {
+    expect(
+      buildPregeneratedConcretePathTable({
+        routes: [
+          {
+            route: "/blog/:slug",
+            status: "skipped",
+            reason: "empty-static-params",
+          },
+        ],
+      }),
+    ).toEqual([["/blog/:slug", []]]);
+  });
+
   describe("isFallbackShellArtifactPath", () => {
     it("identifies fallback shells when fallback === true", () => {
       expect(
@@ -132,7 +155,7 @@ describe("pregenerated concrete paths", () => {
   });
 
   describe("getPrerenderedConcretePaths", () => {
-    it("selects unique rendered App and Pages paths and skips fallback shells by default", () => {
+    it("selects unique rendered App and Pages paths and skips fallback shells", () => {
       expect(
         getPrerenderedConcretePaths({
           routes: [
@@ -160,6 +183,15 @@ describe("pregenerated concrete paths", () => {
               router: "pages",
               revalidate: false,
               fallback: false,
+            },
+            {
+              route: "/docs/:slug",
+              path: "/docs/missing",
+              status: "rendered",
+              router: "pages",
+              revalidate: false,
+              notFound: true,
+              responseStatus: 404,
             },
             {
               route: "/404",
@@ -227,26 +259,6 @@ describe("pregenerated concrete paths", () => {
           { includeErrorDocuments: true },
         ),
       ).toEqual(["/404", "/500", "/_error"]);
-    });
-
-    it("can include fallback-shell placeholder paths for explicit warmup requests", () => {
-      expect(
-        getPrerenderedConcretePaths(
-          {
-            routes: [
-              {
-                route: "/blog/:slug",
-                path: "/blog/[slug]",
-                status: "rendered",
-                router: "app",
-                revalidate: 60,
-                fallback: true,
-              },
-            ],
-          },
-          { includeFallbackShells: true },
-        ),
-      ).toEqual(["/blog/[slug]"]);
     });
   });
 });

@@ -2,17 +2,17 @@ import { describe, expect, it } from "vite-plus/test";
 import { resolveConfig, type Plugin, type ServerOptions } from "vite";
 import {
   applyDevServerDefaults,
-  createDevServerConfigPlugin,
+  createDevServerLifecyclePlugin,
   normalizeDevServerHostname,
 } from "../packages/vinext/src/cli-dev-config.js";
 
 describe("applyDevServerDefaults", () => {
-  it("uses vinext defaults when neither config nor CLI flags specify values", () => {
+  it("leaves the port to Vite when neither config nor CLI flags specify one", () => {
     const server: ServerOptions = {};
 
     applyDevServerDefaults(server, {});
 
-    expect(server).toMatchObject({ host: "localhost", port: 3000 });
+    expect(server).toEqual({ host: "localhost" });
   });
 
   it("preserves host and port from the Vite config", () => {
@@ -32,7 +32,7 @@ describe("applyDevServerDefaults", () => {
   });
 });
 
-describe("createDevServerConfigPlugin", () => {
+describe("createDevServerLifecyclePlugin", () => {
   it("applies explicit CLI flags after user config hooks", async () => {
     const lateUserConfigPlugin: Plugin = {
       name: "test:late-user-config",
@@ -52,7 +52,7 @@ describe("createDevServerConfigPlugin", () => {
         configFile: false,
         plugins: [
           lateUserConfigPlugin,
-          createDevServerConfigPlugin({ hostname: "127.0.0.1", port: 4000 }),
+          createDevServerLifecyclePlugin({ hostname: "127.0.0.1", port: 4000 }, () => true),
         ],
       },
       "serve",

@@ -57,11 +57,18 @@ describe("closeAfterResponseWithBody on the Cloudflare Workers runtime", () => {
       // createIsolatedFixture swaps in a plain workspace node_modules symlink
       // (here, cf-app-basic's, for @cloudflare/vite-plugin + wrangler), which
       // drops app-basic's own `file:./__test_packages__/*` local packages.
-      // Exclude the two routes that depend on those — unrelated to this
+      // Exclude the routes that depend on those — unrelated to this
       // regression — so the rest of the fixture still builds.
       (src) =>
         !src.includes(`${path.sep}app${path.sep}context-dedup-test`) &&
-        !src.includes(`${path.sep}app${path.sep}nextjs-compat${path.sep}node-modules-css`),
+        !src.includes(`${path.sep}app${path.sep}optimize-imports-client-barrel`) &&
+        !src.includes(`${path.sep}app${path.sep}nextjs-compat${path.sep}node-modules-css`) &&
+        !src.includes(
+          `${path.sep}app${path.sep}nextjs-compat${path.sep}dynamic${path.sep}out-of-root-package`,
+        ) &&
+        !src.includes(
+          `${path.sep}app${path.sep}nextjs-compat${path.sep}dynamic${path.sep}node-modules-call-site`,
+        ),
       CLOUDFLARE_NODE_MODULES,
     );
     // app-basic has no wrangler config of its own (it's normally only used
@@ -73,9 +80,40 @@ describe("closeAfterResponseWithBody on the Cloudflare Workers runtime", () => {
         name: "vinext-after-response-close-worker-fixture",
         compatibility_date: "2026-04-01",
         compatibility_flags: ["nodejs_compat"],
-        main: "vinext/server/fetch-handler",
+        main: "./worker/index.ts",
         assets: { not_found_handling: "none", binding: "ASSETS" },
       }),
+    );
+    const requestTracingPath = path.resolve(
+      import.meta.dirname,
+      "../packages/vinext/src/server/request-tracing.ts",
+    );
+    await fs.mkdir(path.join(root, "worker"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, "worker/index.ts"),
+      `import handler from "vinext/server/fetch-handler";
+import { traceFrameworkRequest } from ${JSON.stringify(requestTracingPath)};
+
+export default {
+  fetch(request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname !== "/__trace-manual-gzip") return handler.fetch(request, env, ctx);
+    return traceFrameworkRequest({
+      callback: async () => new Response(
+        new Blob(["manual gzip"]).stream().pipeThrough(new CompressionStream("gzip")),
+        {
+          headers: { "Content-Encoding": "gzip" },
+          encodeBody: "manual",
+        } as ResponseInit,
+      ),
+      getStatus: (response) => response?.status,
+      headers: request.headers,
+      method: request.method,
+      target: url.pathname,
+    });
+  },
+};
+`,
     );
     // Force the metadata response through the middleware header/status rebuild
     // that previously discarded the internal fully-buffered marker.
@@ -158,6 +196,13 @@ export const config = { matcher: ["/robots.txt"] };
     const contentLength = res.headers.get("content-length");
     expect(contentLength).not.toBeNull();
     expect(Number(contentLength)).toBe(expectedLength);
+  });
+
+  it("preserves manual response body encoding while tracing a streamed response", async () => {
+    const res = await fetch(`${baseUrl}/__trace-manual-gzip`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-encoding")).toBe("gzip");
+    expect(await res.text()).toBe("manual gzip");
   });
 
   it("preserves Content-Length on a metadata sitemap.xml response", async () => {
